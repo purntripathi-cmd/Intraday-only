@@ -178,9 +178,10 @@ with tab4:
     bt_res = load_csv("backtest_3y_results.csv")
     bt_reg = load_csv("backtest_3y_regime_matrix.csv")
     bt_ver15 = load_csv("intraday_60d_15m_verification.csv")
+    bt_timing_sum = load_csv("entry_timing_10am_5gate_summary.csv")
     bt_ledger = load_csv("backtest_trade_ledger_3y.csv")
 
-    st.markdown("#### 1. Strategy Performance Comparison (Top 5 Sniper Logics vs Production Baseline & Controls)")
+    st.markdown("#### 1. Strategy Performance Comparison (Top 6 Sniper Logics Including L6 5-Gate 10:00 AM Sniper vs Controls)")
     if not bt_res.empty:
         st.dataframe(bt_res, use_container_width=True, hide_index=True)
 
@@ -188,14 +189,18 @@ with tab4:
     if not bt_reg.empty:
         st.dataframe(bt_reg, use_container_width=True, hide_index=True)
 
-    st.markdown("#### 3. 60-Day 15-Minute Bar-by-Bar Intraday Walk-Forward Verification")
+    st.markdown("#### 3. 10:00 AM Entry Timing Study on 5-Gate Pre-Qualified Stocks (15m Bars + Trailing SL & Profit Target)")
+    if not bt_timing_sum.empty:
+        st.dataframe(bt_timing_sum, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 4. 60-Day 15-Minute Bar-by-Bar Intraday Walk-Forward Verification")
     if not bt_ver15.empty:
         st.dataframe(bt_ver15, use_container_width=True, hide_index=True)
 
-    st.markdown("#### 4. Filterable 3-Year Historical Trade Ledger")
+    st.markdown("#### 5. Filterable 3-Year Historical Trade Ledger")
     if not bt_ledger.empty:
-        sniper_only = st.checkbox("Show Top 5 Sniper Logics Only (L1–L5)", value=True)
-        view_df = bt_ledger[bt_ledger["Logic_ID"].str.startswith(("L1_", "L2_", "L3_", "L4_", "L5_"))] if sniper_only else bt_ledger
+        sniper_only = st.checkbox("Show Top 6 Sniper Logics Only (L1–L6)", value=True)
+        view_df = bt_ledger[bt_ledger["Logic_ID"].str.startswith(("L1_", "L2_", "L3_", "L4_", "L5_", "L6_"))] if sniper_only else bt_ledger
         st.dataframe(view_df.tail(250), use_container_width=True, hide_index=True)
 
 with tab5:

@@ -9,10 +9,10 @@ Engineered after a full forensic audit of production trades in [`smart-etf-track
 ## 📌 Core Philosophy: Sniper Cadence Over Daily Overtrading
 
 - **No Mandatory Daily Trades**: High-frequency daily intraday trading (`~6.3 trades/week`) suffers from a `45.1%–55.1%` win rate and `-25%` to `-99%` drawdowns due to sideways market chop and opening auction noise.
-- **High-Conviction Sniper Cadence**: This engine deploys **5 Regime-Specialized Sniper Logics (`L1`–`L5`)** that fire **only when Market Regime + Sectoral/Macro Shift + Structural Support (`S1`) + Intraday Volume Expansion align** (`~0.13 to 0.43 trades/week` per logic, or **`~1.26 trades/week` combined**).
+- **High-Conviction Sniper Cadence**: This engine deploys **6 Regime-Specialized Sniper Logics (`L1`–`L6`)** that fire **only when Market Regime + Sectoral/Macro Shift + Structural Support (`S1`) + Intraday Volume Expansion align** (`~0.09 to 0.43 trades/week` per logic, or **`~1.35 trades/week` combined**).
 - **Multi-Layer Downside Risk Protection**:
-  1. **Structural Support Floor (`S1`)**: Initial stop-loss is anchored below the **9:15–9:45 Opening Range Low (`ORB_Low`) / 20-Day Structural Support `S1` minus a `0.15x–0.18x ATR` cushion**—never inside normal 15-minute bid-ask noise.
-  2. **Chronological 4-Stage High-Water-Mark (`HWM`) Trailing Stop**: Tracks `Last_Evaluated_Bar_TS` and `High_Water_Mark` strictly forward in time (`Stage 1: +0.80 ATR -> +0.18 ATR Breakeven+`, `Stage 2: +1.25 ATR -> +0.65 ATR`, `Stage 3: +1.75 ATR -> +1.15 ATR`, `Stage 4: +2.20 ATR -> HWM - 0.50 ATR Chandelier`).
+  1. **Structural Support Floor (`S1`)**: Initial stop-loss is anchored below the **9:15–10:00 Morning Support Low (`ORB_Low`) / 20-Day Structural Support `S1` minus a `0.15x–0.18x ATR` cushion**—never inside normal 15-minute bid-ask noise.
+  2. **Chronological 4-Stage High-Water-Mark (`HWM`) Trailing Stop**: Tracks `Last_Evaluated_Bar_TS` and `High_Water_Mark` strictly forward in time (`Stage 1: +0.40–0.80 ATR -> +0.15–0.18 ATR Breakeven+`, `Stage 2: +0.75–1.25 ATR -> +0.45–0.65 ATR`, `Stage 3: +1.75 ATR -> +1.15 ATR`, `Stage 4: HWM - 0.35–0.50 ATR Chandelier`).
   3. **3:10 PM Smart Intraday-to-Swing Conversion Gate**: Evaluates stalled 3:10 PM intraday positions against 5 institutional criteria (`84.90%` 3-year empirical win rate).
 
 ---
@@ -47,17 +47,30 @@ We analyzed **4,955 historical intraday signals over 3 years** ([`data/productio
 
 ---
 
-## 🏆 3. Top 5 Institutional Sniper Logics (3-Year Backtest: 2023–2026)
+## 🏆 3. Top 6 Institutional Sniper Logics (3-Year Backtest: 2023–2026)
 
 Full report: [`BACKTEST_REPORT_3Y.md`](BACKTEST_REPORT_3Y.md) | Summary CSV: [`data/backtest_3y_results.csv`](data/backtest_3y_results.csv) | 3Y Trade Ledger: [`data/backtest_trade_ledger_3y.csv`](data/backtest_trade_ledger_3y.csv)
 
-| Rank | Logic ID | Strategy & Shift Focus | Best Market Regime | 3Y Trades | Cadence | Intraday Win Rate | Avg Return | Profit Factor | Max DD |
-| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **#1** | `L1_SECTOR_ORB_SNIPER` | **Sectoral Shift + NR7 Compression ORB Sniper** | `BULL_EXPANSION` & `SECTOR_SHIFT` | `21` | `0.13 / wk` | **`95.24%`** | **`+1.570%`** | **`375.55`** | **`-0.09%`** |
-| **#2** | `L4_DEFENSIVE_RS_SNIPER` | **Bear/High-VIX Defensive RS Fortress Sniper** | `BEAR_OR_CORRECTION` & `HIGH_VIX` | `38` | `0.24 / wk` | **`92.11%`** | **`+1.228%`** | **`54.20`** | **`-0.40%`** |
-| **#3** | `L5_GLOBAL_MACRO_SNIPER` | **International & Overnight Global Macro Sniper** | `INTERNATIONAL_CUE` & `BULL` | `40` | `0.26 / wk` | **`95.00%`** | **`+1.500%`** | **`27.49`** | **`-1.27%`** |
-| **#4** | `L2_SUPPORT_SPRING_SNIPER` | **Structural S1 + 50DMA Institutional Spring Sniper** | `SIDEWAYS_ROTATION` & Pullbacks | `67` | `0.43 / wk` | **`86.57%`** | **`+1.572%`** | **`25.11`** | **`-1.60%`** |
-| **#5** | `L3_CATALYST_VWAP_SNIPER` | **Fundamental Catalyst / Volume Shock Day-2 VWAP Sniper** | `CATALYST_PEAD` (All Regimes) | `31` | `0.20 / wk` | **`83.87%`** | **`+1.194%`** | **`21.47`** | **`-0.53%`** |
+| Rank | Logic ID | Strategy & Shift Focus | Best Market Regime | 3Y Trades | Cadence | Intraday Win Rate | Avg Return | Profit Factor | Max DD | Hybrid (+Swing) Return |
+| :---: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **#1** | `L1_SECTOR_ORB_SNIPER` | **Sectoral Shift + NR7 Compression ORB Sniper** | `BULL_EXPANSION` & `SECTOR_SHIFT` | `21` | `0.13 / wk` | **`95.24%`** | **`+1.570%`** | **`375.55`** | **`-0.09%`** | **`+1.570%`** |
+| **#2** | `L6_5GATE_10AM_SNIPER` | **5-Gate Pre-Qualified 10:00 AM Intraday Sniper (Trail SL + Target)** | `BULL` & `SIDEWAYS` (5-Gate Qualified) | `14` | `0.09 / wk` | **`85.71%`** | **`+1.688%`** | **`71.97`** | **`-0.21%`** | **`+1.811%`** |
+| **#3** | `L4_DEFENSIVE_RS_SNIPER` | **Bear/High-VIX Defensive RS Fortress Sniper** | `BEAR_OR_CORRECTION` & `HIGH_VIX` | `38` | `0.24 / wk` | **`92.11%`** | **`+1.228%`** | **`54.20`** | **`-0.40%`** | **`+1.228%`** |
+| **#4** | `L5_GLOBAL_MACRO_SNIPER` | **International & Overnight Global Macro Sniper** | `INTERNATIONAL_CUE` & `BULL` | `40` | `0.26 / wk` | **`95.00%`** | **`+1.500%`** | **`27.49`** | **`-1.27%`** | **`+1.543%`** |
+| **#5** | `L2_SUPPORT_SPRING_SNIPER` | **Structural S1 + 50DMA Institutional Spring Sniper** | `SIDEWAYS_ROTATION` & Pullbacks | `67` | `0.43 / wk` | **`86.57%`** | **`+1.572%`** | **`25.11`** | **`-1.60%`** | **`+1.575%`** |
+| **#6** | `L3_CATALYST_VWAP_SNIPER` | **Fundamental Catalyst / Volume Shock Day-2 VWAP Sniper** | `CATALYST_PEAD` (All Regimes) | `31` | `0.20 / wk` | **`83.87%`** | **`+1.194%`** | **`21.47`** | **`-0.53%`** | **`+1.468%`** |
+
+---
+
+## ⏰ 4. 10:00 AM Entry Timing Study on 5-Gate Pre-Qualified Stocks (60-Day 15m Bars)
+
+Summary CSV: [`data/entry_timing_10am_5gate_summary.csv`](data/entry_timing_10am_5gate_summary.csv) | Trade Ledger: [`data/entry_timing_10am_5gate_trades.csv`](data/entry_timing_10am_5gate_trades.csv)
+
+| Entry Timing Window (on 5-Gate Stocks) | 60D Trades | Pure Intraday Win Rate | Avg Intraday Return | Profit Factor | Initial Stop-Out Rate | Hybrid (+3:10 PM Swing) Win Rate | Hybrid Avg Return |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. `09:30 AM` Early Open Chase** | `171` | `45.03%` | `-0.011%` | `0.97` | `35.09%` 🚨 | `53.80%` | `+0.417%` |
+| **2. `10:00 AM` Confirmed 5-Gate Sniper** | **`11`** | **`63.64%`** | **`+0.456%`** 🏆 | **`2.43`** 🏆 | **`9.09%`** ✅ | **`81.82%`** 🏆 | **`+1.997%`** 🏆 |
+| **3. `11:15 AM` Late Mid-Day Entry** | `65` | `66.15%` | `+0.298%` | `1.89` | `4.62%` | `73.85%` | `+1.176%` |
 
 ---
 

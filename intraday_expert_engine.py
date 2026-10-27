@@ -89,6 +89,13 @@ TOP_5_LOGICS_METADATA = {
         "cadence": "~1 trade every 5–8 trading days",
         "stop_architecture": "Structural S1 + Non-Exhausted Opening Gap Floor + 4-Stage Trail",
     },
+    "L6_5GATE_10AM_SNIPER": {
+        "name": "L6: 5-Gate Pre-Qualified 10:00 AM Intraday Sniper (Trail SL + Target)",
+        "regime_fit": ["BULL_EXPANSION", "SIDEWAYS_ROTATION", "HIGH_VOL_MACRO_SHOCK"],
+        "shift_type": "5-Gate Structural-Support Pre-Qualified 10:00 AM ORB + Dual Intraday/Swing Payoff",
+        "cadence": "~1 trade every 4–6 trading days",
+        "stop_architecture": "9:15–10:00 AM ORB Low / Structural S1 - 0.15*ATR + 4-Stage Chronological Trail & Target",
+    },
 }
 
 
@@ -484,6 +491,28 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             initial_sl = round(max(o_curr - 0.38 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.991), 2)
             conviction = min(99.0, 85.0 + max(ndx_ret, sp_ret, gold_ret) * 4.5)
 
+        # L6: 5-Gate Pre-Qualified 10:00 AM Intraday Sniper (Triggered ONLY when 5-Gate Swing Criteria are met at 10 AM)
+        meets_5gate_10am = (
+            c_prev > max(s1_floor, sma20)
+            and l_curr >= max(s1_floor, sma20 * 0.998)
+            and prev_close_pos >= 0.58
+            and (sma20 >= sma50 * 0.995 and sma50 > sma200)
+            and (prev_vol_ratio >= 1.15 and vol_ratio >= 1.25)
+            and mkt_regime != "BEAR_OR_CORRECTION"
+            and -0.10 <= gap_pct <= 1.10
+            and (o_curr - l_curr) <= 0.32 * atr
+            and c_curr >= o_curr + 0.26 * atr
+            and sec_ret_1d >= 0.25
+            and sector_rs_5d >= 0.20
+            and 50.0 <= rsi_prev <= 66.0
+        )
+        if matched_logic_id is None and meets_5gate_10am:
+            matched_logic_id = "L6_5GATE_10AM_SNIPER"
+            matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
+            entry_trigger = round(o_curr + 0.26 * atr, 2)
+            initial_sl = round(l_curr - 0.15 * atr, 2)
+            conviction = min(99.0, 88.0 + sector_rs_5d * 2.0 + (vol_ratio - 1.2) * 4.5)
+
         ladder = compute_downside_protection_ladder(c_curr, initial_sl, atr, s1_floor)
         swing_pred = predict_swing_conversion_success(
             entry_price=entry_trigger,
@@ -530,6 +559,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "Stage2_ProfitLock_SL": ladder["stage2_trail_sl"],
             "Stage3_Chandelier_SL": ladder["stage3_trail_sl"],
             "Intraday_Target": ladder["intraday_target"],
+            "Meets_5Gate_10AM_Entry": bool(meets_5gate_10am),
             "Swing_Conversion_Prob_Pct": swing_pred["predicted_swing_win_rate_pct"],
             "Swing_Conversion_Gates": swing_pred["gates_passed"],
             "Swing_Conversion_Verdict": swing_pred["verdict"],
