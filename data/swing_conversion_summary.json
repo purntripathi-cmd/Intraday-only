@@ -1,0 +1,31 @@
+{
+  "total_signals_3y": 4955,
+  "raw_intraday_win_rate_pct": 45.11,
+  "raw_intraday_avg_ret_pct": -0.055,
+  "stalled_310pm_count": 4601,
+  "stalled_intraday_win_rate_pct": 47.95,
+  "stalled_intraday_avg_ret_pct": 0.075,
+  "unconditional_swing_conversion_win_rate_pct": 60.7,
+  "unconditional_swing_conversion_avg_ret_pct": 0.382,
+  "loser_baghold_swing_win_rate_pct": 35.38,
+  "loser_baghold_swing_avg_ret_pct": -1.528,
+  "smart_gated_swing_conversion_count": 298,
+  "smart_gated_swing_conversion_win_rate_pct": 84.9,
+  "smart_gated_swing_conversion_avg_ret_pct": 1.96,
+  "smart_gated_swing_5d_win_rate_pct": 69.8,
+  "smart_gated_swing_5d_avg_ret_pct": 1.877,
+  "by_regime_smart_swing": {
+    "BULL_EXPANSION": {
+      "count": 187,
+      "intraday_avg_ret_pct": 1.383,
+      "swing_managed_win_rate_pct": 85.03,
+      "swing_managed_avg_ret_pct": 1.721
+    },
+    "SIDEWAYS_CONSOLIDATION": {
+      "count": 111,
+      "intraday_avg_ret_pct": 1.621,
+      "swing_managed_win_rate_pct": 84.68,
+      "swing_managed_avg_ret_pct": 2.363
+    }
+  }
+}

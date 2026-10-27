@@ -1,0 +1,66 @@
+name: Institutional Intraday Sniper & Downside Risk Daemon
+
+on:
+  schedule:
+    # 09:50 IST (04:20 UTC) — Morning 9:45 ORB / S1 Spring Sniper Scan
+    - cron: '20 4 * * 1-5'
+    # 11:30 IST (06:00 UTC) — Midday Chronological GTT & Trailing Stop Check
+    - cron: '0 6 * * 1-5'
+    # 13:30 IST (08:00 UTC) — Afternoon Chronological GTT & Trailing Stop Check
+    - cron: '0 8 * * 1-5'
+    # 15:10 IST (09:40 UTC) — 3:10 PM Smart Swing Conversion Gate / 3:15 PM Square-Off
+    - cron: '40 9 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution Mode'
+        required: true
+        default: 'FULL_CYCLE'
+        type: choice
+        options:
+          - FULL_CYCLE
+          - MORNING_SNIPER_SCAN
+          - CHRONOLOGICAL_GTT_CHECK
+          - EOD_310PM_SWING_GATE
+
+permissions:
+  contents: write
+
+jobs:
+  run-sniper-daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute Intraday Sniper Daemon
+        env:
+          TZ: 'Asia/Kolkata'
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python intraday_daemon.py --mode "${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "20 4 * * 1-5" ]; then
+            python intraday_daemon.py --mode MORNING_SNIPER_SCAN
+          elif [ "${{ github.event.schedule }}" = "40 9 * * 1-5" ]; then
+            python intraday_daemon.py --mode EOD_310PM_SWING_GATE
+          else
+            python intraday_daemon.py --mode CHRONOLOGICAL_GTT_CHECK
+          fi
+
+      - name: Commit Updated Sniper Ledger & Live Radar
+        run: |
+          git config user.name "intraday-sniper-bot"
+          git config user.email "intraday-sniper-bot@users.noreply.github.com"
+          git add data/*.csv data/*.json
+          git diff --staged --quiet || git commit -m "chore(sniper): automated intraday radar & chronological GTT update [skip ci]"
+          git pull --rebase origin main || true
+          git push origin main
