@@ -52,6 +52,13 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 SNIPER_TRADES_CSV = os.path.join(DATA_DIR, "intraday_sniper_trades.csv")
+SNIPER_TELEMETRY_CSV = os.path.join(DATA_DIR, "sniper_telemetry_trades.csv")
+
+# Strict Capital & Daily Slot Constraints (User Rule: ₹20K max/ticker, Max 3 entries/day, CNC Only)
+MAX_BUDGET_PER_TICKER_INR = 20000.0
+MAX_DAILY_ENTRIES = 3
+MAX_DAILY_TOTAL_BUDGET_INR = MAX_BUDGET_PER_TICKER_INR * MAX_DAILY_ENTRIES
+
 
 TOP_5_LOGICS_METADATA = {
     "L1_SECTOR_ORB_SNIPER": {
@@ -595,9 +602,11 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             cnc_order_action = "⚪ STANDBY (NO CNC ORDER)"
             cnc_order_type = "No Order — Wait for Alignment"
 
-        # Default ₹1,00,000 CNC cash allocation sizing (1x Delivery, zero MIS leverage)
-        default_cnc_capital = 100000.0
+        # Default ₹20,000 MAX CNC cash allocation sizing per ticker (1x Delivery, zero MIS leverage, Max 3 entries/day)
+        default_cnc_capital = 20000.0
         suggested_cnc_qty = max(1, int(default_cnc_capital // max(cnc_buy_limit, 1.0)))
+        if suggested_cnc_qty * cnc_buy_limit > default_cnc_capital and suggested_cnc_qty > 1:
+            suggested_cnc_qty -= 1
         cnc_order_value = round(suggested_cnc_qty * cnc_buy_limit, 2)
         per_share_risk = max(0.05, cnc_buy_limit - ladder["initial_stop_loss"])
         per_share_reward = max(0.05, ladder["intraday_target"] - cnc_buy_limit)
@@ -694,6 +703,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "Stage2_ProfitLock_SL": ladder["stage2_trail_sl"],
             "Stage3_Chandelier_SL": ladder["stage3_trail_sl"],
             "Intraday_Target": ladder["intraday_target"],
+            "ATR_14": round(atr, 2),
             "Swing_Conversion_Prob_Pct": swing_pred["predicted_swing_win_rate_pct"],
             "Swing_Conversion_Gates": swing_pred["gates_passed"],
             "Swing_Conversion_Verdict": swing_pred["verdict"],
@@ -707,12 +717,29 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     watchlist_df = pd.DataFrame(watchlist_rows).sort_values(
         ["Order_Priority_Rank", "Sniper_Readiness_Score", "5D_Rel_Strength_Pct"],
         ascending=[True, False, False],
-    )
-    sniper_df = (
-        pd.DataFrame(sniper_rows).sort_values(["Order_Priority_Rank", "Sniper_Readiness_Score"], ascending=[True, False])
-        if sniper_rows
-        else pd.DataFrame(columns=watchlist_df.columns)
-    )
+    ).reset_index(drop=True)
+
+    # Tag Top 3 Daily Entries (Max 3 entries/day @ <= ₹20,000/ticker = Max ₹60,000/day)
+    slot_labels = []
+    for i in range(len(watchlist_df)):
+        if i < MAX_DAILY_ENTRIES:
+            slot_labels.append(f"🏆 Top #{i+1}/3 (<=₹20K)")
+        else:
+            slot_labels.append("⚪ Standby (>Top 3 Cap)")
+    watchlist_df.insert(3, "Daily_Top3_Slot", slot_labels)
+
+    if sniper_rows:
+        sniper_df = pd.DataFrame(sniper_rows).sort_values(
+            ["Order_Priority_Rank", "Sniper_Readiness_Score", "5D_Rel_Strength_Pct"],
+            ascending=[True, False, False],
+        ).reset_index(drop=True)
+        s_slots = [
+            f"🏆 Top #{i+1}/3 (<=₹20K)" if i < MAX_DAILY_ENTRIES else "⚪ Standby (>Top 3 Cap)"
+            for i in range(len(sniper_df))
+        ]
+        sniper_df.insert(3, "Daily_Top3_Slot", s_slots)
+    else:
+        sniper_df = pd.DataFrame(columns=watchlist_df.columns)
 
     watchlist_df.to_csv(os.path.join(DATA_DIR, "live_watchlist_radar.csv"), index=False)
     sniper_df.to_csv(os.path.join(DATA_DIR, "live_sniper_signals.csv"), index=False)
@@ -722,16 +749,32 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     return regime_report, sniper_df, watchlist_df
 
 
-def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd.DataFrame:
+def _format_performance_verdict(pnl_inr: float, pnl_pct: float, is_closed: bool) -> str:
+    tag = "REALIZED" if is_closed else "LIVE"
+    if pnl_inr > 0.01:
+        return f"🟢 {tag} PROFIT +₹{pnl_inr:,.2f} (+{pnl_pct:.2f}%)"
+    elif pnl_inr < -0.01:
+        return f"🔴 {tag} LOSS -₹{abs(pnl_inr):,.2f} ({pnl_pct:.2f}%)"
+    return f"⚪ {tag} FLAT ₹0.00 (0.00%)"
+
+
+def evaluate_chronological_exits(
+    trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+    force_full_replay: bool = False,
+    eod_315pm_auto_exit: bool = True,
+    sync_purchase_candle_price: bool = True,
+    click_timestamp_str: str | None = None,
+) -> pd.DataFrame:
     """
-    Bug-Free Chronological 5-Minute CNC GTT & Trailing Stop Evaluator:
-    - Fixes Bug #1 from `smart-etf-tracker`: stores `Last_Evaluated_Bar_TS` and `High_Water_Mark`
-      so afternoon SL ratchets are NEVER checked against earlier morning bars.
-    - Computes live CNC GTT OCO Trigger & Limit prices (`GTT_SL_Trigger`, `GTT_SL_Limit`,
-      `GTT_Target_Trigger`, `GTT_Target_Limit`, `Exit_Readiness_Status`, `Product_Type="CNC"`).
-    - At 3:10 PM IST, automatically evaluates the 5-Gate Smart Swing Conversion rule:
-      if a trade has not hit intraday target or SL and passes all 5 gates (84.9% historical win rate),
-      it upgrades Status to `SWING_CONVERTED` (Hold CNC Overnight) instead of forcing an EOD exit.
+    Bug-Free Chronological 5-Minute CNC Auto-Exit & Late-Click Historical Candle Replay Engine:
+    - Enforces ₹20,000 max budget per ticker (`MAX_BUDGET_PER_TICKER_INR = 20000.0`) and Max 3 entries/day.
+    - Tracks 5-minute candles starting strictly 5 minutes AFTER purchase time (`Purchase_Time + 5m`,
+      e.g. `10:05 IST` for a `10:00 AM` entry) up to `3:15 PM IST` (`15:15:00`) or the time the button
+      was clicked (`click_timestamp_str`).
+    - If a manual click is done late (afternoon, after market close, or on a subsequent day), it loads
+      historical 5-minute candles from the purchase date & time up to click time / 3:15 PM to check if
+      any exit condition was met (Stop Loss, 4-Stage Trailing Stop, Profit Target, or 3:15 PM EOD close)
+      and records the exact exit candle, exit price, and Profit/Loss (`PnL_INR` and `PnL_Pct`).
     """
     if not os.path.exists(trades_csv_path):
         return pd.DataFrame()
@@ -740,104 +783,287 @@ def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd
     if df.empty:
         return df
 
-    # Ensure CNC & GTT columns exist on the active trade ledger
+    for sc in ("Status", "Exit_Timestamp", "Exit_Reason", "GTT_Order_Status", "Performance_Verdict"):
+        if sc in df.columns:
+            df[sc] = df[sc].fillna("").astype(object)
+
+    # Ensure all required CNC, GTT, Top-3 Slot, Replay & Performance columns exist with proper dtypes
+    str_cols = [
+        "Daily_Slot", "Ticker", "Product_Type", "Purchase_Date", "Purchase_Time",
+        "GTT_Order_Status", "Active_Trail_Stage", "CNC_310PM_Decision",
+        "Performance_Verdict", "Replay_Audit_Trail", "Status",
+        "Entry_Timestamp", "Last_Evaluated_Bar_TS", "Exit_Timestamp", "Exit_Reason",
+    ]
     for col, default_val in [
+        ("Daily_Slot", "Slot #1/3"),
         ("Product_Type", "CNC (Delivery - 0% MIS)"),
-        ("CNC_Qty", 45),
+        ("CNC_Qty", 1),
+        ("Capital_Used_INR", 0.0),
+        ("Max_Budget_INR", MAX_BUDGET_PER_TICKER_INR),
+        ("Purchase_Date", ""),
+        ("Purchase_Time", "10:00:00"),
         ("GTT_Order_Status", "🛡️ GTT OCO ARMED (HOLD CNC)"),
         ("GTT_SL_Trigger", 0.0),
         ("GTT_SL_Limit", 0.0),
         ("GTT_Target_Trigger", 0.0),
         ("GTT_Target_Limit", 0.0),
         ("Active_Trail_Stage", "Stage 0: Initial S1/ORB Floor"),
-        ("CNC_310PM_Decision", "🟠 EXIT CNC BY 3:20 PM IST (If <5 Gates)"),
+        ("CNC_310PM_Decision", "🟠 EXIT CNC BY 3:15 PM IST"),
+        ("PnL_INR", 0.0),
+        ("PnL_Pct", 0.0),
+        ("Performance_Verdict", "⚪ FLAT ₹0.00 (0.00%)"),
+        ("Bars_Tracked_5m", 0),
+        ("Window_Low_5m", 0.0),
+        ("Window_High_5m", 0.0),
+        ("Replay_Audit_Trail", ""),
+        ("Exit_Timestamp", ""),
+        ("Exit_Reason", ""),
     ]:
         if col not in df.columns:
             df[col] = default_val
+    for sc in str_cols:
+        if sc in df.columns:
+            df[sc] = df[sc].fillna("").astype(object)
 
-    active_mask = df["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"])
-    if not active_mask.any():
+    if force_full_replay:
+        eval_mask = pd.Series(True, index=df.index)
+    else:
+        eval_mask = df["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"])
+
+    if not eval_mask.any():
         return df
 
-    tickers = sorted(list({f"{t}.NS" for t in df.loc[active_mask, "Ticker"].unique()}))
-    data_5m = yf.download(tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=True)
+    click_ts = pd.to_datetime(click_timestamp_str) if click_timestamp_str else pd.Timestamp.now()
 
-    for idx in df[active_mask].index:
-        ticker = str(df.at[idx, "Ticker"]).strip()
+    # Determine if any trade requires >5d of 5m history (up to 60d supported by Yahoo Finance for 5m)
+    min_entry_ts = click_ts
+    for idx in df[eval_mask].index:
+        raw_ts = str(df.at[idx, "Entry_Timestamp"]) if "Entry_Timestamp" in df.columns else ""
+        try:
+            ets = pd.to_datetime(raw_ts)
+            if ets < min_entry_ts:
+                min_entry_ts = ets
+        except Exception:
+            pass
+    days_back = max(1, (click_ts - min_entry_ts).days + 2)
+    yf_period = "60d" if days_back > 5 else "5d"
+
+    tickers = sorted(list({f"{str(t).strip().replace('.NS', '')}.NS" for t in df.loc[eval_mask, "Ticker"].unique()}))
+    data_5m = yf.download(tickers, period=yf_period, interval="5m", group_by="ticker", progress=False, threads=True)
+
+    for idx in df[eval_mask].index:
+        ticker = str(df.at[idx, "Ticker"]).strip().replace(".NS", "")
         sym = f"{ticker}.NS"
         entry_p = float(df.at[idx, "Entry_Price"])
-        curr_sl = float(df.at[idx, "Current_Trailing_SL"])
-        target_p = float(df.at[idx, "Target_Price"])
-        s1_floor = float(df.at[idx, "Structural_S1_Floor"])
-        atr = float(df.at[idx, "ATR_At_Entry"]) if "ATR_At_Entry" in df.columns and pd.notna(df.at[idx, "ATR_At_Entry"]) else entry_p * 0.015
-        hwm = float(df.at[idx, "High_Water_Mark"]) if "High_Water_Mark" in df.columns and pd.notna(df.at[idx, "High_Water_Mark"]) else entry_p
+        s1_floor = float(df.at[idx, "Structural_S1_Floor"]) if "Structural_S1_Floor" in df.columns and pd.notna(df.at[idx, "Structural_S1_Floor"]) else round(entry_p * 0.98, 2)
+        atr = float(df.at[idx, "ATR_At_Entry"]) if "ATR_At_Entry" in df.columns and pd.notna(df.at[idx, "ATR_At_Entry"]) else round(entry_p * 0.015, 2)
+        init_sl = float(df.at[idx, "Initial_SL"]) if "Initial_SL" in df.columns and pd.notna(df.at[idx, "Initial_SL"]) else round(entry_p - 0.95 * atr, 2)
+        target_p = float(df.at[idx, "Target_Price"]) if "Target_Price" in df.columns and pd.notna(df.at[idx, "Target_Price"]) else round(entry_p + 1.80 * atr, 2)
+
+        # Parse Entry_Timestamp; if outside market hours (e.g. evening test click), normalize purchase time to 10:00:00 on the session date
+        raw_entry_ts = str(df.at[idx, "Entry_Timestamp"]) if "Entry_Timestamp" in df.columns and pd.notna(df.at[idx, "Entry_Timestamp"]) else click_ts.strftime("%Y-%m-%d 10:00:00")
+        try:
+            entry_ts = pd.to_datetime(raw_entry_ts)
+        except Exception:
+            entry_ts = pd.to_datetime(click_ts.strftime("%Y-%m-%d 10:00:00"))
+
+        bars = pd.DataFrame()
+        if len(tickers) == 1 and "Close" in data_5m.columns and not isinstance(data_5m.columns, pd.MultiIndex):
+            bars = data_5m.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+        elif sym in data_5m.columns.get_level_values(0):
+            bars = data_5m[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+
+        if not bars.empty:
+            if bars.index.tz is not None:
+                bars.index = bars.index.tz_convert("Asia/Kolkata").tz_localize(None)
+
+            # If entry_ts date has no bars (e.g. weekend/holiday) or time is after 15:10, map to latest available session date @ 10:00 AM
+            avail_dates = sorted(list(set(bars.index.date)))
+            if entry_ts.date() not in avail_dates and avail_dates:
+                # Pick latest session date <= entry_ts.date(), or latest overall
+                prior_dates = [d for d in avail_dates if d <= entry_ts.date()]
+                session_date = prior_dates[-1] if prior_dates else avail_dates[-1]
+                p_time_str = str(df.at[idx, "Purchase_Time"]) if pd.notna(df.at[idx, "Purchase_Time"]) and str(df.at[idx, "Purchase_Time"]).strip() not in ("", "nan") else "10:00:00"
+                entry_ts = pd.to_datetime(f"{session_date} {p_time_str}")
+
+            if entry_ts.time() > pd.Timestamp("15:10:00").time() or entry_ts.time() < pd.Timestamp("09:15:00").time():
+                entry_ts = pd.to_datetime(f"{entry_ts.date()} 10:00:00")
+                df.at[idx, "Entry_Timestamp"] = entry_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+            df.at[idx, "Purchase_Date"] = str(entry_ts.date())
+            df.at[idx, "Purchase_Time"] = entry_ts.strftime("%H:%M:%S")
+
+            # Optional: anchor Entry_Price to the actual 5m candle close at Purchase_Time
+            if sync_purchase_candle_price:
+                same_day_bars = bars[(bars.index.date == entry_ts.date()) & (bars.index <= entry_ts)]
+                if not same_day_bars.empty:
+                    entry_p = round(float(same_day_bars["Close"].iloc[-1]), 2)
+                    df.at[idx, "Entry_Price"] = entry_p
+                    ladder_recalc = compute_downside_protection_ladder(entry_p, entry_p - 0.95 * atr, atr, s1_floor)
+                    init_sl = ladder_recalc["initial_stop_loss"]
+                    target_p = ladder_recalc["intraday_target"]
+                    df.at[idx, "Initial_SL"] = init_sl
+                    df.at[idx, "Target_Price"] = target_p
+
+        # Enforce <= ₹20,000 max budget per ticker
+        budget_cap = min(MAX_BUDGET_PER_TICKER_INR, float(df.at[idx, "Max_Budget_INR"]) if "Max_Budget_INR" in df.columns and pd.notna(df.at[idx, "Max_Budget_INR"]) and float(df.at[idx, "Max_Budget_INR"]) > 0 else MAX_BUDGET_PER_TICKER_INR)
+        cnc_qty = max(1, int(budget_cap // max(entry_p, 1.0)))
+        if cnc_qty * entry_p > budget_cap and cnc_qty > 1:
+            cnc_qty -= 1
+        capital_used = round(cnc_qty * entry_p, 2)
 
         df.at[idx, "Product_Type"] = "CNC (Delivery - 0% MIS)"
-        df.at[idx, "CNC_Qty"] = max(1, int(100000.0 // max(entry_p, 1.0)))
+        df.at[idx, "Max_Budget_INR"] = budget_cap
+        df.at[idx, "CNC_Qty"] = cnc_qty
+        df.at[idx, "Capital_Used_INR"] = capital_used
 
-        entry_ts = pd.to_datetime(str(df.at[idx, "Entry_Timestamp"]))
-        last_eval_str = str(df.at[idx, "Last_Evaluated_Bar_TS"]) if "Last_Evaluated_Bar_TS" in df.columns and pd.notna(df.at[idx, "Last_Evaluated_Bar_TS"]) else ""
-        cutoff_ts = pd.to_datetime(last_eval_str) if last_eval_str and last_eval_str != "nan" else entry_ts
+        # Tracking starts strictly 5 minutes after purchase time (e.g. 10:05:00 for 10:00:00 entry)
+        track_start_ts = entry_ts + pd.Timedelta(minutes=5)
+        eod_315_ts = pd.to_datetime(f"{entry_ts.date()} 15:15:00")
+
+        if force_full_replay:
+            curr_sl = init_sl
+            hwm = entry_p
+            cutoff_ts = track_start_ts - pd.Timedelta(seconds=1)
+            df.at[idx, "Status"] = "ACTIVE_INTRADAY"
+            df.at[idx, "Exit_Price"] = np.nan
+            df.at[idx, "Exit_Timestamp"] = ""
+            df.at[idx, "Exit_Reason"] = ""
+        else:
+            curr_sl = float(df.at[idx, "Current_Trailing_SL"]) if pd.notna(df.at[idx, "Current_Trailing_SL"]) else init_sl
+            hwm = float(df.at[idx, "High_Water_Mark"]) if "High_Water_Mark" in df.columns and pd.notna(df.at[idx, "High_Water_Mark"]) else entry_p
+            last_eval_str = str(df.at[idx, "Last_Evaluated_Bar_TS"]) if "Last_Evaluated_Bar_TS" in df.columns and pd.notna(df.at[idx, "Last_Evaluated_Bar_TS"]) else ""
+            try:
+                parsed_last = pd.to_datetime(last_eval_str) if last_eval_str and last_eval_str != "nan" else (track_start_ts - pd.Timedelta(seconds=1))
+                cutoff_ts = max(parsed_last, track_start_ts - pd.Timedelta(seconds=1))
+            except Exception:
+                cutoff_ts = track_start_ts - pd.Timedelta(seconds=1)
 
         exited = False
-        if sym in data_5m.columns.get_level_values(0):
-            bars = data_5m[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
-            if not bars.empty:
-                if bars.index.tz is not None:
-                    bars.index = bars.index.tz_convert("Asia/Kolkata").tz_localize(None)
+        bars_tracked = int(df.at[idx, "Bars_Tracked_5m"]) if not force_full_replay and pd.notna(df.at[idx, "Bars_Tracked_5m"]) else 0
+        win_low = entry_p
+        win_high = entry_p
+        stage_events = []
 
-                # Strictly filter ONLY new bars strictly AFTER cutoff_ts
-                new_bars = bars[bars.index > cutoff_ts]
-                for b_ts, b_row in new_bars.iterrows():
-                    bl = float(b_row["Low"])
-                    bh = float(b_row["High"])
-                    bc = float(b_row["Close"])
+        if not bars.empty:
+            # Filter 5m candles on purchase date from Purchase_Time + 5m up to min(click_ts, 15:15 IST)
+            # (or multi-day if SWING_CONVERTED and not eod_315pm_auto_exit)
+            if eod_315pm_auto_exit:
+                upper_bound_ts = min(click_ts, eod_315_ts)
+                window_bars = bars[(bars.index > cutoff_ts) & (bars.index >= track_start_ts) & (bars.index <= upper_bound_ts) & (bars.index.date == entry_ts.date())]
+            else:
+                window_bars = bars[(bars.index > cutoff_ts) & (bars.index >= track_start_ts) & (bars.index <= click_ts)]
 
-                    # 1) Check active stop loss BEFORE upgrading HWM/SL from current bar's high
-                    if bl <= curr_sl:
-                        df.at[idx, "Status"] = "STOP_OR_TRAIL_EXIT"
-                        df.at[idx, "Exit_Price"] = round(curr_sl, 2)
-                        df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                        df.at[idx, "Exit_Reason"] = f"CNC GTT SL/Trail Executed at {b_ts.strftime('%H:%M')} (SL ₹{curr_sl:.2f})"
-                        df.at[idx, "GTT_Order_Status"] = f"🛑 GTT SL EXECUTED @ ₹{curr_sl:.2f} (CNC Sold)"
-                        df.at[idx, "PnL_Pct"] = round((curr_sl - entry_p) / entry_p * 100.0, 2)
-                        df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                        exited = True
-                        break
+            if not window_bars.empty:
+                win_low = float(window_bars["Low"].min())
+                win_high = float(window_bars["High"].max())
 
-                    # 2) Check target achievement
-                    if bh >= target_p:
-                        df.at[idx, "Status"] = "TARGET_ACHIEVED"
-                        df.at[idx, "Exit_Price"] = round(target_p, 2)
-                        df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                        df.at[idx, "Exit_Reason"] = f"CNC GTT Target Executed at {b_ts.strftime('%H:%M')} (₹{target_p:.2f})"
-                        df.at[idx, "GTT_Order_Status"] = f"🎯 GTT TARGET EXECUTED @ ₹{target_p:.2f} (CNC Sold)"
-                        df.at[idx, "PnL_Pct"] = round((target_p - entry_p) / entry_p * 100.0, 2)
-                        df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                        exited = True
-                        break
+            for b_ts, b_row in window_bars.iterrows():
+                # Skip any post-3:15 PM bars on purchase date
+                if b_ts.date() == entry_ts.date() and b_ts.time() > pd.Timestamp("15:15:00").time():
+                    continue
 
-                    # 3) Upgrade High-Water-Mark and 4-Stage Trailing Stop for SUBSEQUENT bars only
-                    hwm = max(hwm, bh)
-                    mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
-                    if mfe_atr >= 2.20:
-                        curr_sl = max(curr_sl, round(hwm - 0.50 * atr, 2))
-                    elif mfe_atr >= 1.75:
-                        curr_sl = max(curr_sl, round(entry_p + 1.15 * atr, 2))
-                    elif mfe_atr >= 1.25:
-                        curr_sl = max(curr_sl, round(entry_p + 0.65 * atr, 2))
-                    elif mfe_atr >= 0.80:
-                        curr_sl = max(curr_sl, round(entry_p + 0.18 * atr, 2))
+                bars_tracked += 1
+                bl = float(b_row["Low"])
+                bh = float(b_row["High"])
+                bc = float(b_row["Close"])
 
-                    df.at[idx, "High_Water_Mark"] = round(hwm, 2)
-                    df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
-                    df.at[idx, "Live_CMP"] = round(bc, 2)
-                    df.at[idx, "PnL_Pct"] = round((bc - entry_p) / entry_p * 100.0, 2)
+                # 1) Check active stop loss / trailing stop BEFORE upgrading HWM/SL from current bar's high
+                if bl <= curr_sl:
+                    exit_p = round(curr_sl, 2)
+                    pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
+                    pnl_inr = round((exit_p - entry_p) * cnc_qty, 2)
+                    df.at[idx, "Status"] = "STOP_OR_TRAIL_EXIT"
+                    df.at[idx, "Exit_Price"] = exit_p
+                    df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    df.at[idx, "Exit_Reason"] = f"🛑 5m Candle Low (₹{bl:.2f}) hit SL/Trail ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
+                    df.at[idx, "GTT_Order_Status"] = f"🛑 AUTO-EXITED @ ₹{exit_p:.2f} ({b_ts.strftime('%H:%M')} SL/Trail Hit)"
+                    df.at[idx, "Live_CMP"] = exit_p
+                    df.at[idx, "PnL_Pct"] = pnl_pct
+                    df.at[idx, "PnL_INR"] = pnl_inr
+                    df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, True)
                     df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    stage_events.append(f"{b_ts.strftime('%H:%M')} SL/Trail Exit @ ₹{exit_p:.2f}")
+                    exited = True
+                    break
+
+                # 2) Check intraday profit target achievement
+                if bh >= target_p:
+                    exit_p = round(target_p, 2)
+                    pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
+                    pnl_inr = round((exit_p - entry_p) * cnc_qty, 2)
+                    df.at[idx, "Status"] = "TARGET_ACHIEVED"
+                    df.at[idx, "Exit_Price"] = exit_p
+                    df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    df.at[idx, "Exit_Reason"] = f"🎯 5m Candle High (₹{bh:.2f}) hit Profit Target ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
+                    df.at[idx, "GTT_Order_Status"] = f"🎯 AUTO-EXITED @ ₹{exit_p:.2f} ({b_ts.strftime('%H:%M')} Target Hit)"
+                    df.at[idx, "Live_CMP"] = exit_p
+                    df.at[idx, "PnL_Pct"] = pnl_pct
+                    df.at[idx, "PnL_INR"] = pnl_inr
+                    df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, True)
+                    df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    stage_events.append(f"{b_ts.strftime('%H:%M')} Target Hit @ ₹{exit_p:.2f}")
+                    exited = True
+                    break
+
+                # 3) Upgrade High-Water-Mark and 4-Stage Trailing Stop for SUBSEQUENT 5m bars
+                prev_sl = curr_sl
+                hwm = max(hwm, bh)
+                mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
+                if mfe_atr >= 2.20:
+                    curr_sl = max(curr_sl, round(hwm - 0.50 * atr, 2))
+                elif mfe_atr >= 1.75:
+                    curr_sl = max(curr_sl, round(entry_p + 1.15 * atr, 2))
+                elif mfe_atr >= 1.25:
+                    curr_sl = max(curr_sl, round(entry_p + 0.65 * atr, 2))
+                elif mfe_atr >= 0.80:
+                    curr_sl = max(curr_sl, round(entry_p + 0.18 * atr, 2))
+
+                if curr_sl > prev_sl:
+                    stage_events.append(f"{b_ts.strftime('%H:%M')} Trail SL->{curr_sl:.2f}")
+
+                df.at[idx, "High_Water_Mark"] = round(hwm, 2)
+                df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
+                df.at[idx, "Live_CMP"] = round(bc, 2)
+                pnl_pct = round((bc - entry_p) / entry_p * 100.0, 2)
+                pnl_inr = round((bc - entry_p) * cnc_qty, 2)
+                df.at[idx, "PnL_Pct"] = pnl_pct
+                df.at[idx, "PnL_INR"] = pnl_inr
+                df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, False)
+                df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+                # 4) Check 3:15 PM IST (15:15:00) Auto-Exit Rule on Purchase Date
+                if eod_315pm_auto_exit and b_ts.date() == entry_ts.date() and b_ts.time() >= pd.Timestamp("15:15:00").time():
+                    exit_p = round(bc, 2)
+                    pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
+                    pnl_inr = round((exit_p - entry_p) * cnc_qty, 2)
+                    df.at[idx, "Status"] = "AUTO_EXIT_315PM_CLOSE"
+                    df.at[idx, "Exit_Price"] = exit_p
+                    df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    df.at[idx, "Exit_Reason"] = f"⏰ 3:15 PM IST Auto-Exit @ Candle Close ₹{exit_p:.2f} (Peak ₹{hwm:.2f}, Trail SL ₹{curr_sl:.2f})"
+                    df.at[idx, "GTT_Order_Status"] = f"⏰ AUTO-EXITED @ ₹{exit_p:.2f} (3:15 PM IST Close)"
+                    df.at[idx, "Live_CMP"] = exit_p
+                    df.at[idx, "PnL_Pct"] = pnl_pct
+                    df.at[idx, "PnL_INR"] = pnl_inr
+                    df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, True)
+                    stage_events.append(f"15:15 3:15PM Close Exit @ ₹{exit_p:.2f}")
+                    exited = True
+                    break
+
+        df.at[idx, "Bars_Tracked_5m"] = bars_tracked
+        df.at[idx, "Window_Low_5m"] = round(win_low, 2)
+        df.at[idx, "Window_High_5m"] = round(win_high, 2)
 
         if not exited:
             df.at[idx, "High_Water_Mark"] = round(hwm, 2)
             df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
+            live_cmp = float(df.at[idx, "Live_CMP"]) if "Live_CMP" in df.columns and pd.notna(df.at[idx, "Live_CMP"]) else entry_p
+            pnl_pct = round((live_cmp - entry_p) / entry_p * 100.0, 2)
+            pnl_inr = round((live_cmp - entry_p) * cnc_qty, 2)
+            df.at[idx, "PnL_Pct"] = pnl_pct
+            df.at[idx, "PnL_INR"] = pnl_inr
+            df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, False)
+
             mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
             if mfe_atr >= 2.20:
                 stage_lbl = "Stage 4: Chandelier Trail (HWM - 0.50 ATR)"
@@ -858,6 +1084,11 @@ def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd
             df.at[idx, "Active_Trail_Stage"] = stage_lbl
             df.at[idx, "GTT_Order_Status"] = gtt_status
 
+        audit_head = f"Tracked {bars_tracked} bars ({track_start_ts.strftime('%H:%M')}->15:15) | Range ₹{win_low:.2f}-₹{win_high:.2f}"
+        if stage_events:
+            audit_head += " | " + " -> ".join(stage_events[-3:])
+        df.at[idx, "Replay_Audit_Trail"] = audit_head
+
         df.at[idx, "GTT_SL_Trigger"] = round(curr_sl, 2)
         df.at[idx, "GTT_SL_Limit"] = round(curr_sl * 0.997, 2)
         df.at[idx, "GTT_Target_Trigger"] = round(target_p, 2)
@@ -865,13 +1096,246 @@ def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd
 
         prob = float(df.at[idx, "Swing_Conversion_Prob_Pct"]) if "Swing_Conversion_Prob_Pct" in df.columns and pd.notna(df.at[idx, "Swing_Conversion_Prob_Pct"]) else 50.0
         if prob >= 80.0:
-            df.at[idx, "CNC_310PM_Decision"] = "🟢 HOLD CNC OVERNIGHT (Passed 5/5 Swing Gates)"
+            df.at[idx, "CNC_310PM_Decision"] = "🟢 3:15 PM Auto-Exit OR Hold CNC (Passed 5/5 Swing Gates)"
         elif prob >= 70.0:
-            df.at[idx, "CNC_310PM_Decision"] = "🟡 HOLD 50% CNC / EXIT 50% @ 3:10 PM (4/5 Gates)"
+            df.at[idx, "CNC_310PM_Decision"] = "🟡 3:15 PM Auto-Exit OR Hold 50% CNC (4/5 Gates)"
         else:
-            df.at[idx, "CNC_310PM_Decision"] = "🟠 EXIT CNC BY 3:20 PM (Cancel GTT & Sell CNC)"
+            df.at[idx, "CNC_310PM_Decision"] = "🟠 AUTO-EXIT CNC AT 3:15 PM IST"
 
     df.to_csv(trades_csv_path, index=False)
+    if trades_csv_path != SNIPER_TRADES_CSV:
+        df.to_csv(SNIPER_TRADES_CSV, index=False)
+    return df
+
+
+def stage_ticker_into_top3_cnc(
+    ticker: str,
+    watchlist_df: pd.DataFrame,
+    regime_badge: str = "TRENDING_OR_ROTATION",
+    entry_price: float | None = None,
+    budget_inr: float = MAX_BUDGET_PER_TICKER_INR,
+    purchase_date_str: str | None = None,
+    purchase_time_str: str = "10:00:00",
+    eod_315pm_auto_exit: bool = True,
+    sync_purchase_candle_price: bool = False,
+    replace_slot3_if_full: bool = True,
+    trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+) -> tuple[bool, str, pd.DataFrame]:
+    """
+    Stages a selected ticker into the Top 3 daily CNC entries (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`)
+    with a strict maximum budget of ₹20,000 per ticker (`MAX_BUDGET_PER_TICKER_INR = 20000.0`)
+    and max 3 entries per day (`MAX_DAILY_ENTRIES = 3`), then immediately runs the 5-minute
+    candle replay from `Purchase_Time + 5m` through `3:15 PM IST` / click time.
+    """
+    clean_ticker = str(ticker).strip().replace(".NS", "")
+    budget_cap = min(MAX_BUDGET_PER_TICKER_INR, max(1000.0, float(budget_inr)))
+
+    row_match = watchlist_df[watchlist_df["Ticker"] == clean_ticker]
+    if row_match.empty:
+        return False, f"Ticker {clean_ticker} not found in live watchlist radar.", pd.DataFrame()
+    r = row_match.iloc[0]
+
+    # Resolve purchase date (if not provided, use latest session date from existing ledger or today)
+    now_ist = pd.Timestamp.now()
+    if not purchase_date_str:
+        purchase_date_str = now_ist.strftime("%Y-%m-%d")
+    if len(purchase_time_str.strip()) == 5:
+        purchase_time_str = purchase_time_str.strip() + ":00"
+    entry_ts_str = f"{purchase_date_str} {purchase_time_str}"
+
+    eff_entry_p = round(float(entry_price if entry_price and entry_price > 0 else r["CNC_Buy_Limit_Price"]), 2)
+    s1_floor = round(float(r["Structural_S1_Floor"]), 2)
+    atr_val = round(float(r["ATR_14"]) if "ATR_14" in r and pd.notna(r["ATR_14"]) else max(eff_entry_p * 0.015, ( float(r["Intraday_Target"]) - eff_entry_p ) / 1.80), 2)
+    ladder = compute_downside_protection_ladder(eff_entry_p, eff_entry_p - 0.95 * atr_val, atr_val, s1_floor)
+
+    cnc_qty = max(1, int(budget_cap // max(eff_entry_p, 1.0)))
+    if cnc_qty * eff_entry_p > budget_cap and cnc_qty > 1:
+        cnc_qty -= 1
+    cap_used = round(cnc_qty * eff_entry_p, 2)
+
+    if os.path.exists(trades_csv_path):
+        df = pd.read_csv(trades_csv_path)
+    else:
+        df = pd.DataFrame()
+
+    if not df.empty and "Purchase_Date" not in df.columns and "Entry_Timestamp" in df.columns:
+        df["Purchase_Date"] = df["Entry_Timestamp"].astype(str).str.slice(0, 10)
+
+    # Check existing entries for the same session date (or overall Top 3 active deck)
+    existing_idx = None
+    if not df.empty and "Ticker" in df.columns:
+        same_t = df[df["Ticker"].astype(str) == clean_ticker]
+        if not same_t.empty:
+            existing_idx = same_t.index[-1]
+
+    if existing_idx is None and not df.empty:
+        if len(df) >= MAX_DAILY_ENTRIES:
+            if replace_slot3_if_full:
+                # Replace Slot #3/3 so Top 3 cap (max 3 entries/day) is strictly preserved
+                existing_idx = df.index[MAX_DAILY_ENTRIES - 1]
+                df = df.iloc[:MAX_DAILY_ENTRIES].copy()
+            else:
+                return (
+                    False,
+                    f"⚠️ Max {MAX_DAILY_ENTRIES} entries/day cap reached (₹60,000 max daily budget). Enable 'Replace Slot #3' or reset slots.",
+                    df,
+                )
+
+    slot_num = (df.index.get_loc(existing_idx) + 1) if existing_idx is not None else (len(df) + 1)
+    slot_label = f"Slot #{min(slot_num, MAX_DAILY_ENTRIES)}/3"
+
+    new_rec = {
+        "Daily_Slot": slot_label,
+        "Ticker": clean_ticker,
+        "Product_Type": "CNC (Delivery - 0% MIS)",
+        "CNC_Qty": cnc_qty,
+        "Capital_Used_INR": cap_used,
+        "Max_Budget_INR": budget_cap,
+        "Purchase_Date": purchase_date_str,
+        "Purchase_Time": purchase_time_str,
+        "Logic_ID": r.get("Matched_Sniper_Logic_ID", r.get("Best_Logic_ID", "L6_5GATE_10AM_ORB")),
+        "Logic_Name": r.get("Matched_Sniper_Logic_Name", r.get("Best_Logic_Name", "10:00 AM 5-Gate ORB")),
+        "Market_Regime": regime_badge,
+        "Entry_Timestamp": entry_ts_str,
+        "Entry_Price": eff_entry_p,
+        "Live_CMP": round(float(r["Live_Price"]), 2),
+        "Structural_S1_Floor": s1_floor,
+        "ATR_At_Entry": atr_val,
+        "Initial_SL": ladder["initial_stop_loss"],
+        "Current_Trailing_SL": ladder["initial_stop_loss"],
+        "High_Water_Mark": eff_entry_p,
+        "Stage1_Breakeven_SL": ladder["stage1_trail_sl"],
+        "Stage2_ProfitLock_SL": ladder["stage2_trail_sl"],
+        "Stage3_Chandelier_SL": ladder["stage3_trail_sl"],
+        "Target_Price": ladder["intraday_target"],
+        "GTT_Order_Status": f"🛡️ GTT OCO ARMED: SL ₹{ladder['initial_stop_loss']:.2f} | TGT ₹{ladder['intraday_target']:.2f}",
+        "GTT_SL_Trigger": ladder["initial_stop_loss"],
+        "GTT_SL_Limit": ladder["gtt_sl_limit_price"],
+        "GTT_Target_Trigger": ladder["intraday_target"],
+        "GTT_Target_Limit": ladder["gtt_target_limit_price"],
+        "Active_Trail_Stage": "Stage 0: Initial S1/ORB Floor",
+        "CNC_310PM_Decision": r.get("CNC_310PM_Decision", "🟠 AUTO-EXIT CNC AT 3:15 PM IST"),
+        "Swing_Conversion_Prob_Pct": r.get("Swing_Conversion_Prob_Pct", 84.9),
+        "Swing_Conversion_Verdict": r.get("Swing_Conversion_Verdict", ""),
+        "Status": "ACTIVE_INTRADAY",
+        "PnL_INR": 0.0,
+        "PnL_Pct": 0.0,
+        "Performance_Verdict": "⚪ FLAT ₹0.00 (0.00%)",
+        "Bars_Tracked_5m": 0,
+        "Window_Low_5m": eff_entry_p,
+        "Window_High_5m": eff_entry_p,
+        "Replay_Audit_Trail": "",
+        "Last_Evaluated_Bar_TS": entry_ts_str,
+        "Exit_Timestamp": "",
+        "Exit_Price": np.nan,
+        "Exit_Reason": "",
+    }
+
+    if existing_idx is not None:
+        for k, v in new_rec.items():
+            df.at[existing_idx, k] = v
+    else:
+        df = pd.concat([df, pd.DataFrame([new_rec])], ignore_index=True)
+
+    # Strictly cap ledger to Top 3 entries for the day and re-number slots #1/3, #2/3, #3/3
+    df = df.head(MAX_DAILY_ENTRIES).reset_index(drop=True)
+    df["Daily_Slot"] = [f"Slot #{i+1}/3" for i in range(len(df))]
+    df.to_csv(trades_csv_path, index=False)
+
+    # Immediately run the 5-minute candle replay from Purchase_Time + 5m to min(click_time, 3:15 PM)
+    df = evaluate_chronological_exits(
+        trades_csv_path=trades_csv_path,
+        force_full_replay=True,
+        eod_315pm_auto_exit=eod_315pm_auto_exit,
+        sync_purchase_candle_price=sync_purchase_candle_price,
+    )
+    row_out = df[df["Ticker"] == clean_ticker].iloc[-1]
+    msg = (
+        f"✅ Staged **{clean_ticker}** in **{row_out['Daily_Slot']}** | "
+        f"Qty: **{int(row_out['CNC_Qty'])} CNC** (`₹{float(row_out['Capital_Used_INR']):,.2f} <= ₹20,000`) | "
+        f"Entry: `₹{float(row_out['Entry_Price']):,.2f}` @ `{row_out['Purchase_Time']}` | "
+        f"Status: **{row_out['Status']}** | **{row_out['Performance_Verdict']}**"
+    )
+    return True, msg, df
+
+
+def stage_top3_daily_cnc_entries(
+    watchlist_df: pd.DataFrame,
+    regime_badge: str = "TRENDING_OR_ROTATION",
+    purchase_time_str: str = "10:00:00",
+    eod_315pm_auto_exit: bool = True,
+    sync_purchase_candle_price: bool = True,
+    trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+) -> pd.DataFrame:
+    """
+    Populates the Top 3 daily CNC slots (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`) using the top 3
+    ranked candidates from `watchlist_df` with max ₹20,000 budget per ticker (<= ₹60,000 total)
+    and replays 5-minute candles from `Purchase_Time + 5m` through `3:15 PM IST`.
+    """
+    if watchlist_df.empty:
+        return pd.DataFrame()
+
+    # Clear existing file so Top 3 slots are cleanly built
+    if os.path.exists(trades_csv_path):
+        os.remove(trades_csv_path)
+
+    top3 = watchlist_df.head(MAX_DAILY_ENTRIES)
+    df_out = pd.DataFrame()
+    for _, r in top3.iterrows():
+        _, _, df_out = stage_ticker_into_top3_cnc(
+            ticker=str(r["Ticker"]),
+            watchlist_df=watchlist_df,
+            regime_badge=regime_badge,
+            entry_price=float(r["CNC_Buy_Limit_Price"]),
+            budget_inr=MAX_BUDGET_PER_TICKER_INR,
+            purchase_time_str=purchase_time_str,
+            eod_315pm_auto_exit=eod_315pm_auto_exit,
+            sync_purchase_candle_price=sync_purchase_candle_price,
+            trades_csv_path=trades_csv_path,
+        )
+    return df_out
+
+
+def force_manual_exit_trade(
+    ticker: str = "ALL",
+    trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+) -> pd.DataFrame:
+    """
+    Immediately exits the specified ticker (or ALL active trades) at the latest 5-minute / live CMP
+    and calculates realized Profit or Loss (`PnL_INR` and `PnL_Pct`).
+    """
+    if not os.path.exists(trades_csv_path):
+        return pd.DataFrame()
+    df = pd.read_csv(trades_csv_path)
+    if df.empty:
+        return df
+
+    for sc in ("Status", "Exit_Timestamp", "Exit_Reason", "GTT_Order_Status", "Performance_Verdict"):
+        if sc in df.columns:
+            df[sc] = df[sc].fillna("").astype(object)
+
+    now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    for idx in df.index:
+        t_sym = str(df.at[idx, "Ticker"]).strip()
+        if ticker != "ALL" and t_sym != ticker:
+            continue
+        entry_p = float(df.at[idx, "Entry_Price"])
+        cmp_p = float(df.at[idx, "Live_CMP"]) if "Live_CMP" in df.columns and pd.notna(df.at[idx, "Live_CMP"]) else entry_p
+        qty = int(df.at[idx, "CNC_Qty"]) if "CNC_Qty" in df.columns and pd.notna(df.at[idx, "CNC_Qty"]) else max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0)))
+        pnl_pct = round((cmp_p - entry_p) / entry_p * 100.0, 2)
+        pnl_inr = round((cmp_p - entry_p) * qty, 2)
+        df.at[idx, "Status"] = "MANUAL_EXIT_EXECUTED"
+        df.at[idx, "Exit_Price"] = round(cmp_p, 2)
+        df.at[idx, "Exit_Timestamp"] = now_str
+        df.at[idx, "Exit_Reason"] = f"⚡ Manual Exit Button Clicked @ CMP ₹{cmp_p:.2f}"
+        df.at[idx, "GTT_Order_Status"] = f"⚡ MANUAL EXIT @ ₹{cmp_p:.2f} (CNC Sold)"
+        df.at[idx, "PnL_Pct"] = pnl_pct
+        df.at[idx, "PnL_INR"] = pnl_inr
+        df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, True)
+
+    df.to_csv(trades_csv_path, index=False)
+    if trades_csv_path != SNIPER_TRADES_CSV:
+        df.to_csv(SNIPER_TRADES_CSV, index=False)
     return df
 
 
@@ -881,4 +1345,4 @@ if __name__ == "__main__":
     print(f"Authorized Sniper Logics Today: {report['authorized_sniper_logics']}")
     print(f"High-Conviction Sniper Signals Triggered Today: {len(snipers)}")
     if not snipers.empty:
-        print(snipers[["Ticker", "Matched_Sniper_Logic_ID", "Live_Price", "Structural_S1_Floor", "Initial_Protected_SL", "Intraday_Target", "Swing_Conversion_Prob_Pct"]].to_string(index=False))
+        print(snipers[["Ticker", "Daily_Top3_Slot", "Matched_Sniper_Logic_ID", "Live_Price", "Suggested_CNC_Qty", "CNC_Order_Value_INR", "Initial_Protected_SL", "Intraday_Target"]].to_string(index=False))

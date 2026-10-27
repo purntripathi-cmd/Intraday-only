@@ -3,10 +3,10 @@ Institutional Intraday Trading Expert Dashboard (`app.py`)
 ==========================================================
 Interactive Streamlit platform for Indian (NSE) & International Markets:
 - Strictly CNC-Only Execution (100% Cash & Carry / Delivery, Zero MIS Auto-Squareoff Penalty)
-- Tab 1 Side-by-Side Cards:
-  * Left Card: CNC Intraday Entry Orders (Best Empirically Proven Sniper Logics L1–L6)
-  * Right Card: CNC Exit Readiness & Broker GTT (OCO) Exit Orders (4-Stage Trail + 3:10 PM 5-Gate Decision)
-- All tables display Order-Related Data in the initial rows and freeze the first 3 columns.
+- Strict Capital & Slot Discipline: Max ₹20,000 budget per ticker, Max 3 entries per day (`Top 3` slots, <= ₹60,000/day)
+- 5-Minute Auto-Refresh & Auto-Exit (`@st.fragment(run_every="5m")`) + Late-Click 5-Minute Historical Candle Replay
+  (tracks price movement from `Purchase_Time + 5m` through `3:15 PM IST` / click time and executes exits + P&L)
+- All tables display Order & Performance Data in the initial rows and freeze the first 3 columns.
 """
 
 import os
@@ -18,19 +18,25 @@ import streamlit as st
 from intraday_expert_engine import (
     DATA_DIR,
     SNIPER_TRADES_CSV,
+    SNIPER_TELEMETRY_CSV,
+    MAX_BUDGET_PER_TICKER_INR,
+    MAX_DAILY_ENTRIES,
+    MAX_DAILY_TOTAL_BUDGET_INR,
     TOP_5_LOGICS_METADATA,
     scan_live_sniper_opportunities,
     evaluate_chronological_exits,
+    stage_ticker_into_top3_cnc,
+    stage_top3_daily_cnc_entries,
+    force_manual_exit_trade,
     predict_swing_conversion_success,
 )
 
 st.set_page_config(
-    page_title="Intraday-Only CNC | Institutional Sniper & GTT Exit Desk",
+    page_title="Intraday-Only CNC | 5m Auto-Exit & Top-3 Sniper Desk",
     page_icon="🎯",
     layout="wide",
 )
 
-# Custom CSS to reinforce card styling and sticky first-3-columns in any rendered HTML tables
 st.markdown(
     """
     <style>
@@ -45,11 +51,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🎯 Institutional CNC Intraday Sniper & GTT Exit Desk")
+st.title("🎯 Institutional CNC Intraday Sniper, 5m Auto-Exit & GTT Desk")
 st.caption(
-    "Execution Mode: **100% CNC Only (Cash & Carry / Delivery — Zero MIS)** | "
-    "Top 6 Multi-Regime Sniper Logics (`L1`–`L6`) | 10:00 AM Entry Window | "
-    "4-Stage Chronological GTT OCO Trailing Stop & 3:10 PM 5-Gate Swing Hold Predictor"
+    "Execution Mode: **100% CNC Only (Delivery — 0% MIS)** | "
+    "**Budget Rule: Max `₹20,000` per Ticker & Max `3` Entries/Day (`Top 3` Slots <= `₹60,000`)** | "
+    "**5-Minute Auto-Refresh & Auto-Exit + Late-Click 5m Candle Replay (`Purchase Time + 5m -> 3:15 PM IST`)**"
 )
 
 
@@ -86,7 +92,6 @@ def render_frozen_3col_dataframe(df: pd.DataFrame, height: int = None):
     freeze_cols = list(work.columns[:3])
     col0 = freeze_cols[0]
 
-    # Ensure col0 values are unique strings so MultiIndex never collapses adjacent rows
     seen = {}
     unique_col0 = []
     for val in work[col0].astype(str):
@@ -110,14 +115,19 @@ def render_frozen_3col_dataframe(df: pd.DataFrame, height: int = None):
 
 def recalculate_cnc_sizing(df: pd.DataFrame, cnc_capital_inr: float) -> pd.DataFrame:
     """
-    Dynamically updates CNC order quantity, order value, and rupee stop risk based on user's CNC capital.
+    Dynamically updates CNC order quantity, order value, and rupee stop risk based on user's CNC capital
+    (strictly capped at ₹20,000 per ticker).
     """
     if df.empty or "CNC_Buy_Limit_Price" not in df.columns:
         return df
     out = df.copy()
+    capped_capital = min(MAX_BUDGET_PER_TICKER_INR, max(1000.0, float(cnc_capital_inr)))
     prices = pd.to_numeric(out["CNC_Buy_Limit_Price"], errors="coerce").fillna(1.0).clip(lower=1.0)
     sl_prices = pd.to_numeric(out["Initial_Protected_SL"], errors="coerce").fillna(prices * 0.98)
-    qtys = (cnc_capital_inr // prices).clip(lower=1).astype(int)
+    qtys = (capped_capital // prices).clip(lower=1).astype(int)
+    # Ensure qty * price never exceeds capped_capital when qty > 1
+    over_mask = (qtys * prices > capped_capital) & (qtys > 1)
+    qtys = qtys.where(~over_mask, qtys - 1)
     out["Suggested_CNC_Qty"] = qtys
     out["CNC_Order_Value_INR"] = (qtys * prices).round(2)
     out["Max_Stop_Risk_INR"] = (qtys * (prices - sl_prices).clip(lower=0.05)).round(2)
@@ -127,33 +137,34 @@ def recalculate_cnc_sizing(df: pd.DataFrame, cnc_capital_inr: float) -> pd.DataF
 def build_entry_order_initial_rows_table(candidates_df: pd.DataFrame) -> pd.DataFrame:
     """
     Builds the CNC Entry Order Specification Table where:
-    - INITIAL ROWS (Rows 01–08) are strictly the Broker CNC Order Execution Data.
-    - LOWER ROWS (Rows 09–14) are the Sniper Logic, 5-Gate, and Structural Support metrics.
-    - FIRST 3 COLUMNS (`Row_Group`, `CNC_Order_Field`, and `#1 Primary CNC Pick`) are frozen!
+    - INITIAL ROWS (Rows 01–09) are strictly the Broker CNC Order Execution & Top-3 Slot Data.
+    - LOWER ROWS (Rows 10–15) are the Sniper Logic, 5-Gate, and Structural Support metrics.
+    - FIRST 3 COLUMNS (`Row_Priority`, `CNC_Order_Parameter`, and `#1 Top CNC Pick`) are frozen!
     """
     if candidates_df.empty:
         return pd.DataFrame()
 
     top_n = candidates_df.head(6).copy().reset_index(drop=True)
-    col_Labels = [f"#{i+1} {row['Ticker']}" for i, row in top_n.iterrows()]
+    col_labels = [f"#{i+1} {row['Ticker']}" for i, row in top_n.iterrows()]
 
     rows_spec = [
-        # INITIAL ROWS = ORDER-RELATED DATA
-        ("01. ORDER DATA (INITIAL)", "CNC Order Action", [r["CNC_Order_Action"] for _, r in top_n.iterrows()]),
-        ("02. ORDER DATA (INITIAL)", "Broker Product Type", [r["Product_Type"] for _, r in top_n.iterrows()]),
-        ("03. ORDER DATA (INITIAL)", "Order Type & Timing", [r["CNC_Order_Type"] for _, r in top_n.iterrows()]),
-        ("04. ORDER DATA (INITIAL)", "CNC Buy Limit Price (₹)", [f"₹{float(r['CNC_Buy_Limit_Price']):,.2f}" for _, r in top_n.iterrows()]),
-        ("05. ORDER DATA (INITIAL)", "Suggested CNC Qty (Shares)", [f"{int(r['Suggested_CNC_Qty'])} Qty" for _, r in top_n.iterrows()]),
-        ("06. ORDER DATA (INITIAL)", "Total CNC Cash Required (₹)", [f"₹{float(r['CNC_Order_Value_INR']):,.0f}" for _, r in top_n.iterrows()]),
-        ("07. ORDER DATA (INITIAL)", "Initial Protected SL (₹ / %)", [f"₹{float(r['Initial_Protected_SL']):,.2f} (-{float(r['Downside_Risk_Pct']):.2f}%)" for _, r in top_n.iterrows()]),
-        ("08. ORDER DATA (INITIAL)", "Intraday Target & R:R", [f"₹{float(r['Intraday_Target']):,.2f} ({r['Risk_Reward_Ratio']})" for _, r in top_n.iterrows()]),
+        # INITIAL ROWS = ORDER-RELATED & TOP-3 BUDGET DATA
+        ("01. ORDER DATA (INITIAL)", "Daily Top-3 Slot Status", [r.get("Daily_Top3_Slot", f"🏆 Top #{i+1}/3" if i < 3 else "Standby") for i, r in top_n.iterrows()]),
+        ("02. ORDER DATA (INITIAL)", "CNC Order Action", [r["CNC_Order_Action"] for _, r in top_n.iterrows()]),
+        ("03. ORDER DATA (INITIAL)", "Broker Product Type", [r["Product_Type"] for _, r in top_n.iterrows()]),
+        ("04. ORDER DATA (INITIAL)", "Order Type & Timing", [r["CNC_Order_Type"] for _, r in top_n.iterrows()]),
+        ("05. ORDER DATA (INITIAL)", "CNC Buy Limit Price (₹)", [f"₹{float(r['CNC_Buy_Limit_Price']):,.2f}" for _, r in top_n.iterrows()]),
+        ("06. ORDER DATA (INITIAL)", "Suggested CNC Qty (<= ₹20K)", [f"{int(r['Suggested_CNC_Qty'])} Qty" for _, r in top_n.iterrows()]),
+        ("07. ORDER DATA (INITIAL)", "Total CNC Order Value (<= ₹20K)", [f"₹{float(r['CNC_Order_Value_INR']):,.2f}" for _, r in top_n.iterrows()]),
+        ("08. ORDER DATA (INITIAL)", "Initial Protected SL (₹ / %)", [f"₹{float(r['Initial_Protected_SL']):,.2f} (-{float(r['Downside_Risk_Pct']):.2f}%)" for _, r in top_n.iterrows()]),
+        ("09. ORDER DATA (INITIAL)", "Intraday Target & R:R", [f"₹{float(r['Intraday_Target']):,.2f} ({r['Risk_Reward_Ratio']})" for _, r in top_n.iterrows()]),
         # TECHNICAL & LOGIC CONTEXT ROWS BELOW INITIAL ORDER ROWS
-        ("09. SNIPER LOGIC", "Best Sniper Logic ID", [r["Best_Logic_ID"] for _, r in top_n.iterrows()]),
-        ("10. SNIPER LOGIC", "Sniper Readiness / Conviction", [f"{float(r['Sniper_Readiness_Score']):.1f} / 100" for _, r in top_n.iterrows()]),
-        ("11. 5-GATE 10AM CHECK", "5-Gate Pre-Qualified (10 AM)", ["✅ YES (5/5)" if bool(r["Meets_5Gate_10AM_Entry"]) else f"Gates: {r['Swing_Conversion_Gates']}" for _, r in top_n.iterrows()]),
-        ("12. SUPPORT & CMP", "Live CMP vs Structural S1", [f"CMP ₹{float(r['Live_Price']):,.2f} | S1 ₹{float(r['Structural_S1_Floor']):,.2f}" for _, r in top_n.iterrows()]),
-        ("13. RELATIVE STRENGTH", "Stock 5D RS / Sector 5D RS", [f"{float(r['5D_Rel_Strength_Pct']):+.2f}% / {float(r['Sector_5D_RS_Pct']):+.2f}%" for _, r in top_n.iterrows()]),
-        ("14. MOMENTUM & VOL", "RSI(14) & 20D Vol Ratio", [f"RSI {float(r['RSI_14']):.1f} | Vol {float(r['Vol_Ratio_20D']):.2f}x" for _, r in top_n.iterrows()]),
+        ("10. SNIPER LOGIC", "Best Sniper Logic ID", [r["Best_Logic_ID"] for _, r in top_n.iterrows()]),
+        ("11. SNIPER LOGIC", "Sniper Readiness / Conviction", [f"{float(r['Sniper_Readiness_Score']):.1f} / 100" for _, r in top_n.iterrows()]),
+        ("12. 5-GATE 10AM CHECK", "5-Gate Pre-Qualified (10 AM)", ["✅ YES (5/5)" if bool(r["Meets_5Gate_10AM_Entry"]) else f"Gates: {r['Swing_Conversion_Gates']}" for _, r in top_n.iterrows()]),
+        ("13. SUPPORT & CMP", "Live CMP vs Structural S1", [f"CMP ₹{float(r['Live_Price']):,.2f} | S1 ₹{float(r['Structural_S1_Floor']):,.2f}" for _, r in top_n.iterrows()]),
+        ("14. RELATIVE STRENGTH", "Stock 5D RS / Sector 5D RS", [f"{float(r['5D_Rel_Strength_Pct']):+.2f}% / {float(r['Sector_5D_RS_Pct']):+.2f}%" for _, r in top_n.iterrows()]),
+        ("15. MOMENTUM & VOL", "RSI(14) & 20D Vol Ratio", [f"RSI {float(r['RSI_14']):.1f} | Vol {float(r['Vol_Ratio_20D']):.2f}x" for _, r in top_n.iterrows()]),
     ]
 
     records = []
@@ -162,49 +173,49 @@ def build_entry_order_initial_rows_table(candidates_df: pd.DataFrame) -> pd.Data
             "Row_Priority": r_group,
             "CNC_Order_Parameter": r_field,
         }
-        for c_name, v in zip(col_Labels, vals):
+        for c_name, v in zip(col_labels, vals):
             rec[c_name] = v
         records.append(rec)
     return pd.DataFrame(records)
 
 
-def build_exit_gtt_initial_rows_table(exit_df: pd.DataFrame) -> pd.DataFrame:
+def build_top3_exit_and_pnl_ticket_table(top3_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Builds the CNC Exit & Broker GTT (OCO) Order Specification Table where:
-    - INITIAL ROWS (Rows 01–08) are strictly the Exit Readiness & Broker GTT OCO Order Parameters.
-    - LOWER ROWS (Rows 09–14) are the 4-Stage Trailing SL Ratchet Ladder & 5-Gate Swing Conversion metrics.
-    - FIRST 3 COLUMNS (`Row_Priority`, `GTT_Exit_Parameter`, and `#1 Monitored CNC Position`) are frozen!
+    Builds the Card 2 Top-3 CNC Active/Replayed Exit & Performance Ticket Table where:
+    - INITIAL ROWS (Rows 01–09) are strictly the Performance (Profit/Loss), Exit Status, GTT Triggers & Order Data.
+    - LOWER ROWS (Rows 10–14) are the 5-Minute Candle Replay Audit (`Purchase Time + 5m -> 3:15 PM`) & Trailing Ladder.
+    - FIRST 3 COLUMNS (`Row_Priority`, `Exit_And_PnL_Parameter`, and `Slot #1/3`) are frozen!
     """
-    if exit_df.empty:
+    if top3_df.empty:
         return pd.DataFrame()
 
-    top_n = exit_df.head(6).copy().reset_index(drop=True)
-    col_labels = [f"#{i+1} {row['Ticker']}" for i, row in top_n.iterrows()]
+    work = top3_df.head(MAX_DAILY_ENTRIES).copy().reset_index(drop=True)
+    col_labels = [f"{row.get('Daily_Slot', f'Slot #{i+1}/3')} ({row['Ticker']})" for i, row in work.iterrows()]
 
     rows_spec = [
-        # INITIAL ROWS = EXIT & GTT ORDER-RELATED DATA
-        ("01. GTT ORDER (INITIAL)", "When Ready for Exit / Action", [r["Exit_Readiness_Status"] for _, r in top_n.iterrows()]),
-        ("02. GTT ORDER (INITIAL)", "Broker GTT Order Mode", ["GTT OCO (2-Leg Sell CNC)" for _ in range(len(top_n))]),
-        ("03. GTT ORDER (INITIAL)", "Product & Sell Qty (CNC)", [f"CNC Delivery | {int(r['Suggested_CNC_Qty'])} Qty" for _, r in top_n.iterrows()]),
-        ("04. GTT ORDER (INITIAL)", "GTT Leg-1: SL Trigger Price (₹)", [f"₹{float(r['GTT_SL_Trigger']):,.2f}" for _, r in top_n.iterrows()]),
-        ("05. GTT ORDER (INITIAL)", "GTT Leg-1: SL Limit Price (₹)", [f"₹{float(r['GTT_SL_Limit']):,.2f}" for _, r in top_n.iterrows()]),
-        ("06. GTT ORDER (INITIAL)", "GTT Leg-2: Target Trigger (₹)", [f"₹{float(r['GTT_Target_Trigger']):,.2f}" for _, r in top_n.iterrows()]),
-        ("07. GTT ORDER (INITIAL)", "GTT Leg-2: Target Limit (₹)", [f"₹{float(r['GTT_Target_Limit']):,.2f}" for _, r in top_n.iterrows()]),
-        ("08. GTT ORDER (INITIAL)", "3:10 PM CNC Exit vs Swing Hold", [r["CNC_310PM_Decision"] for _, r in top_n.iterrows()]),
-        # TRAILING STOP LADDER & SWING CONVERSION CONTEXT BELOW INITIAL ROWS
-        ("09. TRAIL RATCHET", "Active Trailing SL Stage", [r["Active_Trail_Stage"] for _, r in top_n.iterrows()]),
-        ("10. TRAIL RATCHET", "Stage 1 Breakeven+ SL (+0.18 ATR)", [f"₹{float(r['Stage1_Breakeven_SL']):,.2f}" for _, r in top_n.iterrows()]),
-        ("11. TRAIL RATCHET", "Stage 2 Profit-Lock SL (+0.65 ATR)", [f"₹{float(r['Stage2_ProfitLock_SL']):,.2f}" for _, r in top_n.iterrows()]),
-        ("12. TRAIL RATCHET", "Stage 3 66%-Lock SL (+1.15 ATR)", [f"₹{float(r['Stage3_Chandelier_SL']):,.2f}" for _, r in top_n.iterrows()]),
-        ("13. SWING GTT TARGET", "5-Day Swing GTT Target (+3.2 ATR)", [f"₹{float(r['GTT_Swing_Target']):,.2f}" for _, r in top_n.iterrows()]),
-        ("14. 5-GATE WIN PROB", "3:10 PM Swing Win Prob & Gates", [f"{float(r['Swing_Conversion_Prob_Pct']):.1f}% ({r['Swing_Conversion_Gates']})" for _, r in top_n.iterrows()]),
+        # INITIAL ROWS = PERFORMANCE (PROFIT/LOSS) & EXIT / GTT ORDER DATA
+        ("01. PERFORMANCE (INITIAL)", "Profit / Loss Verdict (₹ & %)", [r.get("Performance_Verdict", "⚪ FLAT") for _, r in work.iterrows()]),
+        ("02. EXIT STATUS (INITIAL)", "Auto-Exit / GTT Execution Status", [r.get("GTT_Order_Status", r.get("Status", "")) for _, r in work.iterrows()]),
+        ("03. ORDER DATA (INITIAL)", "Product & CNC Qty (<= ₹20K)", [f"CNC | {int(r.get('CNC_Qty', 1))} Qty (₹{float(r.get('Capital_Used_INR', 0)):,.2f})" for _, r in work.iterrows()]),
+        ("04. ORDER DATA (INITIAL)", "Purchase Date & Time (IST)", [f"{r.get('Purchase_Date', '')} @ {r.get('Purchase_Time', '10:00:00')}" for _, r in work.iterrows()]),
+        ("05. ORDER DATA (INITIAL)", "CNC Purchase Price (₹)", [f"₹{float(r.get('Entry_Price', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("06. EXIT DATA (INITIAL)", "Exit Price / Live CMP (₹)", [f"₹{float(r['Exit_Price']) if pd.notna(r.get('Exit_Price')) and str(r.get('Exit_Price')) not in ('', 'nan') and float(r.get('Exit_Price', 0)) > 0 else float(r.get('Live_CMP', r.get('Entry_Price', 0))):,.2f}" for _, r in work.iterrows()]),
+        ("07. EXIT DATA (INITIAL)", "Exit Candle Timestamp & Reason", [f"{r.get('Exit_Timestamp', 'Active')} | {r.get('Exit_Reason', 'Monitoring 5m candles')}" for _, r in work.iterrows()]),
+        ("08. GTT OCO (INITIAL)", "GTT SL Trigger / Limit (₹)", [f"SL ₹{float(r.get('GTT_SL_Trigger', r.get('Current_Trailing_SL', 0))):,.2f} (Lmt ₹{float(r.get('GTT_SL_Limit', 0)):,.2f})" for _, r in work.iterrows()]),
+        ("09. GTT OCO (INITIAL)", "GTT Target Trigger / Limit (₹)", [f"TGT ₹{float(r.get('GTT_Target_Trigger', r.get('Target_Price', 0))):,.2f} (Lmt ₹{float(r.get('GTT_Target_Limit', 0)):,.2f})" for _, r in work.iterrows()]),
+        # 5-MINUTE CANDLE REPLAY & TRAILING RATCHET ROWS BELOW INITIAL ROWS
+        ("10. 5M REPLAY AUDIT", "5m Candles Tracked (+5m -> 3:15 PM)", [f"{int(r.get('Bars_Tracked_5m', 0))} bars | Low ₹{float(r.get('Window_Low_5m', 0)):,.2f} – High ₹{float(r.get('Window_High_5m', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("11. 5M REPLAY AUDIT", "Peak High-Water-Mark (HWM)", [f"₹{float(r.get('High_Water_Mark', 0)):,.2f} ({r.get('Active_Trail_Stage', '')})" for _, r in work.iterrows()]),
+        ("12. 5M REPLAY AUDIT", "Chronological Replay Path", [str(r.get("Replay_Audit_Trail", "")) for _, r in work.iterrows()]),
+        ("13. TRAIL LADDER", "Initial SL -> S1 -> S2 -> S3", [f"₹{float(r.get('Initial_SL', 0)):.0f} -> ₹{float(r.get('Stage1_Breakeven_SL', 0)):.0f} -> ₹{float(r.get('Stage2_ProfitLock_SL', 0)):.0f} -> ₹{float(r.get('Stage3_Chandelier_SL', 0)):.0f}" for _, r in work.iterrows()]),
+        ("14. EOD 3:15 PM RULE", "3:15 PM Action / Swing Gate", [str(r.get("CNC_310PM_Decision", "Auto-Exit @ 3:15 PM IST")) for _, r in work.iterrows()]),
     ]
 
     records = []
     for r_group, r_field, vals in rows_spec:
         rec = {
             "Row_Priority": r_group,
-            "GTT_Exit_Parameter": r_field,
+            "Exit_And_PnL_Parameter": r_field,
         }
         for c_name, v in zip(col_labels, vals):
             rec[c_name] = v
@@ -213,41 +224,76 @@ def build_exit_gtt_initial_rows_table(exit_df: pd.DataFrame) -> pd.DataFrame:
 
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🎯 Tab 1: CNC Entry & GTT Exit Desk (Side-by-Side)",
+    "🎯 Tab 1: CNC Entry (Top 3 <=₹20K) & 5m Auto-Exit Desk",
     "🛡️ Downside Protection & Trailing SL Ladder",
     "🔄 3:10 PM CNC Intraday-to-Swing Predictor",
     "🏆 3-Year Backtest (Top 6 Sniper Logics)",
-    "🔬 Production Forensics (smart-etf-tracker)",
+    "🔬 Production Forensics & Integration Blueprint",
 ])
 
-with tab1:
+
+@st.fragment(run_every="5m")
+def render_live_5m_auto_refresh_desk():
+    """
+    Auto-refreshes every 5 minutes (300 seconds) and automatically evaluates 5-minute candles
+    from `Purchase_Time + 5m` up to `3:15 PM IST`, executing exits when SL/Trail, Target, or 3:15 PM is met.
+    """
+    # Automatically evaluate chronological 5m exits on every 5-minute cycle
+    auto_eval_df = evaluate_chronological_exits(
+        trades_csv_path=SNIPER_TELEMETRY_CSV,
+        force_full_replay=False,
+        eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+    )
+
+    now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
+    st.markdown(
+        f"⏱️ **5-Minute Auto-Refresh & Auto-Exit Engine: `ACTIVE (Every 5 Minutes)`** | "
+        f"Last 5m Candle Check: **`{now_ist_str}`** | "
+        f"**Budget Cap: `₹20,000 / Ticker` | Daily Entry Cap: `Max 3 Tickers/Day (₹60,000 Total)`**"
+    )
+
     # Top Control Bar
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.4, 1.3, 1.5, 1.8])
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.4, 1.4, 1.3, 1.9])
     with ctrl1:
-        if st.button("🔄 Run Live Market CNC Sniper Scan", type="primary", use_container_width=True):
-            with st.spinner("Scanning 54 NSE & International instruments + evaluating 5m CNC GTT exits..."):
+        if st.button("🔄 Run Full Live Market Scan & 5m Check", type="primary", use_container_width=True):
+            with st.spinner("Scanning 54 NSE & International instruments + evaluating 5m CNC exits..."):
                 scan_live_sniper_opportunities()
-                evaluate_chronological_exits(SNIPER_TRADES_CSV)
+                evaluate_chronological_exits(
+                    trades_csv_path=SNIPER_TELEMETRY_CSV,
+                    force_full_replay=True,
+                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                )
             st.rerun()
     with ctrl2:
-        if st.button("⚡ Refresh 5m Chronological GTT Status", use_container_width=True):
-            with st.spinner("Checking chronological 5-minute bars for GTT SL/Target & Trail upgrades..."):
-                evaluate_chronological_exits(SNIPER_TRADES_CSV)
+        if st.button("🏆 Reset / Auto-Load Today's Top 3 CNC (<=₹20K)", use_container_width=True):
+            with st.spinner("Loading Top 3 CNC entries (<= ₹20,000 each) & replaying 5m candles from 10:05 to 3:15 PM..."):
+                rep_tmp = load_json("live_regime_report.json")
+                wl_tmp = load_csv("live_watchlist_radar.csv")
+                sn_tmp = load_csv("live_sniper_signals.csv")
+                src_tmp = sn_tmp if not sn_tmp.empty else wl_tmp
+                stage_top3_daily_cnc_entries(
+                    watchlist_df=src_tmp,
+                    regime_badge=rep_tmp.get("regime_badge", "TRENDING_OR_ROTATION"),
+                    purchase_time_str="10:00:00",
+                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                    sync_purchase_candle_price=True,
+                    trades_csv_path=SNIPER_TELEMETRY_CSV,
+                )
             st.rerun()
     with ctrl3:
         cnc_capital = st.number_input(
-            "💰 Per-Trade CNC Cash Capital (₹, 0% MIS)",
-            min_value=10000.0,
-            max_value=5000000.0,
-            value=100000.0,
-            step=25000.0,
-            help="All trades are executed in CNC (Cash & Carry / Delivery) with 1x cash and zero MIS auto-squareoff risk.",
+            "💰 Max Budget / Ticker (₹, <= 20K)",
+            min_value=2000.0,
+            max_value=float(MAX_BUDGET_PER_TICKER_INR),
+            value=float(MAX_BUDGET_PER_TICKER_INR),
+            step=2000.0,
+            help="Strict ₹20,000 maximum budget per ticker in CNC Delivery (max 3 entries/day = ₹60,000 total).",
         )
     with ctrl4:
         filter_mode = st.selectbox(
-            "🔎 Card 1 & 2 Candidate Filter",
+            "🔎 Card 1 Candidate Filter",
             options=[
-                "Top Actionable & High-Readiness CNC Setups (Score >= 80)",
+                "Top Actionable & High-Readiness CNC Setups (Top 3 Highlighted)",
                 "Triggered Sniper Signals Only (Immediate CNC Buy)",
                 "All 54 NSE & International Universe Instruments",
             ],
@@ -257,7 +303,9 @@ with tab1:
     regime_rep = load_json("live_regime_report.json")
     sniper_df = load_csv("live_sniper_signals.csv")
     watchlist_df = load_csv("live_watchlist_radar.csv")
-    active_ledger_df = load_csv("intraday_sniper_trades.csv")
+    top3_ledger_df = load_csv("sniper_telemetry_trades.csv")
+    if top3_ledger_df.empty:
+        top3_ledger_df = auto_eval_df
 
     watchlist_df = recalculate_cnc_sizing(watchlist_df, cnc_capital)
     sniper_df = recalculate_cnc_sizing(sniper_df, cnc_capital)
@@ -266,17 +314,19 @@ with tab1:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"))
         m2.metric("Nifty 50 (^NSEI)", f"{regime_rep.get('nifty_close', 0):,.2f}", f"{regime_rep.get('nifty_ret_1d_pct', 0):+.2f}% (1D)")
-        m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "Execution: CNC Only (No MIS)")
+        m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "Max ₹20K/Ticker | Max 3/Day")
+        tot_pnl_banner = float(top3_ledger_df["PnL_INR"].sum()) if not top3_ledger_df.empty and "PnL_INR" in top3_ledger_df.columns else 0.0
+        tot_cap_banner = float(top3_ledger_df["Capital_Used_INR"].sum()) if not top3_ledger_df.empty and "Capital_Used_INR" in top3_ledger_df.columns else 0.0
+        tot_pct_banner = (tot_pnl_banner / tot_cap_banner * 100.0) if tot_cap_banner > 0 else 0.0
         m4.metric(
-            "Triggered CNC Sniper Trades Today",
-            f"{len(sniper_df)}",
-            "Sniper Standby (Capital Protected)" if sniper_df.empty else f"Top Pick: {sniper_df.iloc[0]['Ticker']} ({sniper_df.iloc[0]['Best_Logic_ID']})",
+            f"Top 3 Daily CNC P&L ({len(top3_ledger_df)}/3 Slots)",
+            f"₹{tot_pnl_banner:+,.2f} ({tot_pct_banner:+.2f}%)",
+            f"Deployed: ₹{tot_cap_banner:,.0f} / ₹60,000 Max",
         )
 
-    # Filter candidate rows based on user selection, keeping Order_Priority_Rank sorted so actionable rows are always in initial rows
     if not watchlist_df.empty:
         if filter_mode.startswith("Triggered"):
-            entry_candidates_df = sniper_df if not sniper_df.empty else watchlist_df.head(5)
+            entry_candidates_df = sniper_df if not sniper_df.empty else watchlist_df.head(6)
         elif filter_mode.startswith("Top Actionable"):
             entry_candidates_df = watchlist_df[
                 (watchlist_df["Order_Priority_Rank"] <= 3) | (watchlist_df["Sniper_Readiness_Score"] >= 80.0)
@@ -292,53 +342,93 @@ with tab1:
 
     # =========================================================================
     # SIDE-BY-SIDE CARDS IN TAB 1:
-    #   LEFT CARD : Which Intraday Trades to Enter in CNC (Best Logics L1–L6)
-    #   RIGHT CARD: When Ready for Exit & Broker GTT (OCO) Exit Order
+    #   LEFT CARD : CNC Intraday Entry Orders + Select Ticker -> Create Entry in Top 3 (<= ₹20K)
+    #   RIGHT CARD: 5m Auto-Exit / Late-Click Candle Replay Button + Performance (P&L) & GTT Orders
     # =========================================================================
     col_entry_card, col_exit_card = st.columns(2, gap="medium")
 
     # -------------------------------------------------------------------------
-    # LEFT CARD: CNC INTRADAY ENTRY ORDERS (BEST LOGICS L1–L6)
+    # LEFT CARD: CNC INTRADAY ENTRY ORDERS & TOP 3 ENTRY BUILDER (<= ₹20K/TICKER)
     # -------------------------------------------------------------------------
     with col_entry_card:
         with st.container(border=True):
-            st.markdown("### 🟢 Card 1: Which Intraday Trades to Enter (`CNC Only`)")
+            st.markdown("### 🟢 Card 1: Which Intraday Trades to Enter (`CNC Only` | `Max ₹20K` | `Top 3/Day`)")
             st.caption(
-                "**Product: `CNC` (Delivery / Cash & Carry — Never `MIS`)** | "
-                "**Best Logics**: `L6` (5-Gate 10:00 AM Sniper, 89.4% WR), `L1` (Sector ORB, 78.7% WR), "
-                "`L4` (Defensive RS Fortress, 78.0% WR), `L5` (Global Macro, 77.8% WR), `L2` (Support Spring, 76.1% WR), `L3` (Catalyst VWAP, 75.6% WR)"
+                "**Budget Rule**: Max **`₹20,000` per ticker** (`Suggested_CNC_Qty = int(20000 // Price)`) and **Max `3` entries per day (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`)**. "
+                "Selecting a ticker below creates/updates its entry in the **Top 3** and immediately tracks 5m candles (`Purchase Time + 5m -> 3:15 PM`)."
             )
 
-            if not sniper_df.empty:
-                top_s = sniper_df.iloc[0]
-                st.success(
-                    f"**🔥 ACTIONABLE CNC ENTRY TRIGGERED**: Buy **`{top_s['Ticker']}`** in **`CNC`** "
-                    f"(Qty: **`{int(top_s['Suggested_CNC_Qty'])}`** @ Limit **`₹{float(top_s['CNC_Buy_Limit_Price']):,.2f}`**) | "
-                    f"Logic: `{top_s['Best_Logic_Name']}` | Initial Protected SL: `₹{float(top_s['Initial_Protected_SL']):,.2f}` | "
-                    f"Intraday Target: `₹{float(top_s['Intraday_Target']):,.2f}`"
-                )
-            else:
-                st.info(
-                    "🛡️ **0 Immediate Market Orders Forced Right Now**: Below are the highest-priority **CNC Limit / 10:00 AM Trigger Orders** "
-                    "pre-calculated from our Top 6 Sniper Logics. Enter ONLY if price triggers `CNC_Buy_Limit_Price`."
-                )
+            # Prominent Interactive Box: Select Ticker Entered in Broker (CNC) -> Creates Entry in Top 3
+            with st.container(border=True):
+                st.markdown("##### ➕ Select Ticker Entered in Broker (`CNC`) -> Create Entry in Top 3 (`<= ₹20,000`)")
+                if not entry_candidates_df.empty:
+                    b_col1, b_col2, b_col3 = st.columns([1.6, 1.1, 1.1])
+                    pick_ticker = b_col1.selectbox(
+                        "Select Ticker Entered in Broker (CNC)",
+                        options=entry_candidates_df["Ticker"].tolist(),
+                        key="stage_cnc_ticker",
+                    )
+                    default_p_date = (
+                        str(top3_ledger_df["Purchase_Date"].iloc[0])
+                        if not top3_ledger_df.empty and "Purchase_Date" in top3_ledger_df.columns and str(top3_ledger_df["Purchase_Date"].iloc[0]).strip() != ""
+                        else datetime.now().strftime("%Y-%m-%d")
+                    )
+                    pick_date_str = b_col2.text_input(
+                        "Purchase Date (YYYY-MM-DD)",
+                        value=default_p_date,
+                        help="If clicking late or testing a past session, enter the purchase date so historical 5m candles from that date are replayed.",
+                    )
+                    pick_time_str = b_col3.selectbox(
+                        "Purchase Time (IST)",
+                        options=["09:30:00", "09:45:00", "10:00:00", "10:15:00", "10:30:00", "11:00:00", "12:00:00", "13:00:00", "14:00:00"],
+                        index=2,
+                        help="5-minute exit tracking starts strictly 5 minutes after Purchase Time (e.g., 10:05:00 for a 10:00:00 entry) through 3:15 PM IST.",
+                    )
+
+                    b_col4, b_col5 = st.columns([1.4, 1.6])
+                    sync_5m_price = b_col4.checkbox(
+                        "Anchor Entry Price to Exact 5m Candle @ Purchase Time",
+                        value=True,
+                        help="Uses the actual historical 5m candle close at Purchase Time (e.g. 10:00 AM IST) and sizes Qty <= ₹20,000.",
+                    )
+                    if b_col5.button("✅ Create Entry in Top 3 (<=₹20K) & Track 5m", type="primary", use_container_width=True):
+                        row_match = entry_candidates_df[entry_candidates_df["Ticker"] == pick_ticker].iloc[0]
+                        ok, msg, _ = stage_ticker_into_top3_cnc(
+                            ticker=pick_ticker,
+                            watchlist_df=watchlist_df,
+                            regime_badge=regime_rep.get("regime_badge", "LIVE"),
+                            entry_price=float(row_match["CNC_Buy_Limit_Price"]),
+                            budget_inr=min(MAX_BUDGET_PER_TICKER_INR, cnc_capital),
+                            purchase_date_str=pick_date_str.strip(),
+                            purchase_time_str=pick_time_str,
+                            eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                            sync_purchase_candle_price=sync_5m_price,
+                            replace_slot3_if_full=True,
+                            trades_csv_path=SNIPER_TELEMETRY_CSV,
+                        )
+                        st.session_state["last_stage_msg"] = msg
+                        st.rerun()
+
+                    if "last_stage_msg" in st.session_state:
+                        st.success(st.session_state["last_stage_msg"])
 
             st.markdown("##### 📋 1A. CNC Entry Order Ticket (`Initial Rows = Order Data` | `First 3 Columns Frozen`)")
             entry_ticket_df = build_entry_order_initial_rows_table(entry_candidates_df)
             render_frozen_3col_dataframe(entry_ticket_df, height=390)
 
-            st.markdown("##### 🎯 1B. Ranked CNC Entry Table (`Initial Rows = Actionable CNC Orders` | `First 3 Columns Frozen`)")
+            st.markdown("##### 🎯 1B. Ranked CNC Entry Table (`Initial Rows = Top 3 CNC Orders <= ₹20K` | `First 3 Columns Frozen`)")
             if not entry_candidates_df.empty:
                 entry_cols = [
                     # First 3 Frozen Columns
                     "Ticker",
                     "CNC_Order_Action",
                     "CNC_Buy_Limit_Price",
-                    # Order-Related Columns Immediately Next
-                    "Product_Type",
-                    "CNC_Order_Type",
+                    # Top-3 Slot & Order-Related Columns Immediately Next
+                    "Daily_Top3_Slot",
                     "Suggested_CNC_Qty",
                     "CNC_Order_Value_INR",
+                    "Product_Type",
+                    "CNC_Order_Type",
                     "Initial_Protected_SL",
                     "Downside_Risk_Pct",
                     "Intraday_Target",
@@ -355,148 +445,156 @@ with tab1:
                     "5D_Rel_Strength_Pct",
                     "Vol_Ratio_20D",
                     "RSI_14",
-                    "Best_Logic_Name",
                 ]
                 avail_entry_cols = [c for c in entry_cols if c in entry_candidates_df.columns]
-                render_frozen_3col_dataframe(entry_candidates_df[avail_entry_cols], height=360)
-
-                # Quick Action to Stage/Log a CNC Entry into Active GTT Exit Monitor
-                with st.expander("➕ Log / Stage a CNC Entry Order into Active GTT Exit Monitor (Card 2)"):
-                    sel_col1, sel_col2 = st.columns([2, 1])
-                    pick_ticker = sel_col1.selectbox(
-                        "Select Ticker Entered in Broker (CNC)",
-                        options=entry_candidates_df["Ticker"].tolist(),
-                        key="stage_cnc_ticker",
-                    )
-                    if sel_col2.button("✅ Add to Active CNC Monitor", use_container_width=True):
-                        row_match = entry_candidates_df[entry_candidates_df["Ticker"] == pick_ticker].iloc[0]
-                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        sl_t = float(row_match["GTT_SL_Trigger"])
-                        tgt_t = float(row_match["GTT_Target_Trigger"])
-                        new_trade = {
-                            "Ticker": row_match["Ticker"],
-                            "GTT_Order_Status": f"🛡️ GTT OCO ARMED: SL ₹{sl_t:.2f} | TGT ₹{tgt_t:.2f}",
-                            "GTT_SL_Trigger": sl_t,
-                            "Product_Type": "CNC (Delivery - 0% MIS)",
-                            "CNC_Qty": int(row_match["Suggested_CNC_Qty"]),
-                            "Entry_Price": float(row_match["CNC_Buy_Limit_Price"]),
-                            "Live_CMP": float(row_match["Live_Price"]),
-                            "GTT_SL_Limit": float(row_match["GTT_SL_Limit"]),
-                            "GTT_Target_Trigger": tgt_t,
-                            "GTT_Target_Limit": float(row_match["GTT_Target_Limit"]),
-                            "Active_Trail_Stage": row_match["Active_Trail_Stage"],
-                            "CNC_310PM_Decision": row_match["CNC_310PM_Decision"],
-                            "PnL_Pct": 0.0,
-                            "Trade_ID": f"CNC_{int(datetime.now().timestamp())}_{row_match['Ticker']}",
-                            "Entry_Timestamp": now_str,
-                            "Market": row_match["Market"],
-                            "Sector_Group": row_match["Sector_Group"],
-                            "Logic_ID": row_match["Best_Logic_ID"],
-                            "Logic_Name": row_match["Best_Logic_Name"],
-                            "Market_Regime_At_Entry": regime_rep.get("regime_badge", "LIVE"),
-                            "Conviction_Score": float(row_match["Sniper_Readiness_Score"]),
-                            "Status": "ACTIVE_INTRADAY",
-                            "High_Water_Mark": float(row_match["Live_Price"]),
-                            "Structural_S1_Floor": float(row_match["Structural_S1_Floor"]),
-                            "Initial_SL": float(row_match["Initial_Protected_SL"]),
-                            "Current_Trailing_SL": sl_t,
-                            "Target_Price": tgt_t,
-                            "ATR_At_Entry": round((tgt_t - float(row_match["CNC_Buy_Limit_Price"])) / 2.0, 2),
-                            "Swing_Conversion_Prob_Pct": float(row_match["Swing_Conversion_Prob_Pct"]),
-                            "Swing_Conversion_Gates": row_match["Swing_Conversion_Gates"],
-                            "Swing_Conversion_Verdict": row_match["Swing_Conversion_Verdict"],
-                            "Last_Evaluated_Bar_TS": now_str,
-                            "Exit_Timestamp": "",
-                            "Exit_Price": 0.0,
-                            "Exit_Reason": "",
-                        }
-                        curr_ledger = load_csv("intraday_sniper_trades.csv")
-                        curr_ledger = pd.concat([curr_ledger, pd.DataFrame([new_trade])], ignore_index=True)
-                        curr_ledger.to_csv(SNIPER_TRADES_CSV, index=False)
-                        st.success(f"Added `{pick_ticker}` (CNC) to Active GTT Exit Monitor!")
-                        st.rerun()
+                render_frozen_3col_dataframe(entry_candidates_df[avail_entry_cols], height=350)
 
     # -------------------------------------------------------------------------
-    # RIGHT CARD: WHEN READY FOR EXIT & BROKER GTT (OCO) EXIT ORDERS (CNC ONLY)
+    # RIGHT CARD: 5M AUTO-EXIT, LATE-CLICK HISTORICAL 5M REPLAY & PROFIT/LOSS DESK
     # -------------------------------------------------------------------------
     with col_exit_card:
         with st.container(border=True):
-            st.markdown("### 🛡️ Card 2: When Ready for Exit & Broker `GTT (OCO)` Orders")
+            st.markdown("### 🛡️ Card 2: 5m Auto-Exit, Late-Click Candle Replay & Performance (`Profit / Loss`)")
             st.caption(
-                "**Post-Buy CNC Rule**: Immediately after CNC Buy execution, place a **2-Leg Broker GTT OCO Sell Order** "
-                "(`Leg 1: GTT_SL_Trigger / Limit` + `Leg 2: GTT_Target_Trigger / Limit`). "
-                "Ratchet GTT SL across Stages 1–4; at **3:10 PM IST**, hold CNC overnight ONLY if 5-Gate Swing Criteria pass."
+                "**How Auto-Exit & Late-Click Replay Works**: Tracks every **5-minute candle starting 5 minutes after Purchase Time (`Purchase_Time + 5m`, e.g. `10:05 AM`) up to `3:15 PM IST`**. "
+                "If clicked late (afternoon, after market close, or next day), it loads historical 5m candles from purchase date & time till click time / 3:15 PM to check if SL, Trailing SL, Profit Target, or 3:15 PM Exit was hit."
             )
 
-            # Combine active CNC trades from ledger + top entry candidates so Card 2 always shows live GTT orders
-            if not active_ledger_df.empty and "Status" in active_ledger_df.columns:
-                active_only = active_ledger_df[active_ledger_df["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"])].copy()
-            else:
-                active_only = pd.DataFrame()
-
-            if not active_only.empty:
-                top_act = active_only.iloc[0]
-                st.warning(
-                    f"**🛡️ ACTIVE CNC POSITION MONITORED**: **`{top_act['Ticker']}`** | "
-                    f"Status: **{top_act.get('GTT_Order_Status', 'GTT OCO ARMED')}** | "
-                    f"GTT SL Trigger: **`₹{float(top_act.get('GTT_SL_Trigger', top_act['Current_Trailing_SL'])):,.2f}`** "
-                    f"(Limit `₹{float(top_act.get('GTT_SL_Limit', float(top_act['Current_Trailing_SL'])*0.997)):,.2f}`) | "
-                    f"GTT Target Trigger: **`₹{float(top_act.get('GTT_Target_Trigger', top_act['Target_Price'])):,.2f}`** | "
-                    f"3:10 PM Rule: {top_act.get('CNC_310PM_Decision', '')}"
+            # Interactive Exit & Late-Click 5-Minute Replay Control Box
+            with st.container(border=True):
+                st.markdown("##### ⚡ Exit Action & Late-Click 5-Minute Historical Candle Replay Controls")
+                ex_c1, ex_c2 = st.columns([1.5, 1.5])
+                eod_315_rule = ex_c1.checkbox(
+                    "⏰ Auto-Exit at 3:15 PM IST Candle Close (Intraday Rule)",
+                    value=True,
+                    key="eod_315pm_auto_exit_toggle",
+                    help="When checked, if neither SL/Trail nor Target is hit between Purchase_Time+5m and 3:15 PM, the trade automatically exits on the 3:15 PM candle close.",
                 )
-            else:
-                st.info(
-                    "📋 **No Open CNC Position in Ledger Yet**: Displaying live **GTT OCO Exit Triggers, 4-Stage Trailing Stop Ratchets, "
-                    "and 3:10 PM CNC Exit/Hold Signals** for today's top CNC candidates."
+                replay_sync_price = ex_c2.checkbox(
+                    "📌 Sync Entry Price to Purchase Time 5m Candle on Replay",
+                    value=True,
+                    key="replay_sync_price_toggle",
                 )
 
-            st.markdown("##### 📋 2A. Broker GTT (OCO) Exit Ticket (`Initial Rows = GTT Order Data` | `First 3 Columns Frozen`)")
-            gtt_ticket_df = build_exit_gtt_initial_rows_table(entry_candidates_df)
-            render_frozen_3col_dataframe(gtt_ticket_df, height=390)
+                btn_c1, btn_c2 = st.columns([1.6, 1.4])
+                if btn_c1.button(
+                    "🔍 Track 5m Candles (+5m -> 3:15 PM / Now) & Execute Exit",
+                    type="primary",
+                    use_container_width=True,
+                    help="Loads 5-minute candles from Purchase Date & Time (+5m) up to 3:15 PM / click time, checks SL/Trail/Target/3:15PM exit rules, and updates Profit/Loss.",
+                ):
+                    with st.spinner("Replaying historical 5-minute candles from Purchase Time + 5m through 3:15 PM IST / Click Time..."):
+                        replayed_df = evaluate_chronological_exits(
+                            trades_csv_path=SNIPER_TELEMETRY_CSV,
+                            force_full_replay=True,
+                            eod_315pm_auto_exit=eod_315_rule,
+                            sync_purchase_candle_price=replay_sync_price,
+                        )
+                        tot_p = float(replayed_df["PnL_INR"].sum()) if not replayed_df.empty else 0.0
+                        st.session_state["last_exit_replay_msg"] = (
+                            f"✅ Replayed 5m candles (`Purchase_Time + 5m -> 3:15 PM IST`) across **{len(replayed_df)} Top-3 CNC entries** | "
+                            f"Net Realized/Live P&L: **`₹{tot_p:+,.2f}`**"
+                        )
+                    st.rerun()
 
-            st.markdown("##### 🚨 2B. Live Exit Readiness & GTT Ratchet Table (`Initial Rows = Actionable Exits/GTT` | `First 3 Columns Frozen`)")
-            if not entry_candidates_df.empty:
-                exit_cols = [
-                    # First 3 Frozen Columns (Ticker + When Ready for Exit + GTT SL Trigger)
+                if btn_c2.button(
+                    "🚨 Force Immediate Manual Exit @ Live CMP (All Top 3)",
+                    use_container_width=True,
+                    help="Immediately closes all active Top-3 entries at the latest 5m / live market price and locks in Profit/Loss.",
+                ):
+                    forced_df = force_manual_exit_trade(ticker="ALL", trades_csv_path=SNIPER_TELEMETRY_CSV)
+                    tot_p = float(forced_df["PnL_INR"].sum()) if not forced_df.empty else 0.0
+                    st.session_state["last_exit_replay_msg"] = (
+                        f"⚡ Manual Exit executed @ Live CMP across **{len(forced_df)} Top-3 CNC entries** | Net P&L: **`₹{tot_p:+,.2f}`**"
+                    )
+                    st.rerun()
+
+                if "last_exit_replay_msg" in st.session_state:
+                    st.success(st.session_state["last_exit_replay_msg"])
+
+            # Performance (Profit or Loss) Summary KPI Metrics inside Card 2
+            if not top3_ledger_df.empty:
+                tot_cap = float(top3_ledger_df["Capital_Used_INR"].sum()) if "Capital_Used_INR" in top3_ledger_df.columns else 0.0
+                tot_pnl_inr = float(top3_ledger_df["PnL_INR"].sum()) if "PnL_INR" in top3_ledger_df.columns else 0.0
+                tot_pnl_pct = (tot_pnl_inr / tot_cap * 100.0) if tot_cap > 0 else 0.0
+                wins = int((top3_ledger_df["PnL_INR"] > 0).sum()) if "PnL_INR" in top3_ledger_df.columns else 0
+                losses = int((top3_ledger_df["PnL_INR"] < 0).sum()) if "PnL_INR" in top3_ledger_df.columns else 0
+                wr_pct = (wins / len(top3_ledger_df) * 100.0) if len(top3_ledger_df) > 0 else 0.0
+
+                pk1, pk2, pk3 = st.columns(3)
+                pk1.metric(
+                    "Top 3 Capital Deployed",
+                    f"₹{tot_cap:,.2f}",
+                    f"Max Cap: ₹{MAX_DAILY_TOTAL_BUDGET_INR:,.0f} (<=₹20K x 3)",
+                )
+                pk2.metric(
+                    "Net Profit / Loss (₹ & %)",
+                    f"₹{tot_pnl_inr:+,.2f}",
+                    f"{tot_pnl_pct:+.2f}% Return on Deployed Cash",
+                )
+                pk3.metric(
+                    "Top 3 Win / Loss Count",
+                    f"{wins}W / {losses}L ({wr_pct:.0f}% WR)",
+                    "5m Candle Replay Verified",
+                )
+
+            st.markdown("##### 📋 2A. Top 3 CNC Exit, GTT & Profit/Loss Ticket (`Initial Rows = P&L & Order Data` | `First 3 Columns Frozen`)")
+            top3_ticket_df = build_top3_exit_and_pnl_ticket_table(top3_ledger_df)
+            render_frozen_3col_dataframe(top3_ticket_df, height=390)
+
+            st.markdown("##### 📒 2B. Top 3 Daily CNC Ledger & 5-Minute Replay Audit (`First 3 Columns Frozen`)")
+            if not top3_ledger_df.empty:
+                ledger_cols_order = [
+                    # First 3 Frozen Columns
+                    "Daily_Slot",
                     "Ticker",
-                    "Exit_Readiness_Status",
+                    "Performance_Verdict",
+                    # Order, Exit & P&L Columns Immediately Next
+                    "PnL_INR",
+                    "PnL_Pct",
+                    "Status",
+                    "GTT_Order_Status",
+                    "CNC_Qty",
+                    "Capital_Used_INR",
+                    "Purchase_Date",
+                    "Purchase_Time",
+                    "Entry_Price",
+                    "Exit_Price",
+                    "Exit_Timestamp",
+                    "Exit_Reason",
+                    "Bars_Tracked_5m",
+                    "Window_Low_5m",
+                    "Window_High_5m",
+                    "Replay_Audit_Trail",
                     "GTT_SL_Trigger",
-                    # Remaining GTT OCO & CNC Order Columns Immediately Next
                     "GTT_SL_Limit",
                     "GTT_Target_Trigger",
                     "GTT_Target_Limit",
-                    "Active_Trail_Stage",
-                    "CNC_310PM_Decision",
-                    "Product_Type",
-                    "Suggested_CNC_Qty",
-                    "Stage1_Breakeven_SL",
-                    "Stage2_ProfitLock_SL",
-                    "Stage3_Chandelier_SL",
-                    "GTT_Swing_Target",
-                    "Swing_Conversion_Prob_Pct",
-                    "Swing_Conversion_Gates",
-                    "Live_Price",
-                    "CNC_Buy_Limit_Price",
-                    "Initial_Protected_SL",
+                    "High_Water_Mark",
                     "Structural_S1_Floor",
+                    "Logic_ID",
                 ]
-                avail_exit_cols = [c for c in exit_cols if c in entry_candidates_df.columns]
-                render_frozen_3col_dataframe(entry_candidates_df[avail_exit_cols], height=360)
-
-            if not active_ledger_df.empty:
-                with st.expander("📒 View Tracked CNC Positions Ledger (`data/intraday_sniper_trades.csv` — First 3 Columns Frozen)", expanded=True):
-                    ledger_cols_order = [
-                        "Ticker", "GTT_Order_Status", "GTT_SL_Trigger",
-                        "GTT_SL_Limit", "GTT_Target_Trigger", "GTT_Target_Limit",
-                        "Active_Trail_Stage", "CNC_310PM_Decision", "Product_Type",
-                        "CNC_Qty", "Entry_Price", "Live_CMP", "PnL_Pct",
-                        "High_Water_Mark", "Structural_S1_Floor", "Logic_ID",
-                        "Status", "Entry_Timestamp", "Last_Evaluated_Bar_TS",
-                    ]
-                    avail_l_cols = [c for c in ledger_cols_order if c in active_ledger_df.columns]
-                    render_frozen_3col_dataframe(active_ledger_df[avail_l_cols], height=220)
+                avail_l_cols = [c for c in ledger_cols_order if c in top3_ledger_df.columns]
+                render_frozen_3col_dataframe(top3_ledger_df[avail_l_cols], height=350)
 
     st.markdown("---")
+    with st.expander("🏗️ Can the Best Intraday Logic Be Updated in Production (`smart-etf-tracker`) Without Disturbing Other Logics? (Advisory Blueprint — Zero Production Changes Made)", expanded=True):
+        st.markdown(
+            """
+            ### ✅ YES — 100% Isolated Drop-In Possible Without Disturbing ETF, Swing, or Long-Term Logics
+            We audited `c:\\Users\\epurntr\\Downloads\\Gravity\\smart-etf-tracker` (`core_logic.py` and `pages/1_📈_Intraday_Trading.py`). **No files in `smart-etf-tracker` have been modified.** Here is why and how the best intraday logic from this repo can be plugged into production with **zero side effects** on any other strategy:
+
+            1. **Strict Strategy Namespace Isolation in `smart-etf-tracker/core_logic.py`**:
+               - In production `core_logic.py`, intraday trades are tagged with `Strategy_Type == "INTRADAY"` inside `trade_Multiple_log.csv` and evaluated exclusively inside `evaluate_intraday_trades()` and `generate_intraday_signals()`.
+               - Meanwhile, ETF Accumulation (`ETF_ACCUMULATION`), Swing Trades (`SWING`), and Structural Portfolios run in separate functions and separate Streamlit pages (`pages/2_...`, `pages/3_...`).
+            2. **3 Drop-In Upgrades for Production (When You Are Ready to Promote)**:
+               - **Upgrade #1 (Signal Generation)**: Replace only the body of `generate_intraday_signals()` in `smart-etf-tracker/core_logic.py` with our `L6` (5-Gate 10:00 AM ORB Sniper) + `L1/L4` regime-gated selector, enforcing `Max ₹20,000/ticker` and `Max 3 entries/day` (`CNC` product tag).
+               - **Upgrade #2 (Bug-Free 5m Chronological Replay)**: Replace only the `Strategy_Type == "INTRADAY"` loop inside `evaluate_intraday_trades()` with `evaluate_chronological_exits()` (which tracks `Last_Evaluated_Bar_TS` and replays 5m bars from `Purchase_Time + 5m` to `3:15 PM IST`, fixing the retroactive morning-low stop-out bug).
+               - **Upgrade #3 (UI Card in `pages/1_📈_Intraday_Trading.py`)**: Add the `@st.fragment(run_every="5m")` auto-refresh wrapper and the **Late-Click 5m Candle Replay & Exit Button** exclusively inside `pages/1_📈_Intraday_Trading.py`.
+            3. **Impact on Other Production Logics**: **`0%` (Zero impact)** on ETF tracker, Swing engine, database schema, or other pages.
+            """
+        )
+
     st.markdown("#### 🌍 Global Overnight Cues & NSE Sectoral Rotation Leadership (`First 3 Columns Frozen`)")
     if regime_rep:
         gc1, gc2 = st.columns(2)
@@ -525,14 +623,19 @@ with tab1:
     if not watchlist_df.empty:
         render_frozen_3col_dataframe(watchlist_df, height=460)
 
+
+with tab1:
+    render_live_5m_auto_refresh_desk()
+
 with tab2:
+    watchlist_df_t2 = recalculate_cnc_sizing(load_csv("live_watchlist_radar.csv"), MAX_BUDGET_PER_TICKER_INR)
     st.subheader("🛡️ Institutional Downside Protection & 4-Stage Chronological GTT Trailing Stop Ladder")
     st.markdown(
         """
         **How Our CNC + GTT OCO Downside Risk Engine Prevents Production Stop-Outs:**
-        1. **100% CNC Execution (Zero MIS Penalty)**: All positions are taken in `CNC` with a 2-Leg Broker GTT OCO Sell order. You never face forced 3:20 PM broker auto-squareoff penalties, and winners passing the 5-Gate check at 3:10 PM convert effortlessly into 5-Day Swing trades.
+        1. **100% CNC Execution (Zero MIS Penalty, Max ₹20K/Ticker, Max 3/Day)**: All positions are taken in `CNC` with a 2-Leg Broker GTT OCO Sell order and capped at `₹20,000` per ticker (`<= ₹60,000/day`).
         2. **Structural Support Floor (`S1`)**: Initial GTT stop-loss is anchored below **Opening Range Low (`ORB_Low`) / 20-Day Structural Support `S1` minus an `0.15x–0.18x ATR` cushion**.
-        3. **Chronological High-Water-Mark (`HWM`) Ratchet**: Tracks `Last_Evaluated_Bar_TS` and `High_Water_Mark` bar-by-bar in strict chronological order—eliminating the `smart-etf-tracker` bug where afternoon SL upgrades were retroactively compared against 9:50 AM morning lows.
+        3. **Chronological 5-Minute High-Water-Mark (`HWM`) Ratchet (`Purchase_Time + 5m -> 3:15 PM`)**: Tracks `Last_Evaluated_Bar_TS` and `High_Water_Mark` bar-by-bar in strict chronological order—eliminating the `smart-etf-tracker` bug where afternoon SL upgrades were retroactively compared against 9:50 AM morning lows.
         4. **4-Stage GTT Profit-Locking Ratchet**:
            - **Stage 1 (`MFE >= +0.80 ATR`)**: Modify GTT SL Trigger to `Entry + 0.18 ATR` (True Breakeven + DP/STT cover).
            - **Stage 2 (`MFE >= +1.25 ATR`)**: Modify GTT SL Trigger to `Entry + 0.65 ATR` (Locks >50% of gain).
@@ -540,18 +643,19 @@ with tab2:
            - **Stage 4 (`MFE >= +2.20 ATR`)**: Dynamic Chandelier GTT Trail at `High_Water_Mark - 0.50 ATR`.
         """
     )
-    if not watchlist_df.empty:
+    if not watchlist_df_t2.empty:
         cols_ladder = [
             "Ticker", "Exit_Readiness_Status", "GTT_SL_Trigger",
+            "Daily_Top3_Slot", "Suggested_CNC_Qty", "CNC_Order_Value_INR",
             "GTT_SL_Limit", "GTT_Target_Trigger", "GTT_Target_Limit",
-            "Product_Type", "Suggested_CNC_Qty", "CNC_Buy_Limit_Price",
+            "Product_Type", "CNC_Buy_Limit_Price",
             "Structural_S1_Floor", "Dist_Above_S1_Pct",
             "Initial_Protected_SL", "Downside_Risk_Pct",
             "Stage1_Breakeven_SL", "Stage2_ProfitLock_SL", "Stage3_Chandelier_SL",
             "GTT_Swing_Target", "CNC_310PM_Decision",
         ]
-        avail_ladder = [c for c in cols_ladder if c in watchlist_df.columns]
-        render_frozen_3col_dataframe(watchlist_df[avail_ladder], height=500)
+        avail_ladder = [c for c in cols_ladder if c in watchlist_df_t2.columns]
+        render_frozen_3col_dataframe(watchlist_df_t2[avail_ladder], height=500)
 
 with tab3:
     st.subheader("🔄 3:10 PM IST CNC Intraday-to-Swing Conversion Predictor (3-Year Empirical Study)")
@@ -626,7 +730,15 @@ with tab4:
         render_frozen_3col_dataframe(view_df.tail(250), height=420)
 
 with tab5:
-    st.subheader("🔬 Forensic Audit of `smart-etf-tracker` Production Trades (`First 3 Columns Frozen`)")
+    st.subheader("🔬 Forensic Audit of `smart-etf-tracker` Production Trades & Zero-Disturbance Integration Plan")
+    st.markdown(
+        """
+        ### 🏗️ Production Integration Assessment (`smart-etf-tracker` — Advisory Only, Zero Changes Made in Production)
+        - **Can the best intraday logic (`L6` 5-Gate 10:00 AM ORB + `L1/L4` Regime Sniper + 5m Chronological Replay) be updated in `smart-etf-tracker` without disturbing other logics?**
+          - **Yes, 100%.** In `smart-etf-tracker`, all non-intraday workflows (ETF Accumulation, Swing Trading, Capital Allocation) filter by `Strategy_Type != "INTRADAY"` and reside in separate functions/pages.
+          - Updating only `generate_intraday_signals()`, `evaluate_intraday_trades()` (for `Strategy_Type == "INTRADAY"`), and `pages/1_📈_Intraday_Trading.py` will upgrade production intraday performance while leaving ETF and Swing modules completely untouched.
+        """
+    )
     prod_audit = load_csv("production_trades_forensic_audit.csv")
     if not prod_audit.empty:
         render_frozen_3col_dataframe(prod_audit)
