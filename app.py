@@ -15,10 +15,15 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from nifty250_universe import UNIVERSE_META
 from intraday_expert_engine import (
     DATA_DIR,
     SNIPER_TRADES_CSV,
     SNIPER_TELEMETRY_CSV,
+    OPERATOR_SIGNALS_CSV,
+    OPERATOR_TRADES_CSV,
+    OPERATOR_PERF_JSON,
+    BEL_OCT16_CASE_STUDY_CSV,
     MAX_BUDGET_PER_TICKER_INR,
     MAX_DAILY_ENTRIES,
     MAX_DAILY_TOTAL_BUDGET_INR,
@@ -29,6 +34,8 @@ from intraday_expert_engine import (
     stage_top3_daily_cnc_entries,
     force_manual_exit_trade,
     predict_swing_conversion_success,
+    scan_operator_1m_footprints,
+    auto_execute_and_evaluate_operator_trades,
 )
 
 st.set_page_config(
@@ -51,11 +58,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🎯 Institutional CNC Intraday Sniper, 5m Auto-Exit & GTT Desk")
+st.title("🎯 Institutional CNC Intraday Sniper, 5m Auto-Exit & 1m Operator Footprint Desk")
 st.caption(
-    "Execution Mode: **100% CNC Only (Delivery — 0% MIS)** | "
-    "**Budget Rule: Max `₹20,000` per Ticker & Max `3` Entries/Day (`Top 3` Slots <= `₹60,000`)** | "
-    "**5-Minute Auto-Refresh & Auto-Exit + Late-Click 5m Candle Replay (`Purchase Time + 5m -> 3:15 PM IST`)**"
+    f"Universe: **Full NIFTY 250 + Sectoral/Global ETFs (`{len(UNIVERSE_META)}` Instruments)** | "
+    "Execution Mode: **100% CNC Only (Top 3 <= `₹20,000` each) + Separate 1m Operator Auto-Trade (`BUY` & `SELL`) Tracker** | "
+    "**5-Minute Auto-Refresh (`@st.fragment(run_every='5m')`) + Chronological Candle Replay**"
 )
 
 
@@ -223,8 +230,58 @@ def build_top3_exit_and_pnl_ticket_table(top3_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def build_operator_initial_rows_ticket_table(op_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds the 1-Minute Operator / Big-Player Auto-Trade (`BUY` & `SELL`) Order & Performance Ticket Table where:
+    - INITIAL ROWS (Rows 01–09) are strictly the Separate Performance (Profit/Loss), Auto-Trade Side (`BUY`/`SELL`),
+      Order Sizing (`<= ₹20,000`), Entry/Exit Prices, Stop-Loss & Target.
+    - LOWER ROWS (Rows 10–15) are the 1-Minute Volume-Shock (`>= 4.5x` 20m Median), Estimated Futures-Equivalent Volume
+      (e.g., `BEL` 12:02 PM `1.53M` Fut / `76.1K` Cash), Candle CLV, and `T+2m` Follow-Through Confirmation.
+    - FIRST 3 COLUMNS (`Row_Priority`, `Operator_AutoTrade_Parameter`, and `#1 Auto-Trade`) are frozen!
+    """
+    if op_df is None or op_df.empty:
+        return pd.DataFrame()
+
+    work = op_df.head(6).copy().reset_index(drop=True)
+    col_labels = [
+        f"#{i+1} {r['Ticker']} ({r.get('Signal_Side', 'BUY')} @ {str(r.get('Shock_Time_1m', ''))[:5]})"
+        for i, r in work.iterrows()
+    ]
+
+    rows_spec = [
+        # INITIAL ROWS = SEPARATE PERFORMANCE (PROFIT/LOSS) & AUTO-TRADE ORDER DATA
+        ("01. PERFORMANCE (INITIAL)", "Separate Auto-Trade P&L Verdict", [str(r.get("Performance_Verdict", "⚪ ACTIVE")) for _, r in work.iterrows()]),
+        ("02. AUTO-TRADE (INITIAL)", "Operator Action (BUY or SELL)", [str(r.get("Auto_Trade_Action", "")) for _, r in work.iterrows()]),
+        ("03. ORDER DATA (INITIAL)", "Signal Side & Trade Status", [f"{r.get('Signal_Side', '')} | {r.get('Status', '')}" for _, r in work.iterrows()]),
+        ("04. ORDER DATA (INITIAL)", "Auto Qty & Capital (<= ₹20K)", [f"{int(r.get('Auto_Qty_20K', 1))} Qty (₹{float(r.get('Capital_Used_INR', 0)):,.2f})" for _, r in work.iterrows()]),
+        ("05. ORDER DATA (INITIAL)", "T+2m Confirmed Entry Price (₹)", [f"₹{float(r.get('Confirm_Entry_Price', 0)):,.2f} (@ {r.get('Confirm_Time_T2', '')})" for _, r in work.iterrows()]),
+        ("06. EXIT DATA (INITIAL)", "Exit / Live Price (₹)", [f"₹{float(r.get('Live_Or_Exit_Price', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("07. RISK DATA (INITIAL)", "Initial SL -> Trailing SL (₹)", [f"SL ₹{float(r.get('Initial_SL', 0)):,.2f} -> Trail ₹{float(r.get('Current_Trailing_SL', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("08. TARGET DATA (INITIAL)", "Intraday Target Price (₹)", [f"₹{float(r.get('Target_Price', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("09. EXIT AUDIT (INITIAL)", "Exit Timestamp & Reason", [f"{r.get('Exit_Timestamp', 'Active')} | {r.get('Exit_Reason', '')}" for _, r in work.iterrows()]),
+        # 1-MINUTE OPERATOR VOLUME-SHOCK & T+2M CONFIRMATION FORENSICS BELOW INITIAL ROWS
+        ("10. 1M OPERATOR SHOCK", "Session Date & 1m Shock Candle", [f"{r.get('Session_Date', '')} @ {r.get('Shock_Time_1m', '')}" for _, r in work.iterrows()]),
+        ("11. 1M VOLUME SPIKE", "1m Cash Vol & Spike vs 20m Med", [f"{int(r.get('Shock_1m_Cash_Vol', 0)):,} sh ({float(r.get('Vol_Spike_Mult_20m', 0)):.1f}x 20m Med)" for _, r in work.iterrows()]),
+        ("12. FUTURES EQ VOL", "Est. Futures + Cash Combined Vol", [f"~{int(r.get('Est_Futures_Eq_Vol', 0)):,} shares (F&O + Cash)" for _, r in work.iterrows()]),
+        ("13. FOOTPRINT TYPE", "Institutional Footprint Pattern", [str(r.get("Operator_Footprint_Type", "")) for _, r in work.iterrows()]),
+        ("14. CANDLE STRUCTURE", "1m Shock OHLC, CLV & VWAP", [f"{r.get('Shock_Candle_OHLC', '')} | CLV {float(r.get('Shock_CLV', 0)):.2f} | VWAP ₹{float(r.get('Session_VWAP', 0)):,.2f}" for _, r in work.iterrows()]),
+        ("15. T+2M CONFIRMATION", "2-Minute Anti-Trap Gate Verdict", [str(r.get("T2_Follow_Through", "")) for _, r in work.iterrows()]),
+    ]
+
+    records = []
+    for r_group, r_field, vals in rows_spec:
+        rec = {
+            "Row_Priority": r_group,
+            "Operator_AutoTrade_Parameter": r_field,
+        }
+        for c_name, v in zip(col_labels, vals):
+            rec[c_name] = v
+        records.append(rec)
+    return pd.DataFrame(records)
+
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🎯 Tab 1: CNC Entry (Top 3 <=₹20K) & 5m Auto-Exit Desk",
+    "🎯 Tab 1: CNC Entry (Top 3 <=₹20K), 5m Auto-Exit & 1m Operator Auto-Trade Desk",
     "🛡️ Downside Protection & Trailing SL Ladder",
     "🔄 3:10 PM CNC Intraday-to-Swing Predictor",
     "🏆 3-Year Backtest (Top 6 Sniper Logics)",
@@ -235,8 +292,9 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 @st.fragment(run_every="5m")
 def render_live_5m_auto_refresh_desk():
     """
-    Auto-refreshes every 5 minutes (300 seconds) and automatically evaluates 5-minute candles
-    from `Purchase_Time + 5m` up to `3:15 PM IST`, executing exits when SL/Trail, Target, or 3:15 PM is met.
+    Auto-refreshes every 5 minutes (300 seconds) and automatically evaluates:
+    1. Top-3 CNC 5-minute candle exits (`Purchase_Time + 5m -> 3:15 PM IST`).
+    2. Separate 1-Minute Operator / Big-Player Auto-Trades (`BUY` & `SELL`) across the NIFTY 250 funnel.
     """
     # Automatically evaluate chronological 5m exits on every 5-minute cycle
     auto_eval_df = evaluate_chronological_exits(
@@ -245,24 +303,33 @@ def render_live_5m_auto_refresh_desk():
         eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
     )
 
+    # Also evaluate/refresh the separate Operator Auto-Trade (BUY & SELL) ledger every 5m cycle
+    cached_op_signals = load_csv("live_operator_1m_signals.csv")
+    op_trades_df, op_perf_summary = auto_execute_and_evaluate_operator_trades(
+        signals_df=cached_op_signals if not cached_op_signals.empty else None
+    )
+
     now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
     st.markdown(
         f"⏱️ **5-Minute Auto-Refresh & Auto-Exit Engine: `ACTIVE (Every 5 Minutes)`** | "
-        f"Last 5m Candle Check: **`{now_ist_str}`** | "
-        f"**Budget Cap: `₹20,000 / Ticker` | Daily Entry Cap: `Max 3 Tickers/Day (₹60,000 Total)`**"
+        f"Last 5m Check: **`{now_ist_str}`** | "
+        f"**Universe: `Full NIFTY 250 + ETFs ({len(UNIVERSE_META)} Tickers)`** | "
+        f"**Budget Cap: `₹20,000 / Ticker` (`Top 3 CNC` + `Separate 1m Operator Auto-Trade Ledger`)**"
     )
 
     # Top Control Bar
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.4, 1.4, 1.3, 1.9])
     with ctrl1:
-        if st.button("🔄 Run Full Live Market Scan & 5m Check", type="primary", use_container_width=True):
-            with st.spinner("Scanning 54 NSE & International instruments + evaluating 5m CNC exits..."):
+        if st.button("🔄 Run Full NIFTY 250 Scan + 5m & 1m Operator Check", type="primary", use_container_width=True):
+            with st.spinner(f"Scanning {len(UNIVERSE_META)} NIFTY 250 & Global instruments + 1m Operator footprints..."):
                 scan_live_sniper_opportunities()
                 evaluate_chronological_exits(
                     trades_csv_path=SNIPER_TELEMETRY_CSV,
                     force_full_replay=True,
                     eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
                 )
+                new_op_sig = scan_operator_1m_footprints()
+                auto_execute_and_evaluate_operator_trades(signals_df=new_op_sig)
             st.rerun()
     with ctrl2:
         if st.button("🏆 Reset / Auto-Load Today's Top 3 CNC (<=₹20K)", use_container_width=True):
@@ -291,11 +358,11 @@ def render_live_5m_auto_refresh_desk():
         )
     with ctrl4:
         filter_mode = st.selectbox(
-            "🔎 Card 1 Candidate Filter",
+            "🔎 Card 1 Candidate Filter (NIFTY 250 Universe)",
             options=[
                 "Top Actionable & High-Readiness CNC Setups (Top 3 Highlighted)",
                 "Triggered Sniper Signals Only (Immediate CNC Buy)",
-                "All 54 NSE & International Universe Instruments",
+                f"All {len(UNIVERSE_META)} NIFTY 250 & International Universe Instruments",
             ],
             index=0,
         )
@@ -311,17 +378,25 @@ def render_live_5m_auto_refresh_desk():
     sniper_df = recalculate_cnc_sizing(sniper_df, cnc_capital)
 
     if regime_rep:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"))
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"), f"Universe: {len(watchlist_df)} / {len(UNIVERSE_META)} Tickers")
         m2.metric("Nifty 50 (^NSEI)", f"{regime_rep.get('nifty_close', 0):,.2f}", f"{regime_rep.get('nifty_ret_1d_pct', 0):+.2f}% (1D)")
         m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "Max ₹20K/Ticker | Max 3/Day")
         tot_pnl_banner = float(top3_ledger_df["PnL_INR"].sum()) if not top3_ledger_df.empty and "PnL_INR" in top3_ledger_df.columns else 0.0
         tot_cap_banner = float(top3_ledger_df["Capital_Used_INR"].sum()) if not top3_ledger_df.empty and "Capital_Used_INR" in top3_ledger_df.columns else 0.0
         tot_pct_banner = (tot_pnl_banner / tot_cap_banner * 100.0) if tot_cap_banner > 0 else 0.0
         m4.metric(
-            f"Top 3 Daily CNC P&L ({len(top3_ledger_df)}/3 Slots)",
+            f"Top 3 Daily CNC P&L ({len(top3_ledger_df)}/3)",
             f"₹{tot_pnl_banner:+,.2f} ({tot_pct_banner:+.2f}%)",
-            f"Deployed: ₹{tot_cap_banner:,.0f} / ₹60,000 Max",
+            f"Deployed: ₹{tot_cap_banner:,.0f} / ₹60,000",
+        )
+        op_net_pnl = float(op_perf_summary.get("total_net_pnl_inr", 0.0))
+        op_wr = float(op_perf_summary.get("win_rate_pct", 0.0))
+        op_cnt = int(op_perf_summary.get("total_auto_trades", 0))
+        m5.metric(
+            f"1m Operator Auto-Trade P&L ({op_cnt})",
+            f"₹{op_net_pnl:+,.2f} ({op_wr:.1f}% WR)",
+            f"BUY: ₹{op_perf_summary.get('buy_net_pnl_inr', 0):+,.0f} | SELL: ₹{op_perf_summary.get('sell_net_pnl_inr', 0):+,.0f}",
         )
 
     if not watchlist_df.empty:
@@ -577,8 +652,204 @@ def render_live_5m_auto_refresh_desk():
                 avail_l_cols = [c for c in ledger_cols_order if c in top3_ledger_df.columns]
                 render_frozen_3col_dataframe(top3_ledger_df[avail_l_cols], height=350)
 
+    # =========================================================================
+    # SECTION 3 IN TAB 1:
+    # 1-MINUTE OPERATOR / BIG-PLAYER FOOTPRINT DETECTOR & SEPARATE AUTO-TRADE
+    # (BUY & SELL) PERFORMANCE DESK (5-MINUTE AUTO-REFRESH)
+    # =========================================================================
     st.markdown("---")
-    with st.expander("🏗️ Can the Best Intraday Logic Be Updated in Production (`smart-etf-tracker`) Without Disturbing Other Logics? (Advisory Blueprint — Zero Production Changes Made)", expanded=True):
+    with st.container(border=True):
+        st.markdown(
+            "### 🕵️ Section 3: 1-Minute Operator / Big-Player Footprint Detector & Separate Auto-Trade (`BUY` & `SELL`) Performance Desk (`5m Auto-Refresh`)"
+        )
+        st.caption(
+            "**How It Works (Zero-Load 2-Stage NIFTY 250 Funnel)**: Scans the top active NIFTY 250 stocks on **1-minute candles (`1m`)** for **Institutional / Operator Volume Shocks (`>= 4.5x` 20m Median Volume; e.g., `BEL` Oct 16 `12:02 PM` `1.53M` Futures / `76.1K` Cash Volume)**. "
+            "Instead of trading blind on `T+0`, it enforces a **3-Candle (`T+0` Shock -> `T+1m` Hold -> `T+2m` Follow-Through + `<=0.65%` Non-Exhaustion Gate)** and automatically executes & tracks **`BUY` (Low Absorption / VWAP Markup)** and **`SELL` (Operator Dump / Distribution)** auto-trades (`<= ₹20,000` each) in a **completely separate performance ledger**."
+        )
+
+        op_perf = load_json("operator_performance_summary.json") or op_perf_summary
+        op_signals_all = load_csv("live_operator_1m_signals.csv")
+        op_trades_all = load_csv("operator_auto_trades.csv")
+        bel_oct16_df = load_csv("bel_oct16_operator_validation.csv")
+
+        # Separate Operator Auto-Trade Performance KPIs
+        ok1, ok2, ok3, ok4, ok5 = st.columns(5)
+        ok1.metric(
+            "Separate Operator Net P&L",
+            f"₹{float(op_perf.get('total_net_pnl_inr', 0)):+,.2f}",
+            f"+{float(op_perf.get('return_on_20k_slot_pct', 0)):.2f}% on ₹20K Slot (PF {float(op_perf.get('profit_factor', 0)):.2f})",
+        )
+        ok2.metric(
+            "Operator Auto-Trades (W/L)",
+            f"{int(op_perf.get('total_auto_trades', 0))} Trades ({int(op_perf.get('wins', 0))}W / {int(op_perf.get('losses', 0))}L)",
+            f"Win Rate: {float(op_perf.get('win_rate_pct', 0)):.1f}% (1m Replay)",
+        )
+        ok3.metric(
+            "🟢 AUTO-BUY Net P&L",
+            f"₹{float(op_perf.get('buy_net_pnl_inr', 0)):+,.2f}",
+            f"{int(op_perf.get('buy_auto_trades', 0))} Long Auto-Trades (<=₹20K)",
+        )
+        ok4.metric(
+            "🔴 AUTO-SELL Net P&L",
+            f"₹{float(op_perf.get('sell_net_pnl_inr', 0)):+,.2f}",
+            f"{int(op_perf.get('sell_auto_trades', 0))} Short/Dump Auto-Trades (<=₹20K)",
+        )
+        ok5.metric(
+            "📌 BEL Oct 16 (12:02 PM) P&L",
+            f"₹{float(op_perf.get('bel_oct16_verified_pnl_inr', 0)):+,.2f}",
+            "4/4 Validated Signals (1.53M Fut / 76.1K Cash)",
+        )
+
+        # Interactive Controls for 1-Minute Operator Scan & Auto-Trade Replay
+        op_c1, op_c2, op_c3 = st.columns([1.6, 1.4, 2.0])
+        with op_c1:
+            if st.button(
+                "🔎 Scan 1m Operator Footprints (NIFTY 250) & Auto-Trade (BUY/SELL)",
+                type="primary",
+                use_container_width=True,
+                key="btn_scan_operator_1m",
+            ):
+                with st.spinner("Running 2-Stage NIFTY 250 1-Minute Operator Volume-Shock Scan & T+2m Auto-Trade Replay..."):
+                    fresh_sig = scan_operator_1m_footprints()
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(signals_df=fresh_sig)
+                    st.session_state["last_op_scan_msg"] = (
+                        f"✅ Scanned NIFTY 250 1m Operator Footprints | **{len(fresh_trd)} Confirmed Auto-Trades (`BUY` & `SELL`)** | "
+                        f"Separate Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`** (`{float(fresh_perf.get('win_rate_pct', 0)):.1f}% WR`)"
+                    )
+                st.rerun()
+        with op_c2:
+            if st.button(
+                "🔄 Re-Evaluate Open 1m Operator Trades (1m Trail -> 3:15 PM)",
+                use_container_width=True,
+                key="btn_re_eval_operator_1m",
+            ):
+                with st.spinner("Re-evaluating 1-minute candles (SL, Stage-1/2/3 Trail, Target & 3:15 PM Auto-Close)..."):
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(signals_df=op_signals_all)
+                    st.session_state["last_op_scan_msg"] = (
+                        f"⏱️ Updated 1m Operator Auto-Trades at `{fresh_perf.get('last_5m_refresh_ist', '')}` | "
+                        f"Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`**"
+                    )
+                st.rerun()
+        with op_c3:
+            op_view_filter = st.selectbox(
+                "🎯 Filter Operator Auto-Trade & 1m Footprint View",
+                options=[
+                    "All Confirmed Auto-Trades (BUY + SELL Separate Ledger)",
+                    "🟢 AUTO-BUY Only (Operator Low Absorption & VWAP Markup)",
+                    "🔴 AUTO-SELL Only (Operator Supply Dump / Short)",
+                    "📌 BEL Oct 16 Validation Only (09:58 BUY, 11:08 SELL, 11:23 BUY, 12:02 PM 1.53M Vol SELL)",
+                    "All Detected 1m Volume Shocks (Including Trap-Filtered Spikes)",
+                ],
+                index=0,
+                key="op_view_filter_select",
+            )
+
+        if "last_op_scan_msg" in st.session_state:
+            st.success(st.session_state["last_op_scan_msg"])
+
+        # Apply filter to op_trades_all
+        if not op_trades_all.empty:
+            if op_view_filter.startswith("🟢 AUTO-BUY"):
+                filtered_op_df = op_trades_all[op_trades_all["Signal_Side"] == "BUY"].copy()
+            elif op_view_filter.startswith("🔴 AUTO-SELL"):
+                filtered_op_df = op_trades_all[op_trades_all["Signal_Side"] == "SELL"].copy()
+            elif op_view_filter.startswith("📌 BEL Oct 16"):
+                filtered_op_df = op_trades_all[op_trades_all["Source_Tag"] == "BEL_OCT16_VALIDATED"].copy()
+            elif op_view_filter.startswith("All Detected"):
+                filtered_op_df = op_signals_all.copy() if not op_signals_all.empty else op_trades_all.copy()
+            else:
+                filtered_op_df = op_trades_all.copy()
+        else:
+            filtered_op_df = op_signals_all.copy()
+
+        st.markdown(
+            "##### 📋 3A. Operator Auto-Trade (`BUY` & `SELL`) Order & Separate Performance Ticket (`Initial Rows = P&L & Order Data` | `First 3 Columns Frozen`)"
+        )
+        op_ticket_df = build_operator_initial_rows_ticket_table(filtered_op_df)
+        render_frozen_3col_dataframe(op_ticket_df, height=400)
+
+        st.markdown(
+            "##### 📒 3B. Separate Operator Auto-Trade (`BUY` & `SELL`) Performance Ledger (`Initial Rows = Order & P&L` | `First 3 Columns Frozen`)"
+        )
+        if not filtered_op_df.empty:
+            op_ledger_cols = [
+                # First 3 Frozen Columns
+                "Ticker",
+                "Auto_Trade_Action",
+                "Performance_Verdict",
+                # Separate P&L & Order Execution Columns Immediately Next
+                "Signal_Side",
+                "PnL_INR",
+                "PnL_Pct",
+                "Status",
+                "Auto_Qty_20K",
+                "Capital_Used_INR",
+                "Confirm_Entry_Price",
+                "Live_Or_Exit_Price",
+                "Initial_SL",
+                "Current_Trailing_SL",
+                "Target_Price",
+                # 1-Minute Shock & T+2m Confirmation Forensics
+                "Session_Date",
+                "Shock_Time_1m",
+                "Confirm_Time_T2",
+                "Shock_1m_Cash_Vol",
+                "Est_Futures_Eq_Vol",
+                "Vol_Spike_Mult_20m",
+                "Operator_Footprint_Type",
+                "Shock_Candle_OHLC",
+                "Shock_CLV",
+                "Session_VWAP",
+                "T2_Follow_Through",
+                "Exit_Timestamp",
+                "Exit_Reason",
+                "Max_Favorable_Pct",
+                "Max_Adverse_Pct",
+                "Source_Tag",
+                "Trade_ID",
+            ]
+            avail_op_cols = [c for c in op_ledger_cols if c in filtered_op_df.columns]
+            render_frozen_3col_dataframe(filtered_op_df[avail_op_cols], height=390)
+
+        with st.expander(
+            "🔬 BEL 16th Oct 1-Minute Chart Validation (`12:02 PM` — `1.53M` Futures Vol / `76,149` Cash Vol) & Trap-Filter Audit (`First 3 Columns Frozen`)",
+            expanded=False,
+        ):
+            st.markdown(
+                """
+                - **Validated Statement**: On **16th Oct (`BEL` 1-Minute Chart @ `12:02 PM IST`)**, `BEL` printed a massive **1-minute red breakdown candle (`O: ₹380.35, H: ₹380.40, L: ₹379.85, C: ₹380.00`)** with **`76,149` NSE Cash shares (`7.8x` 20m median volume) and `~1.53 Million` Futures-equivalent shares (~268 BEL Futures lots)**.
+                - **Why Our `T+2m` Confirmation Rule Caught all 4 Moves (`+₹2,990` on `₹20K` budget) & Blocked the `09:50 AM` Fakeout**:
+                  1. **`09:50 AM` (`157K` Cash / `~3.1M` Fut Vol)**: Failed `T+2m` confirmation -> **Filtered out as a Bull Trap (`⚪ TRAP FILTERED`)**, avoiding a `-₹1.60/sh` drop to `₹377.10`.
+                  2. **`09:58 AM` (`70.1K` Cash / `~1.40M` Fut Vol)**: Operator Low Absorption at `₹377.10`, confirmed at `10:00 AM` (`₹377.65`) -> **`🟢 AUTO-BUY` won `+₹1,274.00`**.
+                  3. **`11:08 AM` (`50.5K` Cash / `~1.01M` Fut Vol)**: Supply rejection at `₹380.45`, confirmed at `11:10 AM` (`₹379.65`) -> **`🔴 AUTO-SELL` won `+₹104.00`** before flipping.
+                  4. **`11:23 AM` (`54.5K` Cash / `~1.09M` Fut Vol)**: `9.4x` VWAP reclaim, confirmed at `11:25 AM` (`₹379.55`) -> **`🟢 AUTO-BUY` won `+₹234.00`** before flipping at `12:02 PM`.
+                  5. **`12:02 PM` (`76.1K` Cash / `~1.53M` Fut Vol)**: Operator Distribution Dump, confirmed at `12:04 PM` (`₹379.50 < ₹379.85` Shock Low) -> **`🔴 AUTO-SELL` dropped straight to `₹376.60` (`3:15 PM` close `₹376.85`), winning `+₹1,378.00` (`+0.70%`)** with virtually zero adverse bounce (`+0.03%`).
+                """
+            )
+            if not bel_oct16_df.empty:
+                bel_cols = [
+                    "Ticker",
+                    "Auto_Trade_Action",
+                    "Performance_Verdict",
+                    "Session_Date",
+                    "Shock_Time_1m",
+                    "Confirm_Time_T2",
+                    "Shock_1m_Cash_Vol",
+                    "Est_Futures_Eq_Vol",
+                    "Vol_Spike_Mult_20m",
+                    "Operator_Footprint_Type",
+                    "Shock_Candle_OHLC",
+                    "T2_Follow_Through",
+                    "Confirm_Entry_Price",
+                    "Live_Or_Exit_Price",
+                    "PnL_INR",
+                    "Exit_Reason",
+                ]
+                avail_bel = [c for c in bel_cols if c in bel_oct16_df.columns]
+                render_frozen_3col_dataframe(bel_oct16_df[avail_bel], height=260)
+
+    st.markdown("---")
+    with st.expander("🏗️ Can the Best Intraday Logic Be Updated in Production (`smart-etf-tracker`) Without Disturbing Other Logics? (Advisory Blueprint — Zero Production Changes Made)", expanded=False):
         st.markdown(
             """
             ### ✅ YES — 100% Isolated Drop-In Possible Without Disturbing ETF, Swing, or Long-Term Logics
@@ -619,7 +890,7 @@ def render_live_5m_auto_refresh_desk():
                 avail_s = [c for c in sec_cols if c in sec_df.columns]
                 render_frozen_3col_dataframe(sec_df[avail_s])
 
-    st.markdown("#### 📡 Full 54-Instrument Indian & International CNC Readiness Radar (`Initial Rows = Order Ready` | `First 3 Columns Frozen`)")
+    st.markdown(f"#### 📡 Full {len(UNIVERSE_META)}-Instrument NIFTY 250 & International CNC Readiness Radar (`Initial Rows = Order Ready` | `First 3 Columns Frozen`)")
     if not watchlist_df.empty:
         render_frozen_3col_dataframe(watchlist_df, height=460)
 

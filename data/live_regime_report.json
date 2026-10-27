@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-27 21:29:34 IST",
+  "timestamp": "2026-10-27 23:02:09 IST",
   "regime_code": "BEAR_OR_CORRECTION",
   "regime_badge": "\ud83d\udd34 Bear Market / Correction",
   "nifty_close": 22749.75,
@@ -8,34 +8,34 @@
   "india_vix": 16.4,
   "global_cues": {
     "S&P 500 (^GSPC)": {
-      "close": 7730.78,
-      "ret_1d": 0.7,
-      "ret_5d": 0.24,
-      "sma20": 7730.13,
-      "sma50": 7697.17,
-      "sma200": 7298.91
+      "close": 7722.01,
+      "ret_1d": 0.59,
+      "ret_5d": 0.12,
+      "sma20": 7729.69,
+      "sma50": 7697.0,
+      "sma200": 7298.87
     },
     "Nasdaq 100 (^IXIC)": {
-      "close": 26503.52,
-      "ret_1d": 1.28,
-      "ret_5d": 0.3,
-      "sma20": 26814.53,
-      "sma50": 26584.99,
-      "sma200": 25019.6
+      "close": 26478.74,
+      "ret_1d": 1.18,
+      "ret_5d": 0.2,
+      "sma20": 26813.3,
+      "sma50": 26584.49,
+      "sma200": 25019.48
     },
     "Gold Futures (GC=F)": {
-      "close": 4076.2,
-      "ret_1d": 0.94,
-      "ret_5d": -1.6,
-      "sma20": 4143.59,
-      "sma50": 4325.94,
-      "sma200": 4528.66
+      "close": 4073.1,
+      "ret_1d": 0.86,
+      "ret_5d": -1.68,
+      "sma20": 4143.43,
+      "sma50": 4325.88,
+      "sma200": 4528.65
     },
     "Brent Crude (BZ=F)": {
-      "close": 109.44,
-      "ret_1d": -5.5,
-      "ret_5d": 0.6,
-      "sma20": 106.73,
+      "close": 109.61,
+      "ret_1d": -5.35,
+      "ret_5d": 0.75,
+      "sma20": 106.74,
       "sma50": 101.75,
       "sma200": 91.67
     },

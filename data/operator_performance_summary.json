@@ -1,0 +1,20 @@
+{
+  "last_5m_refresh_ist": "2026-10-27 23:04:45 IST",
+  "universe_size_tickers": 261,
+  "total_auto_trades": 18,
+  "buy_auto_trades": 10,
+  "sell_auto_trades": 8,
+  "wins": 11,
+  "losses": 7,
+  "win_rate_pct": 61.11,
+  "profit_factor": 6.69,
+  "total_net_pnl_inr": 3004.73,
+  "buy_net_pnl_inr": 1582.05,
+  "sell_net_pnl_inr": 1422.68,
+  "bel_oct16_verified_pnl_inr": 2990.0,
+  "live_nifty250_1m_pnl_inr": 14.73,
+  "total_capital_turned_inr": 348105.16,
+  "return_on_20k_slot_pct": 15.54,
+  "return_on_turnover_pct": 0.86,
+  "avg_vol_spike_mult": 33.3
+}

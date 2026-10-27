@@ -27,11 +27,17 @@ from intraday_expert_engine import (
     DATA_DIR,
     SNIPER_TRADES_CSV,
     SNIPER_TELEMETRY_CSV,
+    OPERATOR_SIGNALS_CSV,
+    OPERATOR_TRADES_CSV,
+    OPERATOR_PERF_JSON,
     MAX_BUDGET_PER_TICKER_INR,
     MAX_DAILY_ENTRIES,
+    UNIVERSE_META,
     scan_live_sniper_opportunities,
     evaluate_chronological_exits,
     stage_top3_daily_cnc_entries,
+    scan_operator_1m_footprints,
+    auto_execute_and_evaluate_operator_trades,
 )
 
 
@@ -115,6 +121,17 @@ def run_daemon(mode: str = "FULL_CYCLE"):
             tot_cap = updated_ledger["Capital_Used_INR"].sum()
             tot_pnl = updated_ledger["PnL_INR"].sum()
             print(f"[Portfolio Summary] Total Capital Deployed: ₹{tot_cap:,.2f} (<= ₹60,000 cap) | Net P&L: ₹{tot_pnl:+,.2f}")
+
+    # Step 3: 1-Minute Operator / Big-Player Footprint Detector & Separate Auto-Trade (BUY & SELL) Tracker
+    wl_for_op = watchlist_df if "watchlist_df" in locals() else None
+    op_signals = scan_operator_1m_footprints(watchlist_df=wl_for_op)
+    op_trades, op_perf = auto_execute_and_evaluate_operator_trades(op_signals)
+    print(
+        f"[Operator 1m Auto-Trade Engine (Separate Tracker)] Universe: {op_perf['universe_size_tickers']} tickers | "
+        f"Auto-Trades: {op_perf['total_auto_trades']} ({op_perf['buy_auto_trades']} BUY / {op_perf['sell_auto_trades']} SELL) | "
+        f"Win Rate: {op_perf['win_rate_pct']}% | Net P&L: ₹{op_perf['total_net_pnl_inr']:+,.2f} "
+        f"(Buy P&L: ₹{op_perf['buy_net_pnl_inr']:+,.2f} | Sell P&L: ₹{op_perf['sell_net_pnl_inr']:+,.2f})"
+    )
 
 
 if __name__ == "__main__":
