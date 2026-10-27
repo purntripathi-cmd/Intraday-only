@@ -37,13 +37,17 @@ from intraday_expert_engine import (
 def init_trades_ledger():
     if not os.path.exists(SNIPER_TRADES_CSV):
         cols = [
-            "Trade_ID", "Entry_Timestamp", "Ticker", "Market", "Sector_Group",
+            "Ticker", "GTT_Order_Status", "GTT_SL_Trigger",
+            "Product_Type", "CNC_Qty", "Entry_Price", "Live_CMP",
+            "GTT_SL_Limit", "GTT_Target_Trigger", "GTT_Target_Limit",
+            "Active_Trail_Stage", "CNC_310PM_Decision", "PnL_Pct",
+            "Trade_ID", "Entry_Timestamp", "Market", "Sector_Group",
             "Logic_ID", "Logic_Name", "Market_Regime_At_Entry", "Conviction_Score",
-            "Status", "Entry_Price", "Live_CMP", "High_Water_Mark",
-            "Structural_S1_Floor", "Initial_SL", "Current_Trailing_SL", "Target_Price",
+            "Status", "High_Water_Mark", "Structural_S1_Floor",
+            "Initial_SL", "Current_Trailing_SL", "Target_Price",
             "ATR_At_Entry", "Swing_Conversion_Prob_Pct", "Swing_Conversion_Gates",
             "Swing_Conversion_Verdict", "Last_Evaluated_Bar_TS",
-            "Exit_Timestamp", "Exit_Price", "Exit_Reason", "PnL_Pct"
+            "Exit_Timestamp", "Exit_Price", "Exit_Reason"
         ]
         pd.DataFrame(columns=cols).to_csv(SNIPER_TRADES_CSV, index=False)
 
@@ -51,12 +55,12 @@ def init_trades_ledger():
 def run_daemon(mode: str = "FULL_CYCLE"):
     init_trades_ledger()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"=== Intraday Sniper Daemon | Mode: {mode} | Timestamp: {now_str} IST ===")
+    print(f"=== Intraday CNC Sniper Daemon | Mode: {mode} | Timestamp: {now_str} IST ===")
 
-    # Step 1: Chronological GTT & Trailing Stop Evaluation on existing positions
+    # Step 1: Chronological GTT & Trailing Stop Evaluation on existing CNC positions
     if mode in ("FULL_CYCLE", "CHRONOLOGICAL_GTT_CHECK", "EOD_310PM_SWING_GATE"):
         updated_ledger = evaluate_chronological_exits(SNIPER_TRADES_CSV)
-        print(f"[GTT Check] Evaluated chronological 5m exits ({len(updated_ledger)} ledger rows).")
+        print(f"[GTT Check] Evaluated chronological 5m CNC GTT exits ({len(updated_ledger)} ledger rows).")
 
     # Step 2: Live Market Regime & Sniper Opportunity Scan
     if mode in ("FULL_CYCLE", "MORNING_SNIPER_SCAN", "EOD_310PM_SWING_GATE"):
@@ -65,22 +69,35 @@ def run_daemon(mode: str = "FULL_CYCLE"):
         print(f"[Authorized Logics] {', '.join(report['authorized_sniper_logics'])}")
 
         if snipers_df.empty:
-            print("[Sniper Discipline] 0 forced trades today — Standing by for A+ Multi-Factor Setup.")
+            print("[Sniper Discipline] 0 forced CNC trades today — Standing by for A+ Multi-Factor Setup.")
         else:
             # Take only the #1 highest-conviction Sniper setup today if not already active
             top_pick = snipers_df.iloc[0]
             ledger = pd.read_csv(SNIPER_TRADES_CSV)
-            today_prefix = datetime.now().strftime("%Y-%m-%d")
             already_entered = (
                 not ledger.empty
                 and ((ledger["Ticker"] == top_pick["Ticker"]) & (ledger["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"]))).any()
             )
             if not already_entered and mode in ("FULL_CYCLE", "MORNING_SNIPER_SCAN"):
                 trade_id = f"SNIPER_{int(datetime.now().timestamp())}_{top_pick['Ticker']}"
+                sl_trig = float(top_pick["GTT_SL_Trigger"])
+                tgt_trig = float(top_pick["GTT_Target_Trigger"])
                 new_row = {
+                    "Ticker": top_pick["Ticker"],
+                    "GTT_Order_Status": f"🛡️ GTT OCO ARMED: SL ₹{sl_trig:.2f} | TGT ₹{tgt_trig:.2f}",
+                    "GTT_SL_Trigger": sl_trig,
+                    "Product_Type": "CNC (Delivery - 0% MIS)",
+                    "CNC_Qty": int(top_pick["Suggested_CNC_Qty"]),
+                    "Entry_Price": top_pick["CNC_Buy_Limit_Price"],
+                    "Live_CMP": top_pick["Live_Price"],
+                    "GTT_SL_Limit": float(top_pick["GTT_SL_Limit"]),
+                    "GTT_Target_Trigger": tgt_trig,
+                    "GTT_Target_Limit": float(top_pick["GTT_Target_Limit"]),
+                    "Active_Trail_Stage": top_pick["Active_Trail_Stage"],
+                    "CNC_310PM_Decision": top_pick["CNC_310PM_Decision"],
+                    "PnL_Pct": 0.0,
                     "Trade_ID": trade_id,
                     "Entry_Timestamp": now_str,
-                    "Ticker": top_pick["Ticker"],
                     "Market": top_pick["Market"],
                     "Sector_Group": top_pick["Sector_Group"],
                     "Logic_ID": top_pick["Matched_Sniper_Logic_ID"],
@@ -88,14 +105,12 @@ def run_daemon(mode: str = "FULL_CYCLE"):
                     "Market_Regime_At_Entry": report["regime_badge"],
                     "Conviction_Score": top_pick["Sniper_Readiness_Score"],
                     "Status": "ACTIVE_INTRADAY",
-                    "Entry_Price": top_pick["Live_Price"],
-                    "Live_CMP": top_pick["Live_Price"],
                     "High_Water_Mark": top_pick["Live_Price"],
                     "Structural_S1_Floor": top_pick["Structural_S1_Floor"],
                     "Initial_SL": top_pick["Initial_Protected_SL"],
-                    "Current_Trailing_SL": top_pick["Initial_Protected_SL"],
-                    "Target_Price": top_pick["Intraday_Target"],
-                    "ATR_At_Entry": round((top_pick["Intraday_Target"] - top_pick["Live_Price"]) / 2.0, 2),
+                    "Current_Trailing_SL": sl_trig,
+                    "Target_Price": tgt_trig,
+                    "ATR_At_Entry": round((tgt_trig - float(top_pick["CNC_Buy_Limit_Price"])) / 2.0, 2),
                     "Swing_Conversion_Prob_Pct": top_pick["Swing_Conversion_Prob_Pct"],
                     "Swing_Conversion_Gates": top_pick["Swing_Conversion_Gates"],
                     "Swing_Conversion_Verdict": top_pick["Swing_Conversion_Verdict"],
@@ -103,11 +118,20 @@ def run_daemon(mode: str = "FULL_CYCLE"):
                     "Exit_Timestamp": "",
                     "Exit_Price": 0.0,
                     "Exit_Reason": "",
-                    "PnL_Pct": 0.0,
                 }
                 ledger = pd.concat([ledger, pd.DataFrame([new_row])], ignore_index=True)
                 ledger.to_csv(SNIPER_TRADES_CSV, index=False)
-                print(f"[Sniper Entry Executed] {trade_id} | {top_pick['Ticker']} @ ₹{top_pick['Live_Price']} | SL: ₹{top_pick['Initial_Protected_SL']} | Target: ₹{top_pick['Intraday_Target']}")
+                print(f"[CNC Sniper Entry Executed] {trade_id} | {top_pick['Ticker']} (CNC) @ ₹{top_pick['CNC_Buy_Limit_Price']} | GTT SL: ₹{sl_trig} | GTT Target: ₹{tgt_trig}")
+            elif already_entered:
+                # Sync latest swing conversion & GTT fields for active trade
+                mask = (ledger["Ticker"] == top_pick["Ticker"]) & (ledger["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"]))
+                for idx in ledger[mask].index:
+                    ledger.at[idx, "Swing_Conversion_Prob_Pct"] = top_pick["Swing_Conversion_Prob_Pct"]
+                    ledger.at[idx, "Swing_Conversion_Gates"] = top_pick["Swing_Conversion_Gates"]
+                    ledger.at[idx, "Swing_Conversion_Verdict"] = top_pick["Swing_Conversion_Verdict"]
+                    ledger.at[idx, "CNC_310PM_Decision"] = top_pick["CNC_310PM_Decision"]
+                ledger.to_csv(SNIPER_TRADES_CSV, index=False)
+                evaluate_chronological_exits(SNIPER_TRADES_CSV)
 
         # Step 3: EOD 3:10 PM Smart Swing Conversion Gate
         if mode == "EOD_310PM_SWING_GATE":

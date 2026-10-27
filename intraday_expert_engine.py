@@ -101,14 +101,21 @@ TOP_5_LOGICS_METADATA = {
 
 def compute_downside_protection_ladder(entry_price: float, initial_sl: float, atr: float, s1_floor: float) -> dict:
     """
-    Returns the complete institutional Downside Risk Protection & 4-Stage Trailing Stop Ladder.
+    Returns the complete institutional Downside Risk Protection & 4-Stage Trailing Stop Ladder
+    plus CNC Broker GTT (Good Till Triggered) OCO Trigger & Limit prices.
     """
     atr = max(atr, entry_price * 0.01)
-    risk_pct = (entry_price - initial_sl) / entry_price * 100.0
+    # Ensure initial_sl is strictly below entry_price (at least 0.35*ATR or 0.5% below entry)
+    safe_sl = min(initial_sl, entry_price - 0.35 * atr, entry_price * 0.994)
+    safe_sl = max(safe_sl, entry_price * 0.955)  # Cap max single-trade CNC stop distance at 4.5%
+    risk_pct = max(0.25, (entry_price - safe_sl) / entry_price * 100.0)
+    intraday_tgt = round(entry_price + 2.00 * atr, 2)
+    swing_tgt = round(entry_price + 3.20 * atr, 2)
     return {
         "entry_price": round(entry_price, 2),
         "structural_s1_support": round(s1_floor, 2),
-        "initial_stop_loss": round(initial_sl, 2),
+        "initial_stop_loss": round(safe_sl, 2),
+        "gtt_sl_limit_price": round(safe_sl * 0.997, 2),
         "initial_downside_risk_pct": round(risk_pct, 2),
         "stage1_trigger_price": round(entry_price + 0.80 * atr, 2),
         "stage1_trail_sl": round(entry_price + 0.18 * atr, 2),
@@ -118,8 +125,9 @@ def compute_downside_protection_ladder(entry_price: float, initial_sl: float, at
         "stage3_trail_sl": round(entry_price + 1.15 * atr, 2),
         "stage4_trigger_price": round(entry_price + 2.20 * atr, 2),
         "stage4_chandelier_offset": round(0.50 * atr, 2),
-        "intraday_target": round(entry_price + 2.00 * atr, 2),
-        "swing_conversion_target": round(entry_price + 3.20 * atr, 2),
+        "intraday_target": intraday_tgt,
+        "gtt_target_limit_price": round(intraday_tgt * 0.999, 2),
+        "swing_conversion_target": swing_tgt,
     }
 
 
@@ -513,9 +521,35 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             initial_sl = round(l_curr - 0.15 * atr, 2)
             conviction = min(99.0, 88.0 + sector_rs_5d * 2.0 + (vol_ratio - 1.2) * 4.5)
 
-        ladder = compute_downside_protection_ladder(c_curr, initial_sl, atr, s1_floor)
+        # Determine candidate Best Sniper Logic even for Standby rows so user sees which logic applies
+        if matched_logic_id is not None:
+            best_logic_id = matched_logic_id
+            best_logic_name = matched_logic_name
+        elif meets_5gate_10am or (c_curr > max(s1_floor, sma20) and sma20 >= sma50 * 0.995 and sma50 > sma200):
+            best_logic_id = "L6_5GATE_10AM_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        elif mkt_regime in ("BEAR_OR_CORRECTION", "HIGH_VOL_MACRO_SHOCK") and is_defensive_or_rs:
+            best_logic_id = "L4_DEFENSIVE_RS_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        elif is_global_linked and global_tailwind:
+            best_logic_id = "L5_GLOBAL_MACRO_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        elif had_catalyst_day1:
+            best_logic_id = "L3_CATALYST_VWAP_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        elif tested_support_zone:
+            best_logic_id = "L2_SUPPORT_SPRING_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        else:
+            best_logic_id = "L1_SECTOR_ORB_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+
+        # Actionable CNC Buy Limit Price: if already triggered, buy at Live_Price (or up to entry_trigger + 0.35*ATR);
+        # if on standby, order trigger is the 10:00 AM ORB / breakout price (max(entry_trigger, c_curr))
+        cnc_buy_limit = round(c_curr, 2) if matched_logic_id is not None else round(max(entry_trigger, c_curr), 2)
+        ladder = compute_downside_protection_ladder(cnc_buy_limit, initial_sl, atr, s1_floor)
         swing_pred = predict_swing_conversion_success(
-            entry_price=entry_trigger,
+            entry_price=cnc_buy_limit,
             current_price=c_curr,
             day_high=h_curr,
             day_low=l_curr,
@@ -525,7 +559,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             sma200=sma200,
             vol_ratio=vol_ratio,
             market_regime=mkt_regime,
-            sl_breached=(l_curr <= initial_sl),
+            sl_breached=(c_curr <= ladder["initial_stop_loss"]) or (c_curr < s1_floor),
         )
 
         # Readiness score even if not triggered today
@@ -541,11 +575,112 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         if vol_ratio >= 1.2:
             readiness += 8.0
 
+        final_score = round(max(readiness, conviction), 1)
+
+        # CNC Order Action & Priority Rank (Initial rows = actionable CNC orders first!)
+        if matched_logic_id is not None:
+            order_priority = 1
+            cnc_order_action = f"🟢 BUY CNC NOW ({matched_logic_id.split('_')[0]})"
+            cnc_order_type = "CNC LIMIT BUY (Immediate / 10:00 AM)"
+        elif meets_5gate_10am:
+            order_priority = 2
+            cnc_order_action = "🟢 BUY CNC @ 10AM ORB (L6 5-Gate)"
+            cnc_order_type = "CNC SL-M / LIMIT TRIGGER @ 10:00 AM"
+        elif final_score >= 80.0 and c_curr > s1_floor and stock_rs_5d > 0:
+            order_priority = 3
+            cnc_order_action = f"🟡 WATCH CNC TRIGGER ({best_logic_id.split('_')[0]})"
+            cnc_order_type = "CNC Conditional Limit Above Trigger"
+        else:
+            order_priority = 4
+            cnc_order_action = "⚪ STANDBY (NO CNC ORDER)"
+            cnc_order_type = "No Order — Wait for Alignment"
+
+        # Default ₹1,00,000 CNC cash allocation sizing (1x Delivery, zero MIS leverage)
+        default_cnc_capital = 100000.0
+        suggested_cnc_qty = max(1, int(default_cnc_capital // max(cnc_buy_limit, 1.0)))
+        cnc_order_value = round(suggested_cnc_qty * cnc_buy_limit, 2)
+        per_share_risk = max(0.05, cnc_buy_limit - ladder["initial_stop_loss"])
+        per_share_reward = max(0.05, ladder["intraday_target"] - cnc_buy_limit)
+        rr_ratio = round(per_share_reward / per_share_risk, 2)
+        max_stop_loss_inr = round(suggested_cnc_qty * per_share_risk, 2)
+
+        # Evaluate Live Intraday GTT Exit / Trailing SL Stage if entered at 10:00 AM ORB (entry_trigger)
+        orb_ladder = compute_downside_protection_ladder(entry_trigger, initial_sl, atr, s1_floor)
+        mfe_from_trigger = max(0.0, h_curr - entry_trigger) / max(atr, 1e-6) if c_curr >= entry_trigger else 0.0
+        active_gtt_sl = ladder["initial_stop_loss"]
+        active_trail_stage = "Stage 0: Initial S1/ORB Protected SL"
+        if matched_logic_id is not None and c_curr >= entry_trigger:
+            if mfe_from_trigger >= 2.20:
+                cand_sl = round(h_curr - 0.50 * atr, 2)
+                if cand_sl < c_curr:
+                    active_gtt_sl = max(active_gtt_sl, cand_sl)
+                    active_trail_stage = "Stage 4: Chandelier Trail (HWM - 0.50 ATR)"
+            elif mfe_from_trigger >= 1.75 and orb_ladder["stage3_trail_sl"] < c_curr:
+                active_gtt_sl = max(active_gtt_sl, orb_ladder["stage3_trail_sl"])
+                active_trail_stage = "Stage 3: Profit-Lock (+1.15 ATR / 66% Gain)"
+            elif mfe_from_trigger >= 1.25 and orb_ladder["stage2_trail_sl"] < c_curr:
+                active_gtt_sl = max(active_gtt_sl, orb_ladder["stage2_trail_sl"])
+                active_trail_stage = "Stage 2: Profit-Lock (+0.65 ATR / 50% Gain)"
+            elif mfe_from_trigger >= 0.80 and orb_ladder["stage1_trail_sl"] < c_curr:
+                active_gtt_sl = max(active_gtt_sl, orb_ladder["stage1_trail_sl"])
+                active_trail_stage = "Stage 1: Breakeven+ (+0.18 ATR Above 10AM ORB)"
+
+        gtt_sl_limit = round(active_gtt_sl * 0.997, 2)
+        gtt_target_trigger = ladder["intraday_target"]
+        gtt_target_limit = ladder["gtt_target_limit_price"]
+
+        if matched_logic_id is not None:
+            if c_curr >= gtt_target_trigger:
+                exit_readiness = f"🎯 READY FOR EXIT: TARGET HIT (Sell CNC @ ₹{c_curr:.2f})"
+            elif c_curr <= active_gtt_sl:
+                exit_readiness = f"🛑 READY FOR EXIT: SL HIT (Sell CNC @ ₹{c_curr:.2f})"
+            elif active_gtt_sl > ladder["initial_stop_loss"]:
+                exit_readiness = f"🔼 MODIFY GTT OCO SL -> ₹{active_gtt_sl:.2f} ({active_trail_stage.split(':')[0]})"
+            else:
+                exit_readiness = f"🛡️ PLACE GTT OCO SELL: SL ₹{active_gtt_sl:.2f} | TGT ₹{gtt_target_trigger:.2f}"
+        elif order_priority <= 3:
+            exit_readiness = f"📋 PRE-SET GTT OCO: SL ₹{active_gtt_sl:.2f} | TGT ₹{gtt_target_trigger:.2f}"
+        else:
+            exit_readiness = "⚪ NO ACTIVE POSITION / GTT STANDBY"
+
+        if swing_pred["predicted_swing_win_rate_pct"] >= 80.0:
+            cnc_310pm_action = f"🟢 HOLD CNC OVERNIGHT (5/5 Gates | Raise GTT TGT -> ₹{ladder['swing_conversion_target']:.2f})"
+        elif swing_pred["predicted_swing_win_rate_pct"] >= 70.0:
+            cnc_310pm_action = f"🟡 HOLD 50% CNC OVERNIGHT (4/5 Gates | Trail GTT SL @ ₹{active_gtt_sl:.2f})"
+        else:
+            cnc_310pm_action = "🟠 EXIT CNC BY 3:20 PM IST (Cancel GTT & Sell CNC Intraday)"
+
         rec = {
+            # Frozen First 3 Columns (Identifier + CNC Order Action + CNC Order Limit Price)
             "Ticker": sym.replace(".NS", ""),
-            "Market": meta["market"],
-            "Sector_Group": meta["group"],
+            "CNC_Order_Action": cnc_order_action,
+            "CNC_Buy_Limit_Price": cnc_buy_limit,
+            # Immediate Order-Related Columns (Strictly CNC, Zero MIS)
+            "Product_Type": "CNC (Delivery - 0% MIS)",
+            "CNC_Order_Type": cnc_order_type,
+            "Suggested_CNC_Qty": suggested_cnc_qty,
+            "CNC_Order_Value_INR": cnc_order_value,
+            "Max_Stop_Risk_INR": max_stop_loss_inr,
+            "Risk_Reward_Ratio": f"1:{rr_ratio:.2f}",
+            "Exit_Readiness_Status": exit_readiness,
+            "GTT_Order_Mode": "GTT OCO (2-Leg Sell CNC)",
+            "GTT_SL_Trigger": active_gtt_sl,
+            "GTT_SL_Limit": gtt_sl_limit,
+            "GTT_Target_Trigger": gtt_target_trigger,
+            "GTT_Target_Limit": gtt_target_limit,
+            "GTT_Swing_Target": ladder["swing_conversion_target"],
+            "Active_Trail_Stage": active_trail_stage,
+            "CNC_310PM_Decision": cnc_310pm_action,
+            # Logic & Technical Context Columns
+            "Order_Priority_Rank": order_priority,
+            "Best_Logic_ID": best_logic_id,
+            "Best_Logic_Name": best_logic_name,
+            "Matched_Sniper_Logic_ID": matched_logic_id or "STANDBY",
+            "Matched_Sniper_Logic_Name": matched_logic_name or f"Candidate: {best_logic_name}",
+            "Sniper_Readiness_Score": final_score,
+            "Meets_5Gate_10AM_Entry": bool(meets_5gate_10am),
             "Live_Price": round(c_curr, 2),
+            "ORB_10AM_Trigger": entry_trigger,
             "Day_Change_Pct": round(day_ret_pct, 2),
             "5D_Rel_Strength_Pct": round(stock_rs_5d, 2),
             "Sector_5D_RS_Pct": round(sector_rs_5d, 2),
@@ -559,20 +694,25 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "Stage2_ProfitLock_SL": ladder["stage2_trail_sl"],
             "Stage3_Chandelier_SL": ladder["stage3_trail_sl"],
             "Intraday_Target": ladder["intraday_target"],
-            "Meets_5Gate_10AM_Entry": bool(meets_5gate_10am),
             "Swing_Conversion_Prob_Pct": swing_pred["predicted_swing_win_rate_pct"],
             "Swing_Conversion_Gates": swing_pred["gates_passed"],
             "Swing_Conversion_Verdict": swing_pred["verdict"],
-            "Sniper_Readiness_Score": round(max(readiness, conviction), 1),
-            "Matched_Sniper_Logic_ID": matched_logic_id or "STANDBY",
-            "Matched_Sniper_Logic_Name": matched_logic_name or "Awaiting Full Multi-Factor Sniper Alignment",
+            "Market": meta["market"],
+            "Sector_Group": meta["group"],
         }
         watchlist_rows.append(rec)
         if matched_logic_id is not None:
             sniper_rows.append(rec)
 
-    watchlist_df = pd.DataFrame(watchlist_rows).sort_values("Sniper_Readiness_Score", ascending=False)
-    sniper_df = pd.DataFrame(sniper_rows).sort_values("Sniper_Readiness_Score", ascending=False) if sniper_rows else pd.DataFrame(columns=watchlist_df.columns)
+    watchlist_df = pd.DataFrame(watchlist_rows).sort_values(
+        ["Order_Priority_Rank", "Sniper_Readiness_Score", "5D_Rel_Strength_Pct"],
+        ascending=[True, False, False],
+    )
+    sniper_df = (
+        pd.DataFrame(sniper_rows).sort_values(["Order_Priority_Rank", "Sniper_Readiness_Score"], ascending=[True, False])
+        if sniper_rows
+        else pd.DataFrame(columns=watchlist_df.columns)
+    )
 
     watchlist_df.to_csv(os.path.join(DATA_DIR, "live_watchlist_radar.csv"), index=False)
     sniper_df.to_csv(os.path.join(DATA_DIR, "live_sniper_signals.csv"), index=False)
@@ -584,12 +724,14 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
 
 def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd.DataFrame:
     """
-    Bug-Free Chronological 5-Minute GTT & Trailing Stop Evaluator:
+    Bug-Free Chronological 5-Minute CNC GTT & Trailing Stop Evaluator:
     - Fixes Bug #1 from `smart-etf-tracker`: stores `Last_Evaluated_Bar_TS` and `High_Water_Mark`
       so afternoon SL ratchets are NEVER checked against earlier morning bars.
+    - Computes live CNC GTT OCO Trigger & Limit prices (`GTT_SL_Trigger`, `GTT_SL_Limit`,
+      `GTT_Target_Trigger`, `GTT_Target_Limit`, `Exit_Readiness_Status`, `Product_Type="CNC"`).
     - At 3:10 PM IST, automatically evaluates the 5-Gate Smart Swing Conversion rule:
       if a trade has not hit intraday target or SL and passes all 5 gates (84.9% historical win rate),
-      it upgrades Status to `SWING_CONVERTED` instead of forcing an arbitrary EOD exit.
+      it upgrades Status to `SWING_CONVERTED` (Hold CNC Overnight) instead of forcing an EOD exit.
     """
     if not os.path.exists(trades_csv_path):
         return pd.DataFrame()
@@ -597,6 +739,21 @@ def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd
     df = pd.read_csv(trades_csv_path)
     if df.empty:
         return df
+
+    # Ensure CNC & GTT columns exist on the active trade ledger
+    for col, default_val in [
+        ("Product_Type", "CNC (Delivery - 0% MIS)"),
+        ("CNC_Qty", 45),
+        ("GTT_Order_Status", "🛡️ GTT OCO ARMED (HOLD CNC)"),
+        ("GTT_SL_Trigger", 0.0),
+        ("GTT_SL_Limit", 0.0),
+        ("GTT_Target_Trigger", 0.0),
+        ("GTT_Target_Limit", 0.0),
+        ("Active_Trail_Stage", "Stage 0: Initial S1/ORB Floor"),
+        ("CNC_310PM_Decision", "🟠 EXIT CNC BY 3:20 PM IST (If <5 Gates)"),
+    ]:
+        if col not in df.columns:
+            df[col] = default_val
 
     active_mask = df["Status"].isin(["ACTIVE_INTRADAY", "SWING_CONVERTED"])
     if not active_mask.any():
@@ -615,72 +772,104 @@ def evaluate_chronological_exits(trades_csv_path: str = SNIPER_TRADES_CSV) -> pd
         atr = float(df.at[idx, "ATR_At_Entry"]) if "ATR_At_Entry" in df.columns and pd.notna(df.at[idx, "ATR_At_Entry"]) else entry_p * 0.015
         hwm = float(df.at[idx, "High_Water_Mark"]) if "High_Water_Mark" in df.columns and pd.notna(df.at[idx, "High_Water_Mark"]) else entry_p
 
+        df.at[idx, "Product_Type"] = "CNC (Delivery - 0% MIS)"
+        df.at[idx, "CNC_Qty"] = max(1, int(100000.0 // max(entry_p, 1.0)))
+
         entry_ts = pd.to_datetime(str(df.at[idx, "Entry_Timestamp"]))
         last_eval_str = str(df.at[idx, "Last_Evaluated_Bar_TS"]) if "Last_Evaluated_Bar_TS" in df.columns and pd.notna(df.at[idx, "Last_Evaluated_Bar_TS"]) else ""
         cutoff_ts = pd.to_datetime(last_eval_str) if last_eval_str and last_eval_str != "nan" else entry_ts
 
-        if sym not in data_5m.columns.get_level_values(0):
-            continue
-        bars = data_5m[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
-        if bars.empty:
-            continue
-        if bars.index.tz is not None:
-            bars.index = bars.index.tz_convert("Asia/Kolkata").tz_localize(None)
-
-        # Strictly filter ONLY new bars strictly AFTER cutoff_ts
-        new_bars = bars[bars.index > cutoff_ts]
-        if new_bars.empty:
-            continue
-
         exited = False
-        for b_ts, b_row in new_bars.iterrows():
-            bl = float(b_row["Low"])
-            bh = float(b_row["High"])
-            bc = float(b_row["Close"])
+        if sym in data_5m.columns.get_level_values(0):
+            bars = data_5m[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+            if not bars.empty:
+                if bars.index.tz is not None:
+                    bars.index = bars.index.tz_convert("Asia/Kolkata").tz_localize(None)
 
-            # 1) Check active stop loss BEFORE upgrading HWM/SL from current bar's high
-            if bl <= curr_sl:
-                df.at[idx, "Status"] = "STOP_OR_TRAIL_EXIT"
-                df.at[idx, "Exit_Price"] = round(curr_sl, 2)
-                df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                df.at[idx, "Exit_Reason"] = f"Chronological Protective SL/Trail Hit at {b_ts.strftime('%H:%M')} (SL ₹{curr_sl:.2f})"
-                df.at[idx, "PnL_Pct"] = round((curr_sl - entry_p) / entry_p * 100.0, 2)
-                df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                exited = True
-                break
+                # Strictly filter ONLY new bars strictly AFTER cutoff_ts
+                new_bars = bars[bars.index > cutoff_ts]
+                for b_ts, b_row in new_bars.iterrows():
+                    bl = float(b_row["Low"])
+                    bh = float(b_row["High"])
+                    bc = float(b_row["Close"])
 
-            # 2) Check target achievement
-            if bh >= target_p:
-                df.at[idx, "Status"] = "TARGET_ACHIEVED"
-                df.at[idx, "Exit_Price"] = round(target_p, 2)
-                df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                df.at[idx, "Exit_Reason"] = f"Target Achieved at {b_ts.strftime('%H:%M')} (₹{target_p:.2f})"
-                df.at[idx, "PnL_Pct"] = round((target_p - entry_p) / entry_p * 100.0, 2)
-                df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                exited = True
-                break
+                    # 1) Check active stop loss BEFORE upgrading HWM/SL from current bar's high
+                    if bl <= curr_sl:
+                        df.at[idx, "Status"] = "STOP_OR_TRAIL_EXIT"
+                        df.at[idx, "Exit_Price"] = round(curr_sl, 2)
+                        df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        df.at[idx, "Exit_Reason"] = f"CNC GTT SL/Trail Executed at {b_ts.strftime('%H:%M')} (SL ₹{curr_sl:.2f})"
+                        df.at[idx, "GTT_Order_Status"] = f"🛑 GTT SL EXECUTED @ ₹{curr_sl:.2f} (CNC Sold)"
+                        df.at[idx, "PnL_Pct"] = round((curr_sl - entry_p) / entry_p * 100.0, 2)
+                        df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        exited = True
+                        break
 
-            # 3) Upgrade High-Water-Mark and 4-Stage Trailing Stop for SUBSEQUENT bars only
-            hwm = max(hwm, bh)
-            mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
-            if mfe_atr >= 2.20:
-                curr_sl = max(curr_sl, round(hwm - 0.50 * atr, 2))
-            elif mfe_atr >= 1.75:
-                curr_sl = max(curr_sl, round(entry_p + 1.15 * atr, 2))
-            elif mfe_atr >= 1.25:
-                curr_sl = max(curr_sl, round(entry_p + 0.65 * atr, 2))
-            elif mfe_atr >= 0.80:
-                curr_sl = max(curr_sl, round(entry_p + 0.18 * atr, 2))
+                    # 2) Check target achievement
+                    if bh >= target_p:
+                        df.at[idx, "Status"] = "TARGET_ACHIEVED"
+                        df.at[idx, "Exit_Price"] = round(target_p, 2)
+                        df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        df.at[idx, "Exit_Reason"] = f"CNC GTT Target Executed at {b_ts.strftime('%H:%M')} (₹{target_p:.2f})"
+                        df.at[idx, "GTT_Order_Status"] = f"🎯 GTT TARGET EXECUTED @ ₹{target_p:.2f} (CNC Sold)"
+                        df.at[idx, "PnL_Pct"] = round((target_p - entry_p) / entry_p * 100.0, 2)
+                        df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        exited = True
+                        break
 
-            df.at[idx, "High_Water_Mark"] = round(hwm, 2)
-            df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
-            df.at[idx, "Live_CMP"] = round(bc, 2)
-            df.at[idx, "PnL_Pct"] = round((bc - entry_p) / entry_p * 100.0, 2)
-            df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    # 3) Upgrade High-Water-Mark and 4-Stage Trailing Stop for SUBSEQUENT bars only
+                    hwm = max(hwm, bh)
+                    mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
+                    if mfe_atr >= 2.20:
+                        curr_sl = max(curr_sl, round(hwm - 0.50 * atr, 2))
+                    elif mfe_atr >= 1.75:
+                        curr_sl = max(curr_sl, round(entry_p + 1.15 * atr, 2))
+                    elif mfe_atr >= 1.25:
+                        curr_sl = max(curr_sl, round(entry_p + 0.65 * atr, 2))
+                    elif mfe_atr >= 0.80:
+                        curr_sl = max(curr_sl, round(entry_p + 0.18 * atr, 2))
+
+                    df.at[idx, "High_Water_Mark"] = round(hwm, 2)
+                    df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
+                    df.at[idx, "Live_CMP"] = round(bc, 2)
+                    df.at[idx, "PnL_Pct"] = round((bc - entry_p) / entry_p * 100.0, 2)
+                    df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
 
         if not exited:
             df.at[idx, "High_Water_Mark"] = round(hwm, 2)
             df.at[idx, "Current_Trailing_SL"] = round(curr_sl, 2)
+            mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
+            if mfe_atr >= 2.20:
+                stage_lbl = "Stage 4: Chandelier Trail (HWM - 0.50 ATR)"
+                gtt_status = f"🔼 MODIFY GTT SL -> ₹{curr_sl:.2f} (Stage 4 Chandelier)"
+            elif mfe_atr >= 1.75:
+                stage_lbl = "Stage 3: Profit-Lock (+1.15 ATR)"
+                gtt_status = f"🔼 MODIFY GTT SL -> ₹{curr_sl:.2f} (Stage 3 Lock)"
+            elif mfe_atr >= 1.25:
+                stage_lbl = "Stage 2: Profit-Lock (+0.65 ATR)"
+                gtt_status = f"🔼 MODIFY GTT SL -> ₹{curr_sl:.2f} (Stage 2 Lock)"
+            elif mfe_atr >= 0.80:
+                stage_lbl = "Stage 1: Breakeven+ (+0.18 ATR)"
+                gtt_status = f"🔼 MODIFY GTT SL -> ₹{curr_sl:.2f} (Stage 1 Breakeven+)"
+            else:
+                stage_lbl = "Stage 0: Initial S1/ORB Floor"
+                gtt_status = f"🛡️ GTT OCO ARMED: SL ₹{curr_sl:.2f} | TGT ₹{target_p:.2f}"
+
+            df.at[idx, "Active_Trail_Stage"] = stage_lbl
+            df.at[idx, "GTT_Order_Status"] = gtt_status
+
+        df.at[idx, "GTT_SL_Trigger"] = round(curr_sl, 2)
+        df.at[idx, "GTT_SL_Limit"] = round(curr_sl * 0.997, 2)
+        df.at[idx, "GTT_Target_Trigger"] = round(target_p, 2)
+        df.at[idx, "GTT_Target_Limit"] = round(target_p * 0.999, 2)
+
+        prob = float(df.at[idx, "Swing_Conversion_Prob_Pct"]) if "Swing_Conversion_Prob_Pct" in df.columns and pd.notna(df.at[idx, "Swing_Conversion_Prob_Pct"]) else 50.0
+        if prob >= 80.0:
+            df.at[idx, "CNC_310PM_Decision"] = "🟢 HOLD CNC OVERNIGHT (Passed 5/5 Swing Gates)"
+        elif prob >= 70.0:
+            df.at[idx, "CNC_310PM_Decision"] = "🟡 HOLD 50% CNC / EXIT 50% @ 3:10 PM (4/5 Gates)"
+        else:
+            df.at[idx, "CNC_310PM_Decision"] = "🟠 EXIT CNC BY 3:20 PM (Cancel GTT & Sell CNC)"
 
     df.to_csv(trades_csv_path, index=False)
     return df
