@@ -30,6 +30,7 @@ if (
     or not hasattr(intraday_expert_engine, "build_all_strategies_paper_ledger_and_scorecard")
     or not hasattr(intraday_expert_engine, "FRESH_PAPER_TRADES_CSV")
     or not hasattr(intraday_expert_engine, "auto_rollover_daily_top3_cnc")
+    or not hasattr(intraday_expert_engine, "build_probable_intraday_candidates_sheet")
 ):
     importlib.reload(nifty250_universe)
     importlib.reload(backtest_engine_3y)
@@ -107,6 +108,11 @@ STRATEGY_SCORECARD_CSV = getattr(
     "STRATEGY_SCORECARD_CSV",
     os.path.join(DATA_DIR, "strategy_wise_paper_scorecard.csv"),
 )
+PROBABLE_CANDIDATES_CSV = getattr(
+    intraday_expert_engine,
+    "PROBABLE_CANDIDATES_CSV",
+    os.path.join(DATA_DIR, "probable_intraday_candidates.csv"),
+)
 auto_rollover_daily_top3_cnc = getattr(
     intraday_expert_engine,
     "auto_rollover_daily_top3_cnc",
@@ -126,6 +132,11 @@ build_all_strategies_paper_ledger_and_scorecard = getattr(
     intraday_expert_engine,
     "build_all_strategies_paper_ledger_and_scorecard",
     lambda *a, **kw: (pd.DataFrame(), pd.DataFrame()),
+)
+build_probable_intraday_candidates_sheet = getattr(
+    intraday_expert_engine,
+    "build_probable_intraday_candidates_sheet",
+    lambda *a, **kw: pd.DataFrame(),
 )
 
 st.set_page_config(
@@ -530,7 +541,178 @@ def render_live_5m_auto_refresh_desk():
         entry_candidates_df = pd.DataFrame()
 
     # =========================================================================
-    # SECTION 0 (TOP OF TAB 1):
+    # SECTION 00 (VERY TOP OF TAB 1 — ABOVE DAILY FRESH PAPER TRADE LOG):
+    # PROBABLE INTRADAY ENTRY-EXIT CANDIDATES (PRE-CONFIGURE IN BROKER IN ADVANCE)
+    # =========================================================================
+    st.markdown("---")
+    probable_df = build_probable_intraday_candidates_sheet(
+        watchlist_df=watchlist_df,
+        sniper_df=sniper_df,
+        op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
+        top3_ledger_df=top3_ledger_df,
+        budget_per_ticker=cnc_capital,
+    )
+    if probable_df.empty:
+        probable_df = load_csv("probable_intraday_candidates.csv")
+
+    with st.container(border=True):
+        st.markdown(
+            "### 🎯 Probable Intraday Entry–Exit Candidates — Configure Orders in Advance (`Recommended Entry, SL, Trail & Target Levels`)"
+        )
+        st.caption(
+            "**Advance Broker Order Configuration Sheet (`<= ₹20,000 / Ticker`)**: "
+            "Use this table to pre-configure **Conditional Limit / SL-M Entry Orders** and **2-Leg GTT OCO Exit Orders (Stop-Loss + Target)** in your broker (Zerodha Kite / Groww / Upstox / AngelOne) **in advance**. "
+            "First 3 columns (`Priority_And_Slot`, `Ticker`, `Advance_Entry_To_Exit_Config`) are frozen on the left, followed immediately by `Recommended_Entry_Price`, `Recommended_Stop_Loss`, `Safe_T1_And_Trail_SL_Levels`, and `Recommended_Exit_Target`."
+        )
+
+        if not probable_df.empty:
+            cnc_prob_sub = probable_df[probable_df["Candidate_Group"] == "CNC_OR_INTRADAY_SNIPER"].reset_index(drop=True)
+            imminent_sub = cnc_prob_sub[cnc_prob_sub["Raw_Gap_Pct"] <= 0.85] if "Raw_Gap_Pct" in cnc_prob_sub.columns else pd.DataFrame()
+
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            for idx_card, col_card in enumerate([pc1, pc2, pc3]):
+                if idx_card < len(cnc_prob_sub):
+                    rc = cnc_prob_sub.iloc[idx_card]
+                    badge_icon = ["🏆 #1", "🥈 #2", "🥉 #3"][idx_card]
+                    col_card.metric(
+                        f"{badge_icon} Probable Setup: {rc['Ticker']}",
+                        f"Entry ₹{float(rc['Recommended_Entry_Price']):,.2f} ({int(rc.get('Raw_Qty', 1))} Qty)",
+                        f"SL ₹{float(rc.get('Raw_SL_Price', 0)):,.2f} -> TGT ₹{float(rc.get('Raw_Target_Price', 0)):,.2f}",
+                    )
+            imm_tickers = ", ".join(imminent_sub["Ticker"].head(5).tolist()) if not imminent_sub.empty else "Scanning..."
+            pc4.metric(
+                f"⚡ Ready / Imminent (<0.85% to Entry)",
+                f"{len(imminent_sub)} Candidates Near Trigger",
+                f"Watch: {imm_tickers}",
+            )
+
+            pf1, pf2 = st.columns([1.8, 1.4])
+            prob_view_mode = pf1.selectbox(
+                "🎯 Filter Probable Candidates for Advance Broker Configuration",
+                options=[
+                    "Top 15 High-Probability Entry-Exit Setups (Recommended Pre-Set List)",
+                    "Ready Now & Imminent Breakouts Only (<= 0.85% from Entry Trigger)",
+                    "Top-3 Daily CNC Slot Candidates Only (<= ₹60,000 Total)",
+                    "1-Minute Operator Volume-Shock Candidates (AUTO-BUY & AUTO-SELL Levels)",
+                    f"All Probable Intraday Candidates ({len(probable_df)} Setups)",
+                ],
+                index=0,
+                key="probable_candidates_view_filter",
+            )
+            sectors_avail = ["All Sectors"] + sorted(probable_df["Sector_Group"].dropna().astype(str).unique().tolist()) if "Sector_Group" in probable_df.columns else ["All Sectors"]
+            sel_prob_sector = pf2.selectbox(
+                "🏭 Filter by NSE Sector",
+                options=sectors_avail,
+                index=0,
+                key="probable_candidates_sector_filter",
+            )
+
+            prob_view_df = probable_df.copy()
+            if sel_prob_sector != "All Sectors" and "Sector_Group" in prob_view_df.columns:
+                prob_view_df = prob_view_df[prob_view_df["Sector_Group"].astype(str) == sel_prob_sector]
+
+            if prob_view_mode.startswith("Top 15"):
+                cnc_part = prob_view_df[prob_view_df["Candidate_Group"] == "CNC_OR_INTRADAY_SNIPER"].head(12)
+                op_part = prob_view_df[prob_view_df["Candidate_Group"] == "1M_OPERATOR_FOOTPRINT"].head(3)
+                prob_view_df = pd.concat([cnc_part, op_part], ignore_index=True)
+            elif prob_view_mode.startswith("Ready Now"):
+                prob_view_df = prob_view_df[
+                    (prob_view_df["Candidate_Group"] == "CNC_OR_INTRADAY_SNIPER")
+                    & (prob_view_df["Raw_Gap_Pct"] <= 0.85)
+                ]
+            elif prob_view_mode.startswith("Top-3 Daily"):
+                prob_view_df = prob_view_df[prob_view_df["Priority_And_Slot"].astype(str).str.contains("Top-3 CNC")]
+            elif prob_view_mode.startswith("1-Minute Operator"):
+                prob_view_df = prob_view_df[prob_view_df["Candidate_Group"] == "1M_OPERATOR_FOOTPRINT"]
+
+            display_prob_cols = [
+                "Priority_And_Slot",
+                "Ticker",
+                "Advance_Entry_To_Exit_Config",
+                "Order_Side",
+                "Recommended_Entry_Price",
+                "Recommended_Stop_Loss",
+                "Safe_T1_And_Trail_SL_Levels",
+                "Recommended_Exit_Target",
+                "Trigger_Proximity_Status",
+                "Live_LTP_And_Gap",
+                "Qty_For_20K_And_Capital",
+                "Est_Profit_Vs_Risk_INR",
+                "Time_Exit_And_315PM_Rule",
+                "Strategy_And_Conviction",
+                "Pre_Configure_Broker_Order_Guide",
+            ]
+            avail_prob_cols = [c for c in display_prob_cols if c in prob_view_df.columns]
+            render_frozen_3col_dataframe(prob_view_df[avail_prob_cols], height=390)
+
+            # Quick 1-Click Broker Configuration Lock-In Bar right inside the Top Section
+            with st.expander("📌 Configured a Candidate in Your Broker? Click Here to Lock It into the Top-3 Active 5m Exit Tracker (`<= ₹20K`)", expanded=False):
+                lk1, lk2, lk3, lk4 = st.columns([1.8, 1.0, 1.0, 1.5])
+                cand_tickers = cnc_prob_sub["Ticker"].tolist() if not cnc_prob_sub.empty else probable_df["Ticker"].tolist()
+                sel_cand_ticker = lk1.selectbox(
+                    "Select Probable Candidate Configured in Broker",
+                    options=cand_tickers,
+                    Format_func=lambda t: (
+                        f"{t} | Entry ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Recommended_Entry_Price'].iloc[0]):,.2f} | "
+                        f"SL ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_SL_Price'].iloc[0]):,.2f} -> "
+                        f"TGT ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_Target_Price'].iloc[0]):,.2f}"
+                    ) if t in probable_df["Ticker"].values else t,
+                    key="top_prob_lock_ticker",
+                ) if False else lk1.selectbox(
+                    "Select Probable Candidate Configured in Broker",
+                    options=cand_tickers,
+                    format_func=lambda t: (
+                        f"{t} | Entry ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Recommended_Entry_Price'].iloc[0]):,.2f} | "
+                        f"SL ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_SL_Price'].iloc[0]):,.2f} -> "
+                        f"TGT ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_Target_Price'].iloc[0]):,.2f}"
+                    ) if t in probable_df["Ticker"].values else t,
+                    key="top_prob_lock_ticker",
+                )
+                default_ep = (
+                    float(probable_df.loc[probable_df["Ticker"] == sel_cand_ticker, "Recommended_Entry_Price"].iloc[0])
+                    if sel_cand_ticker in probable_df["Ticker"].values
+                    else 100.0
+                )
+                cfg_ep = lk2.number_input(
+                    "Configured Entry Price (₹)",
+                    min_value=1.0,
+                    value=float(default_ep),
+                    step=0.5,
+                    key="top_prob_lock_price",
+                )
+                cfg_time = lk3.text_input(
+                    "Order / Entry Time (IST)",
+                    value="10:00:00",
+                    key="top_prob_lock_time",
+                )
+                lk4.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if lk4.button(
+                    f"✅ Lock {sel_cand_ticker} into Top-3 Active 5m Tracker",
+                    type="primary",
+                    use_container_width=True,
+                    key="top_prob_lock_btn",
+                ):
+                    row_match = watchlist_df[watchlist_df["Ticker"] == sel_cand_ticker]
+                    r_dict = row_match.iloc[0].to_dict() if not row_match.empty else {"Ticker": sel_cand_ticker, "Live_Price": cfg_ep}
+                    ok, msg, _ = stage_ticker_into_top3_cnc(
+                        ticker=sel_cand_ticker,
+                        row_data=r_dict,
+                        purchase_time_str=cfg_time.strip(),
+                        entry_price_override=float(cfg_ep),
+                        budget_per_ticker=float(cnc_capital),
+                        regime_badge=regime_rep.get("regime_badge", "TRENDING_OR_ROTATION"),
+                        eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                        sync_purchase_candle_price=False,
+                        trades_csv_path=SNIPER_TELEMETRY_CSV,
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.warning(msg)
+
+    # =========================================================================
+    # SECTION 0 (BELOW PROBABLE CANDIDATES):
     # DAILY FRESH PAPER TRADE EXECUTION LOG (ENTRY TIME & EXIT TIME IN FIRST
     # COLUMNS) vs. HISTORICAL BENCHMARK DATA (< 2026-10-27)
     # =========================================================================

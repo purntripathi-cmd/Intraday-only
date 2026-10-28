@@ -63,6 +63,7 @@ FRESH_PAPER_TRADES_CSV = os.path.join(DATA_DIR, "fresh_paper_trades_since_incept
 HISTORICAL_BENCHMARK_CSV = os.path.join(DATA_DIR, "historical_benchmark_trades.csv")
 DAILY_PAPER_SUMMARY_CSV = os.path.join(DATA_DIR, "daily_paper_trade_summary.csv")
 STRATEGY_SCORECARD_CSV = os.path.join(DATA_DIR, "strategy_wise_paper_scorecard.csv")
+PROBABLE_CANDIDATES_CSV = os.path.join(DATA_DIR, "probable_intraday_candidates.csv")
 
 # App Inception Cutoff: App was created on 2026-10-27.
 # Strictly separate Fresh Live Paper Trades (>= 2026-10-27) from Historical Data (< 2026-10-27).
@@ -2602,6 +2603,257 @@ def build_all_strategies_paper_ledger_and_scorecard(
     scorecard_df = pd.DataFrame(scorecard_rows)
     scorecard_df.to_csv(STRATEGY_SCORECARD_CSV, index=False)
     return scorecard_df, fresh_df
+
+
+def build_probable_intraday_candidates_sheet(
+    watchlist_df: pd.DataFrame | None = None,
+    sniper_df: pd.DataFrame | None = None,
+    op_signals_df: pd.DataFrame | None = None,
+    top3_ledger_df: pd.DataFrame | None = None,
+    budget_per_ticker: float = MAX_BUDGET_PER_TICKER_INR,
+) -> pd.DataFrame:
+    """
+    Build the top-of-page 'Probable Intraday Entry-Exit Candidates' table so the user
+    can pre-configure entry orders, stop-loss (SL), trailing SL stages, and exit targets
+    in advance in their broker (Zerodha Kite / Groww / Upstox / AngelOne GTT or SL-M).
+
+    First 3 columns are structured to be frozen:
+    1. Priority_And_Slot
+    2. Ticker
+    3. Advance_Entry_To_Exit_Config
+    Followed immediately by Recommended_Entry_Price, Recommended_Stop_Loss,
+    Safe_T1_And_Trail_SL_Levels, Recommended_Exit_Target, Trigger_Proximity_Status, etc.
+    """
+    budget = min(float(budget_per_ticker), float(MAX_BUDGET_PER_TICKER_INR))
+    if watchlist_df is None or watchlist_df.empty:
+        wl_path = os.path.join(DATA_DIR, "live_watchlist_radar.csv")
+        if os.path.exists(wl_path):
+            try:
+                watchlist_df = pd.read_csv(wl_path)
+            except Exception:
+                watchlist_df = pd.DataFrame()
+        else:
+            watchlist_df = pd.DataFrame()
+
+    if top3_ledger_df is None or top3_ledger_df.empty:
+        if os.path.exists(SNIPER_TELEMETRY_CSV):
+            try:
+                top3_ledger_df = pd.read_csv(SNIPER_TELEMETRY_CSV)
+            except Exception:
+                top3_ledger_df = pd.DataFrame()
+        else:
+            top3_ledger_df = pd.DataFrame()
+
+    if op_signals_df is None or op_signals_df.empty:
+        if os.path.exists(OPERATOR_SIGNALS_CSV):
+            try:
+                op_signals_df = pd.read_csv(OPERATOR_SIGNALS_CSV)
+            except Exception:
+                op_signals_df = pd.DataFrame()
+        else:
+            op_signals_df = pd.DataFrame()
+
+    active_top3_map = {}
+    if not top3_ledger_df.empty and "Ticker" in top3_ledger_df.columns:
+        for idx, r in top3_ledger_df.reset_index(drop=True).iterrows():
+            active_top3_map[str(r["Ticker"])] = idx + 1
+
+    rows = []
+    if not watchlist_df.empty:
+        # Take high-probability candidates (Sniper_Readiness_Score >= 72 or Top-3 Ranked)
+        wl_sub = watchlist_df[
+            (watchlist_df.get("Order_Priority_Rank", 9) <= 3)
+            | (watchlist_df.get("Sniper_Readiness_Score", 0.0) >= 72.0)
+        ].copy()
+        if wl_sub.empty:
+            wl_sub = watchlist_df.head(25).copy()
+
+        for _, r in wl_sub.iterrows():
+            ticker = str(r.get("Ticker", ""))
+            ltp = float(r.get("Live_Price", 0.0))
+            orb_trig = float(r.get("ORB_10AM_Trigger", ltp))
+            rec_entry = round(float(r.get("CNC_Buy_Limit_Price", max(ltp, orb_trig))), 2)
+            if rec_entry <= 0:
+                rec_entry = round(ltp, 2)
+
+            sl_trig = round(float(r.get("Initial_Protected_SL", r.get("GTT_SL_Trigger", rec_entry * 0.985))), 2)
+            sl_limit = round(float(r.get("GTT_SL_Limit", sl_trig * 0.997)), 2)
+            be_sl = round(float(r.get("Stage1_Breakeven_SL", rec_entry * 1.004)), 2)
+            lock_sl = round(float(r.get("Stage2_ProfitLock_SL", rec_entry * 1.012)), 2)
+            chand_sl = round(float(r.get("Stage3_Chandelier_SL", rec_entry * 1.022)), 2)
+            tgt_trig = round(float(r.get("Intraday_Target", r.get("GTT_Target_Trigger", rec_entry * 1.04))), 2)
+            tgt_limit = round(float(r.get("GTT_Target_Limit", tgt_trig * 0.999)), 2)
+            swing_tgt = round(float(r.get("GTT_Swing_Target", tgt_trig * 1.02)), 2)
+
+            qty = max(1, int(budget // rec_entry)) if rec_entry <= budget else 1
+            cap_inr = round(qty * rec_entry, 2)
+            risk_per_sh = max(rec_entry - sl_trig, rec_entry * 0.005)
+            rew_per_sh = max(tgt_trig - rec_entry, rec_entry * 0.01)
+            risk_pct = round(risk_per_sh / max(rec_entry, 1e-9) * 100.0, 2)
+            rew_pct = round(rew_per_sh / max(rec_entry, 1e-9) * 100.0, 2)
+            risk_inr = round(qty * risk_per_sh, 2)
+            rew_inr = round(qty * rew_per_sh, 2)
+            rr_val = round(rew_per_sh / max(risk_per_sh, 1e-9), 2)
+
+            # Calculate distance from Live_LTP to ORB_Trigger / Recommended_Entry_Price
+            if ltp >= orb_trig and orb_trig > 0:
+                gap_pct = 0.0
+                above_orb_pct = round((ltp - orb_trig) / orb_trig * 100.0, 2)
+                is_above_orb = True
+                ltp_gap_str = f"₹{ltp:,.2f} (+{above_orb_pct:.2f}% Above ORB ₹{orb_trig:,.2f})"
+            else:
+                is_above_orb = False
+                gap_pct = round(max(rec_entry - ltp, 0.0) / max(ltp, 1e-9) * 100.0, 2)
+                ltp_gap_str = f"₹{ltp:,.2f} ({gap_pct:.2f}% Below Entry ₹{rec_entry:,.2f})"
+
+            score = float(r.get("Sniper_Readiness_Score", 80.0))
+            logic_id = str(r.get("Best_Logic_ID", "L6_5GATE_10AM_SNIPER"))
+            sector = str(r.get("Sector_Group", "NSE"))
+            swing_gates = str(r.get("Swing_Conversion_Gates", "3/5"))
+            decision_310 = str(r.get("CNC_310PM_Decision", "🟠 EXIT CNC BY 3:15 PM IST"))
+
+            slot_num = active_top3_map.get(ticker, 0)
+            if slot_num > 0:
+                sort_tier = 0
+                prox_status = f"🏆 TOP-{slot_num}/3 ACTIVE CNC (Pre-Set GTT OCO SL ₹{sl_trig:,.2f} | TGT ₹{tgt_trig:,.2f})"
+                slot_badge = f"🏆 #{slot_num} Top-3 CNC (Active)"
+            elif is_above_orb and score >= 80.0:
+                sort_tier = 1
+                prox_status = f"🟢 ABOVE ORB TRIGGER — READY NOW (Limit Buy @ ₹{rec_entry:,.2f})"
+                slot_badge = "🟢 Ready (Above ORB)"
+            elif gap_pct <= 0.80 and score >= 80.0:
+                sort_tier = 2
+                prox_status = f"⚡ IMMINENT BREAKOUT ({gap_pct:.2f}% to Trigger — Pre-Set GTT/SL-M Buy @ ₹{rec_entry:,.2f})"
+                slot_badge = f"⚡ Imminent ({gap_pct:.2f}% Away)"
+            elif gap_pct <= 2.00 and score >= 80.0:
+                sort_tier = 3
+                prox_status = f"🟡 NEAR TRIGGER ({gap_pct:.2f}% to Trigger — Pre-Set GTT Buy @ ₹{rec_entry:,.2f})"
+                slot_badge = f"🟡 Near ({gap_pct:.2f}% Away)"
+            else:
+                sort_tier = 4
+                prox_status = f"⚪ STANDBY WATCHLIST ({gap_pct:.2f}% to Trigger ₹{rec_entry:,.2f})"
+                slot_badge = f"⚪ Standby ({gap_pct:.2f}% Away)"
+
+            rows.append({
+                "_sort_tier": sort_tier,
+                "_sort_slot": slot_num if slot_num > 0 else 99,
+                "_sort_score": -score,
+                "_sort_gap": gap_pct,
+                "Candidate_Group": "CNC_OR_INTRADAY_SNIPER",
+                "Priority_And_Slot": slot_badge,
+                "Ticker": ticker,
+                "Advance_Entry_To_Exit_Config": f"BUY @ ₹{rec_entry:,.2f} | SL ₹{sl_trig:,.2f} -> TGT ₹{tgt_trig:,.2f} (Qty: {qty})",
+                "Order_Side": "BUY (CNC / Intraday)",
+                "Recommended_Entry_Price": rec_entry,
+                "Recommended_Stop_Loss": f"₹{sl_trig:,.2f} (-{risk_pct:.2f}% | -₹{risk_inr:,.0f})",
+                "Safe_T1_And_Trail_SL_Levels": f"T1/BE @ ₹{be_sl:,.2f} | Lock @ ₹{lock_sl:,.2f} | Trail @ ₹{chand_sl:,.2f}",
+                "Recommended_Exit_Target": f"₹{tgt_trig:,.2f} (+{rew_pct:.2f}% | +₹{rew_inr:,.0f})",
+                "Trigger_Proximity_Status": prox_status,
+                "Live_LTP_And_Gap": ltp_gap_str,
+                "Qty_For_20K_And_Capital": f"{qty} Qty (₹{cap_inr:,.0f})",
+                "Est_Profit_Vs_Risk_INR": f"+₹{rew_inr:,.0f} vs -₹{risk_inr:,.0f} (1:{rr_val:.2f})",
+                "Time_Exit_And_315PM_Rule": f"⏰ 3:15 PM Auto-Exit | {decision_310} ({swing_gates} Gates)",
+                "Strategy_And_Conviction": f"{logic_id} (Score: {score:.0f}/100 | {sector})",
+                "Pre_Configure_Broker_Order_Guide": (
+                    f"1) BUY CNC Limit/GTT @ ₹{rec_entry:,.2f} (Qty {qty}) -> "
+                    f"2) GTT OCO Sell: SL Trigger ₹{sl_trig:,.2f} (Limit ₹{sl_limit:,.2f}) | "
+                    f"Target Trigger ₹{tgt_trig:,.2f} (Limit ₹{tgt_limit:,.2f} / Swing ₹{swing_tgt:,.2f})"
+                ),
+                "Raw_SL_Price": sl_trig,
+                "Raw_Target_Price": tgt_trig,
+                "Raw_Stage1_BE": be_sl,
+                "Raw_Qty": qty,
+                "Raw_Gap_Pct": gap_pct,
+                "Raw_Score": score,
+                "Sector_Group": sector,
+            })
+
+    df_out = pd.DataFrame(rows)
+    if not df_out.empty:
+        df_out = df_out.sort_values(
+            by=["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"]
+        ).reset_index(drop=True)
+        # Number the priority ranks cleanly #1, #2, #3...
+        df_out["Priority_And_Slot"] = [
+            f"#{i+1} {r['Priority_And_Slot']}" if not str(r["Priority_And_Slot"]).startswith("🏆 #") else str(r["Priority_And_Slot"])
+            for i, r in df_out.iterrows()
+        ]
+
+    # Also append latest session's 1-Minute Operator Volume-Shock Candidates (BUY & SELL)
+    op_rows = []
+    if not op_signals_df.empty and "Session_Date" in op_signals_df.columns:
+        op_sub = op_signals_df[
+            (op_signals_df["Session_Date"].astype(str) >= APP_CREATED_DATE)
+            & (op_signals_df["Signal_Side"].isin(["BUY", "SELL"]))
+        ].copy()
+        if not op_sub.empty:
+            latest_op_date = str(op_sub["Session_Date"].max())
+            op_sub = op_sub[op_sub["Session_Date"].astype(str) == latest_op_date].head(8)
+            for idx_op, r in op_sub.reset_index(drop=True).iterrows():
+                ticker = str(r.get("Ticker", ""))
+                side = str(r.get("Signal_Side", "BUY"))
+                entry_p = round(float(r.get("Confirm_Entry_Price", r.get("Shock_Close", 0.0))), 2)
+                sl_p = round(float(r.get("Initial_SL", entry_p)), 2)
+                be_p = round(float(r.get("Stage1_Breakeven_SL", entry_p)), 2)
+                lock_p = round(float(r.get("Stage2_Lock_SL", entry_p)), 2)
+                tgt_p = round(float(r.get("Target_Price", entry_p)), 2)
+                qty = max(1, int(budget // entry_p)) if entry_p <= budget else 1
+                cap_inr = round(qty * entry_p, 2)
+                risk_sh = abs(entry_p - sl_p)
+                rew_sh = abs(tgt_p - entry_p)
+                risk_pct = round(risk_sh / max(entry_p, 1e-9) * 100.0, 2)
+                rew_pct = round(rew_sh / max(entry_p, 1e-9) * 100.0, 2)
+                risk_inr = round(qty * risk_sh, 2)
+                rew_inr = round(qty * rew_sh, 2)
+                rr_val = round(rew_sh / max(risk_sh, 1e-9), 2)
+                vol_mult = float(r.get("Vol_Spike_Mult_20m", 5.0))
+                strat_id = str(r.get("Strategy_ID", "OP_S2_Operator_VWAP_Markup_BUY"))
+                shock_t = str(r.get("Confirm_Time_T2", r.get("Shock_Time_1m", "")))
+                sector = UNIVERSE_META.get(ticker, ("NSE", "NSE"))[1] if ticker in UNIVERSE_META else "NSE"
+                side_icon = "🟢 AUTO-BUY" if side == "BUY" else "🔴 AUTO-SELL"
+
+                op_rows.append({
+                    "_sort_tier": 5,
+                    "_sort_slot": 99,
+                    "_sort_score": -vol_mult,
+                    "_sort_gap": 0.0,
+                    "Candidate_Group": "1M_OPERATOR_FOOTPRINT",
+                    "Priority_And_Slot": f"🔥 Op #{idx_op+1} ({side_icon} @ {shock_t[:5]})",
+                    "Ticker": ticker,
+                    "Advance_Entry_To_Exit_Config": f"{side} @ ₹{entry_p:,.2f} | SL ₹{sl_p:,.2f} -> TGT ₹{tgt_p:,.2f} (Qty: {qty})",
+                    "Order_Side": f"{side} (1m Operator)",
+                    "Recommended_Entry_Price": entry_p,
+                    "Recommended_Stop_Loss": f"₹{sl_p:,.2f} (-{risk_pct:.2f}% | -₹{risk_inr:,.0f})",
+                    "Safe_T1_And_Trail_SL_Levels": f"BE @ ₹{be_p:,.2f} | Lock @ ₹{lock_p:,.2f}",
+                    "Recommended_Exit_Target": f"₹{tgt_p:,.2f} (+{rew_pct:.2f}% | +₹{rew_inr:,.0f})",
+                    "Trigger_Proximity_Status": f"🔥 1m OPERATOR {side} CONFIRMED ({vol_mult:.1f}x Vol Shock @ {shock_t})",
+                    "Live_LTP_And_Gap": f"₹{float(r.get('Live_Or_Exit_Price', entry_p)):,.2f} (Entry @ ₹{entry_p:,.2f})",
+                    "Qty_For_20K_And_Capital": f"{qty} Qty (₹{cap_inr:,.0f})",
+                    "Est_Profit_Vs_Risk_INR": f"+₹{rew_inr:,.0f} vs -₹{risk_inr:,.0f} (1:{rr_val:.2f})",
+                    "Time_Exit_And_315PM_Rule": "⏰ 1m Dynamic Trail + Hard Exit 3:15 PM IST",
+                    "Strategy_And_Conviction": f"{strat_id} ({vol_mult:.1f}x Vol | {sector})",
+                    "Pre_Configure_Broker_Order_Guide": (
+                        f"1) {side} Intraday @ ₹{entry_p:,.2f} (Qty {qty}) -> "
+                        f"2) Stop-Loss @ ₹{sl_p:,.2f} | Trail to BE @ ₹{be_p:,.2f} | Target @ ₹{tgt_p:,.2f}"
+                    ),
+                    "Raw_SL_Price": sl_p,
+                    "Raw_Target_Price": tgt_p,
+                    "Raw_Stage1_BE": be_p,
+                    "Raw_Qty": qty,
+                    "Raw_Gap_Pct": 0.0,
+                    "Raw_Score": 90.0,
+                    "Sector_Group": sector,
+                })
+
+    if op_rows:
+        df_out = pd.concat([df_out, pd.DataFrame(op_rows)], ignore_index=True)
+
+    if not df_out.empty:
+        drop_internal = [c for c in ["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"] if c in df_out.columns]
+        df_out = df_out.drop(columns=drop_internal)
+        df_out.to_csv(PROBABLE_CANDIDATES_CSV, index=False)
+
+    return df_out
 
 
 
