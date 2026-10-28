@@ -349,7 +349,7 @@ def render_live_5m_auto_refresh_desk():
     # Also evaluate/refresh the separate Operator Auto-Trade (BUY & SELL) ledger every 5m cycle
     cached_op_signals = load_csv("live_operator_1m_signals.csv")
     op_trades_df, op_perf_summary = auto_execute_and_evaluate_operator_trades(
-        signals_df=cached_op_signals if not cached_op_signals.empty else None
+        cached_op_signals if not cached_op_signals.empty else None
     )
 
     now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
@@ -372,7 +372,7 @@ def render_live_5m_auto_refresh_desk():
                     eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
                 )
                 new_op_sig = scan_operator_1m_footprints()
-                auto_execute_and_evaluate_operator_trades(signals_df=new_op_sig)
+                auto_execute_and_evaluate_operator_trades(new_op_sig)
             st.rerun()
     with ctrl2:
         if st.button("🏆 Reset / Auto-Load Today's Top 3 CNC (<=₹20K)", use_container_width=True):
@@ -754,7 +754,7 @@ def render_live_5m_auto_refresh_desk():
             ):
                 with st.spinner("Running 2-Stage NIFTY 250 1-Minute Operator Volume-Shock Scan & T+2m Auto-Trade Replay..."):
                     fresh_sig = scan_operator_1m_footprints()
-                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(signals_df=fresh_sig)
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(fresh_sig)
                     st.session_state["last_op_scan_msg"] = (
                         f"✅ Scanned NIFTY 250 1m Operator Footprints | **{len(fresh_trd)} Confirmed Auto-Trades (`BUY` & `SELL`)** | "
                         f"Separate Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`** (`{float(fresh_perf.get('win_rate_pct', 0)):.1f}% WR`)"
@@ -767,7 +767,7 @@ def render_live_5m_auto_refresh_desk():
                 key="btn_re_eval_operator_1m",
             ):
                 with st.spinner("Re-evaluating 1-minute candles (SL, Stage-1/2/3 Trail, Target & 3:15 PM Auto-Close)..."):
-                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(signals_df=op_signals_all)
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(op_signals_all)
                     st.session_state["last_op_scan_msg"] = (
                         f"⏱️ Updated 1m Operator Auto-Trades at `{fresh_perf.get('last_5m_refresh_ist', '')}` | "
                         f"Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`**"

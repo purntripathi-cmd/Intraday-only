@@ -1886,6 +1886,7 @@ def scan_operator_1m_footprints(
 
 def auto_execute_and_evaluate_operator_trades(
     operator_signals_df: pd.DataFrame | None = None,
+    signals_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Separate Auto-Trade (BUY & SELL) Execution & 5-Minute Refresh Performance Engine:
@@ -1894,6 +1895,8 @@ def auto_execute_and_evaluate_operator_trades(
         completely separate from the Top-3 CNC Sniper ledger (`sniper_telemetry_trades.csv`).
       - Evaluates exits and updates separate P&L statistics for `BUY` vs `SELL` operator trades.
     """
+    if operator_signals_df is None and signals_df is not None:
+        operator_signals_df = signals_df
     if operator_signals_df is None or operator_signals_df.empty:
         if os.path.exists(OPERATOR_SIGNALS_CSV):
             operator_signals_df = pd.read_csv(OPERATOR_SIGNALS_CSV)
