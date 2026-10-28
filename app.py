@@ -10,20 +10,34 @@ Interactive Streamlit platform for Indian (NSE) & International Markets:
 """
 
 import os
+import sys
 import json
+import importlib
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+
+import nifty250_universe
+import backtest_engine_3y
+import intraday_expert_engine
+
+# Hot-reload guard for Streamlit Cloud: when a new commit is pulled on disk while the
+# Python worker already has an older `intraday_expert_engine` / `backtest_engine_3y` in sys.modules,
+# force a reload from disk so newly added symbols are immediately available without a container reboot.
+if not hasattr(intraday_expert_engine, "OPERATOR_SIGNALS_CSV") or not hasattr(intraday_expert_engine, "scan_operator_1m_footprints"):
+    importlib.reload(nifty250_universe)
+    importlib.reload(backtest_engine_3y)
+    importlib.reload(intraday_expert_engine)
+elif len(getattr(backtest_engine_3y, "UNIVERSE_META", {})) < 200:
+    importlib.reload(nifty250_universe)
+    importlib.reload(backtest_engine_3y)
+    importlib.reload(intraday_expert_engine)
 
 from nifty250_universe import UNIVERSE_META
 from intraday_expert_engine import (
     DATA_DIR,
     SNIPER_TRADES_CSV,
     SNIPER_TELEMETRY_CSV,
-    OPERATOR_SIGNALS_CSV,
-    OPERATOR_TRADES_CSV,
-    OPERATOR_PERF_JSON,
-    BEL_OCT16_CASE_STUDY_CSV,
     MAX_BUDGET_PER_TICKER_INR,
     MAX_DAILY_ENTRIES,
     MAX_DAILY_TOTAL_BUDGET_INR,
@@ -34,8 +48,37 @@ from intraday_expert_engine import (
     stage_top3_daily_cnc_entries,
     force_manual_exit_trade,
     predict_swing_conversion_success,
-    scan_operator_1m_footprints,
-    auto_execute_and_evaluate_operator_trades,
+)
+
+OPERATOR_SIGNALS_CSV = getattr(
+    intraday_expert_engine,
+    "OPERATOR_SIGNALS_CSV",
+    os.path.join(DATA_DIR, "live_operator_1m_signals.csv"),
+)
+OPERATOR_TRADES_CSV = getattr(
+    intraday_expert_engine,
+    "OPERATOR_TRADES_CSV",
+    os.path.join(DATA_DIR, "operator_auto_trades.csv"),
+)
+OPERATOR_PERF_JSON = getattr(
+    intraday_expert_engine,
+    "OPERATOR_PERF_JSON",
+    os.path.join(DATA_DIR, "operator_performance_summary.json"),
+)
+BEL_OCT16_CASE_STUDY_CSV = getattr(
+    intraday_expert_engine,
+    "BEL_OCT16_CASE_STUDY_CSV",
+    os.path.join(DATA_DIR, "bel_oct16_operator_validation.csv"),
+)
+scan_operator_1m_footprints = getattr(
+    intraday_expert_engine,
+    "scan_operator_1m_footprints",
+    lambda *a, **kw: pd.DataFrame(),
+)
+auto_execute_and_evaluate_operator_trades = getattr(
+    intraday_expert_engine,
+    "auto_execute_and_evaluate_operator_trades",
+    lambda *a, **kw: (pd.DataFrame(), {}),
 )
 
 st.set_page_config(
