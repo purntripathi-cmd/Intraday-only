@@ -24,7 +24,11 @@ import intraday_expert_engine
 # Hot-reload guard for Streamlit Cloud: when a new commit is pulled on disk while the
 # Python worker already has an older `intraday_expert_engine` / `backtest_engine_3y` in sys.modules,
 # force a reload from disk so newly added symbols are immediately available without a container reboot.
-if not hasattr(intraday_expert_engine, "OPERATOR_SIGNALS_CSV") or not hasattr(intraday_expert_engine, "scan_operator_1m_footprints"):
+if (
+    not hasattr(intraday_expert_engine, "OPERATOR_SIGNALS_CSV")
+    or not hasattr(intraday_expert_engine, "scan_operator_1m_footprints")
+    or not hasattr(intraday_expert_engine, "build_all_strategies_paper_ledger_and_scorecard")
+):
     importlib.reload(nifty250_universe)
     importlib.reload(backtest_engine_3y)
     importlib.reload(intraday_expert_engine)
@@ -70,6 +74,16 @@ BEL_OCT16_CASE_STUDY_CSV = getattr(
     "BEL_OCT16_CASE_STUDY_CSV",
     os.path.join(DATA_DIR, "bel_oct16_operator_validation.csv"),
 )
+ALL_STRATEGIES_PAPER_CSV = getattr(
+    intraday_expert_engine,
+    "ALL_STRATEGIES_PAPER_CSV",
+    os.path.join(DATA_DIR, "all_strategies_paper_trades.csv"),
+)
+STRATEGY_SCORECARD_CSV = getattr(
+    intraday_expert_engine,
+    "STRATEGY_SCORECARD_CSV",
+    os.path.join(DATA_DIR, "strategy_wise_paper_scorecard.csv"),
+)
 scan_operator_1m_footprints = getattr(
     intraday_expert_engine,
     "scan_operator_1m_footprints",
@@ -79,6 +93,11 @@ auto_execute_and_evaluate_operator_trades = getattr(
     intraday_expert_engine,
     "auto_execute_and_evaluate_operator_trades",
     lambda *a, **kw: (pd.DataFrame(), {}),
+)
+build_all_strategies_paper_ledger_and_scorecard = getattr(
+    intraday_expert_engine,
+    "build_all_strategies_paper_ledger_and_scorecard",
+    lambda *a, **kw: (pd.DataFrame(), pd.DataFrame()),
 )
 
 st.set_page_config(
@@ -346,10 +365,27 @@ def render_live_5m_auto_refresh_desk():
         eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
     )
 
+    # During live Indian market hours (09:15 AM – 03:30 PM IST on weekdays), automatically scan
+    # the NIFTY 250 funnel for new 1m Operator footprints every 5 minutes so paper trades auto-trigger
+    now_ist_dt = pd.Timestamp.now(tz="Asia/Kolkata")
+    is_live_market_hours = (
+        now_ist_dt.weekday() < 5
+        and ((now_ist_dt.hour == 9 and now_ist_dt.minute >= 15) or (10 <= now_ist_dt.hour <= 14) or (now_ist_dt.hour == 15 and now_ist_dt.minute <= 30))
+    )
+    if is_live_market_hours:
+        try:
+            cached_op_signals = scan_operator_1m_footprints()
+        except Exception:
+            cached_op_signals = load_csv("live_operator_1m_signals.csv")
+    else:
+        cached_op_signals = load_csv("live_operator_1m_signals.csv")
+
     # Also evaluate/refresh the separate Operator Auto-Trade (BUY & SELL) ledger every 5m cycle
-    cached_op_signals = load_csv("live_operator_1m_signals.csv")
     op_trades_df, op_perf_summary = auto_execute_and_evaluate_operator_trades(
         cached_op_signals if not cached_op_signals.empty else None
+    )
+    strat_scorecard_df, all_paper_trades_df = build_all_strategies_paper_ledger_and_scorecard(
+        op_trades_df=op_trades_df if not op_trades_df.empty else None
     )
 
     now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
@@ -790,6 +826,38 @@ def render_live_5m_auto_refresh_desk():
         if "last_op_scan_msg" in st.session_state:
             st.success(st.session_state["last_op_scan_msg"])
 
+        # Load Strategy-Wise Paper Trade Scorecard & Master Paper Trade Log across all 9 strategies
+        if strat_scorecard_df.empty:
+            strat_scorecard_df = load_csv("strategy_wise_paper_scorecard.csv")
+        if all_paper_trades_df.empty:
+            all_paper_trades_df = load_csv("all_strategies_paper_trades.csv")
+
+        st.markdown(
+            "##### 📊 3A. Strategy-by-Strategy Paper Trade Performance Scorecard (`All 9 Possible Strategies: OP_S1–OP_S3 + L1–L6` | `First 3 Columns Frozen`)"
+        )
+        st.caption(
+            "Tracks paper trade count, Win/Loss ratio, Profit Factor, and Net ₹ P&L (`<= ₹20,000` budget per trade) separately for **every single strategy (`3` Operator 1m Auto-Trade Strategies + `6` CNC Sniper Strategies)**."
+        )
+        if not strat_scorecard_df.empty:
+            render_frozen_3col_dataframe(strat_scorecard_df, height=360)
+
+        st.markdown(
+            "##### 📒 3B. Master Paper Trade Log Across All 9 Strategies (`Entry / Exit / P&L Audit` | `First 3 Columns Frozen`)"
+        )
+        if not all_paper_trades_df.empty:
+            strat_options = ["All 9 Strategies (Complete Paper Trade Log)"] + strat_scorecard_df["Strategy_ID"].tolist() if not strat_scorecard_df.empty else ["All 9 Strategies (Complete Paper Trade Log)"]
+            selected_strat_log = st.selectbox(
+                "🔎 Filter Paper Trade Log by Strategy (`OP_S1–OP_S3` Operator 1m or `L1–L6` CNC Snipers)",
+                options=strat_options,
+                index=0,
+                key="master_paper_strat_filter",
+            )
+            if selected_strat_log.startswith("All 9"):
+                shown_paper_df = all_paper_trades_df.copy()
+            else:
+                shown_paper_df = all_paper_trades_df[all_paper_trades_df["Strategy_ID"] == selected_strat_log].copy()
+            render_frozen_3col_dataframe(shown_paper_df, height=380)
+
         # Apply filter to op_trades_all
         if not op_trades_all.empty:
             if op_view_filter.startswith("🟢 AUTO-BUY"):
@@ -806,13 +874,13 @@ def render_live_5m_auto_refresh_desk():
             filtered_op_df = op_signals_all.copy()
 
         st.markdown(
-            "##### 📋 3A. Operator Auto-Trade (`BUY` & `SELL`) Order & Separate Performance Ticket (`Initial Rows = P&L & Order Data` | `First 3 Columns Frozen`)"
+            "##### 📋 3C. Operator Auto-Trade (`BUY` & `SELL`) Order & Separate Performance Ticket (`Initial Rows = P&L & Order Data` | `First 3 Columns Frozen`)"
         )
         op_ticket_df = build_operator_initial_rows_ticket_table(filtered_op_df)
         render_frozen_3col_dataframe(op_ticket_df, height=400)
 
         st.markdown(
-            "##### 📒 3B. Separate Operator Auto-Trade (`BUY` & `SELL`) Performance Ledger (`Initial Rows = Order & P&L` | `First 3 Columns Frozen`)"
+            "##### 📒 3D. Separate 1-Minute Operator Auto-Trade (`BUY` & `SELL`) Forensics Ledger (`Initial Rows = Order & P&L` | `First 3 Columns Frozen`)"
         )
         if not filtered_op_df.empty:
             op_ledger_cols = [

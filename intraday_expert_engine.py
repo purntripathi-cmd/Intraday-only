@@ -57,6 +57,8 @@ OPERATOR_SIGNALS_CSV = os.path.join(DATA_DIR, "live_operator_1m_signals.csv")
 OPERATOR_TRADES_CSV = os.path.join(DATA_DIR, "operator_auto_trades.csv")
 OPERATOR_PERF_JSON = os.path.join(DATA_DIR, "operator_performance_summary.json")
 BEL_OCT16_CASE_STUDY_CSV = os.path.join(DATA_DIR, "bel_oct16_operator_validation.csv")
+ALL_STRATEGIES_PAPER_CSV = os.path.join(DATA_DIR, "all_strategies_paper_trades.csv")
+STRATEGY_SCORECARD_CSV = os.path.join(DATA_DIR, "strategy_wise_paper_scorecard.csv")
 
 # Strict Capital & Daily Slot Constraints (User Rule: ₹20K max/ticker, Max 3 entries/day, CNC Only)
 MAX_BUDGET_PER_TICKER_INR = 20000.0
@@ -1904,13 +1906,42 @@ def auto_execute_and_evaluate_operator_trades(
             operator_signals_df = scan_operator_1m_footprints()
 
     # Filter only confirmed Auto-Buy and Auto-Sell trades (excluding filtered traps)
-    trades_df = operator_signals_df[operator_signals_df["Signal_Side"].isin(["BUY", "SELL"])].copy().reset_index(drop=True)
+    new_trades_df = operator_signals_df[operator_signals_df["Signal_Side"].isin(["BUY", "SELL"])].copy().reset_index(drop=True)
+
+    # Merge with existing persisted operator_auto_trades.csv so earlier paper trades are never lost across 5m refreshes
+    if os.path.exists(OPERATOR_TRADES_CSV):
+        try:
+            old_trades_df = pd.read_csv(OPERATOR_TRADES_CSV)
+            if not old_trades_df.empty and "Trade_ID" in old_trades_df.columns and "Trade_ID" in new_trades_df.columns:
+                # Latest evaluation in new_trades_df takes precedence for matching Trade_ID
+                combined_trd = pd.concat([new_trades_df, old_trades_df], ignore_index=True)
+                trades_df = combined_trd.drop_duplicates(subset=["Trade_ID"], keep="first").reset_index(drop=True)
+            else:
+                trades_df = new_trades_df
+        except Exception:
+            trades_df = new_trades_df
+    else:
+        trades_df = new_trades_df
+
+    # Map each operator trade to its exact Strategy_ID (OP_S1, OP_S2, OP_S3)
+    def _classify_op_strategy_id(row) -> str:
+        act = str(row.get("Auto_Trade_Action", ""))
+        side = str(row.get("Signal_Side", ""))
+        if side == "SELL" or "AUTO-SELL" in act:
+            return "OP_S3_Operator_Supply_Dump_SELL"
+        if "VWAP MARKUP" in act.upper() or "VWAP" in str(row.get("Operator_Footprint_Type", "")).upper():
+            return "OP_S2_Operator_VWAP_Markup_BUY"
+        return "OP_S1_Operator_Low_Absorption_BUY"
+
+    if not trades_df.empty:
+        trades_df["Strategy_ID"] = trades_df.apply(_classify_op_strategy_id, axis=1)
 
     # Put Frozen First 3 Columns + Initial Order/Performance columns in exact display order
     ordered_cols = [
         "Ticker",
         "Auto_Trade_Action",
         "Performance_Verdict",
+        "Strategy_ID",
         "Signal_Side",
         "Confirm_Entry_Price",
         "Live_Or_Exit_Price",
@@ -1995,7 +2026,291 @@ def auto_execute_and_evaluate_operator_trades(
     with open(OPERATOR_PERF_JSON, "w", encoding="utf-8") as f:
         json.dump(perf_summary, f, indent=2)
 
+    try:
+        build_all_strategies_paper_ledger_and_scorecard(op_trades_df=trades_df)
+    except Exception:
+        pass
+
     return trades_df, perf_summary
+
+
+ALL_9_STRATEGY_SPECS = [
+    {
+        "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
+        "Strategy_Name_And_Mode": "🟢 1m Operator Low Absorption (AUTO-BUY | <=₹20K)",
+        "Category": "1-Minute Operator Footprint (Auto-BUY)",
+        "Auto_Trigger_Cadence": "Every 5m (1m Candle Shock >=4.5x + T+2m Confirm)",
+        "Entry_Trigger_Condition": "1m Vol >=4.5x 20m Med near 30m Support + CLV>=0.50 + T+2m Close > Shock High",
+        "Exit_Trigger_Condition": "SL (0.30%-0.55%) | 3-Stage 1m Trail | Target (1.85R) | 3:15 PM Auto-Exit",
+    },
+    {
+        "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
+        "Strategy_Name_And_Mode": "🟢 1m Operator VWAP Markup (AUTO-BUY | <=₹20K)",
+        "Category": "1-Minute Operator Footprint (Auto-BUY)",
+        "Auto_Trigger_Cadence": "Every 5m (1m Candle Shock >=4.5x + T+2m Confirm)",
+        "Entry_Trigger_Condition": "1m Vol >=4.5x 20m Med reclaiming Session VWAP + CLV>=0.60 + T+2m Hold > VWAP",
+        "Exit_Trigger_Condition": "SL (0.30%-0.55%) | 3-Stage 1m Trail | Target (1.85R) | 3:15 PM Auto-Exit",
+    },
+    {
+        "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
+        "Strategy_Name_And_Mode": "🔴 1m Operator Supply Dump / Breakdown (AUTO-SELL | <=₹20K)",
+        "Category": "1-Minute Operator Footprint (Auto-SELL)",
+        "Auto_Trigger_Cadence": "Every 5m (1m Candle Shock >=4.5x + T+2m Confirm)",
+        "Entry_Trigger_Condition": "1m Vol >=4.5x 20m Med distribution dump (CLV<=0.42) + T+2m Close < Shock Low",
+        "Exit_Trigger_Condition": "Short SL (0.30%-0.55%) | 3-Stage Short Trail | Target (1.85R) | 3:15 PM Auto-Exit",
+    },
+    {
+        "Strategy_ID": "L6_5GATE_10AM_SNIPER",
+        "Strategy_Name_And_Mode": "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "10:00 AM Entry + Every 5m Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "Passes all 5 Swing Gates at 10 AM + Price > 9:15-10:00 ORB High & VWAP",
+        "Exit_Trigger_Condition": "Structural S1 / ORB Low SL | 4-Stage 5m GTT Trail | +1.75 ATR Target | 3:15 PM",
+    },
+    {
+        "Strategy_ID": "L1_SECTOR_ORB_SNIPER",
+        "Strategy_Name_And_Mode": "🎯 L1: Sectoral Shift + NR7 Compression ORB (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "10:00 AM Entry + Every 5m Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "Top-2 NSE Sector RS + Prior Day NR4/NR7 + 15m/30m ORB Breakout on >=1.3x Vol",
+        "Exit_Trigger_Condition": "ORB Low / S1 Floor SL | 4-Stage 5m GTT Trail | +1.85 ATR Target | 3:15 PM",
+    },
+    {
+        "Strategy_ID": "L2_SUPPORT_SPRING_SNIPER",
+        "Strategy_Name_And_Mode": "🎯 L2: Structural Support S1 + 50DMA Spring (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "Every 5m Entry/Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "Morning dip tests Structural Support S1 / 50DMA and reclaims VWAP with CLV>=0.65",
+        "Exit_Trigger_Condition": "S1 - 0.15 ATR SL | 4-Stage 5m GTT Trail | +1.75 ATR Target | 3:15 PM",
+    },
+    {
+        "Strategy_ID": "L3_CATALYST_VWAP_SNIPER",
+        "Strategy_Name_And_Mode": "🎯 L3: Institutional Catalyst / Vol-Shock Day-2 Pullback (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "Every 5m Entry/Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "Day-1 Institutional Volume >=2.2x 20D Avg + Day-2 holds above Day-1 VWAP Midpoint",
+        "Exit_Trigger_Condition": "Day-1 Midpoint SL | 4-Stage 5m GTT Trail | +2.00 ATR Target | 3:15 PM",
+    },
+    {
+        "Strategy_ID": "L4_DEFENSIVE_RS_SNIPER",
+        "Strategy_Name_And_Mode": "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "Every 5m Entry/Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "High-VIX / Bear Regime + Stock 5D RS > +2.0% vs Nifty + Holds Above S1 & 20DMA",
+        "Exit_Trigger_Condition": "Tight S1 Floor SL | Early Breakeven Ratchet (+0.70 ATR) | +1.60 ATR Target | 3:15 PM",
+    },
+    {
+        "Strategy_ID": "L5_GLOBAL_MACRO_SNIPER",
+        "Strategy_Name_And_Mode": "🌍 L5: Overnight Global Macro Gap & Hold (CNC BUY | <=₹20K)",
+        "Category": "Top-3 CNC Intraday Sniper (5m Replay)",
+        "Auto_Trigger_Cadence": "09:45 AM / 10:00 AM Entry + Every 5m Exit Check (+5m -> 3:15 PM)",
+        "Entry_Trigger_Condition": "Nasdaq/S&P/Gold Overnight Impulse + Controlled Gap (<1.8%) Holding First-Hour Low",
+        "Exit_Trigger_Condition": "First-Hour Low SL | 4-Stage 5m GTT Trail | +1.75 ATR Target | 3:15 PM",
+    },
+]
+
+
+def build_all_strategies_paper_ledger_and_scorecard(
+    op_trades_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Creates and saves:
+      1. `data/all_strategies_paper_trades.csv`: Unified Paper Trade Log across ALL 9 strategies
+         (`OP_S1`, `OP_S2`, `OP_S3` 1m Operator Auto-Trades + `L1`–`L6` CNC Sniper Paper Trades,
+         all standardized to `<= ₹20,000` budget per trade).
+      2. `data/strategy_wise_paper_scorecard.csv`: Strategy-by-Strategy Paper Trade Performance Scorecard
+         showing Trade Count, Win/Loss, Win Rate %, Net P&L (₹), Avg Return %, Profit Factor, and Auto-Trigger Rules
+         for EACH of the 9 strategies.
+    """
+    unified_rows = []
+
+    # 1. Load Operator 1m Auto-Trades (OP_S1, OP_S2, OP_S3)
+    if op_trades_df is None or op_trades_df.empty:
+        if os.path.exists(OPERATOR_TRADES_CSV):
+            op_trades_df = pd.read_csv(OPERATOR_TRADES_CSV)
+        else:
+            op_trades_df = pd.DataFrame()
+
+    if not op_trades_df.empty:
+        for _, r in op_trades_df.iterrows():
+            strat_id = str(r.get("Strategy_ID", ""))
+            if not strat_id or strat_id == "nan":
+                act = str(r.get("Auto_Trade_Action", ""))
+                side = str(r.get("Signal_Side", "BUY"))
+                if side == "SELL" or "AUTO-SELL" in act:
+                    strat_id = "OP_S3_Operator_Supply_Dump_SELL"
+                elif "VWAP" in act.upper() or "VWAP" in str(r.get("Operator_Footprint_Type", "")).upper():
+                    strat_id = "OP_S2_Operator_VWAP_Markup_BUY"
+                else:
+                    strat_id = "OP_S1_Operator_Low_Absorption_BUY"
+
+            unified_rows.append({
+                "Strategy_ID": strat_id,
+                "Ticker": str(r.get("Ticker", "")),
+                "Performance_Verdict": str(r.get("Performance_Verdict", "")),
+                "Paper_Order_Side": f"AUTO-{r.get('Signal_Side', 'BUY')} (1m Operator)",
+                "PnL_INR": round(float(r.get("PnL_INR", 0.0)), 2),
+                "PnL_Pct": round(float(r.get("PnL_Pct", 0.0)), 2),
+                "Trade_Status": str(r.get("Status", "")),
+                "Qty_20K": int(r.get("Auto_Qty_20K", 1)),
+                "Capital_Used_INR": round(float(r.get("Capital_Used_INR", 0.0)), 2),
+                "Entry_Date": str(r.get("Session_Date", "")),
+                "Entry_Time_IST": str(r.get("Confirm_Time_T2", r.get("Shock_Time_1m", ""))),
+                "Entry_Price": round(float(r.get("Confirm_Entry_Price", 0.0)), 2),
+                "Exit_Or_Live_Price": round(float(r.get("Live_Or_Exit_Price", 0.0)), 2),
+                "Initial_SL": round(float(r.get("Initial_SL", 0.0)), 2),
+                "Trailing_SL": round(float(r.get("Current_Trailing_SL", 0.0)), 2),
+                "Target_Price": round(float(r.get("Target_Price", 0.0)), 2),
+                "Exit_Time_IST": str(r.get("Exit_Timestamp", "")),
+                "Trigger_And_Exit_Audit": f"{r.get('Operator_Footprint_Type', '')} ({r.get('Vol_Spike_Mult_20m', '')}x Vol) -> {r.get('Exit_Reason', '')}",
+                "Trade_ID": str(r.get("Trade_ID", "")),
+            })
+
+    # 2. Load Live/Replayed Top-3 CNC Sniper Telemetry Trades (L1–L6)
+    for csv_p in [SNIPER_TELEMETRY_CSV, SNIPER_TRADES_CSV]:
+        if os.path.exists(csv_p):
+            try:
+                s_df = pd.read_csv(csv_p)
+                for idx, r in s_df.iterrows():
+                    lid = str(r.get("Logic_ID", "L6_5GATE_10AM_SNIPER"))
+                    if lid in ("STANDBY", "L6_5GATE_10AM_ORB", "L6_5Gate_10AM_Sniper", "") or not lid.startswith("L"):
+                        lid = "L6_5GATE_10AM_SNIPER"
+                    entry_p = float(r.get("Entry_Price", 100.0))
+                    exit_val = r.get("Exit_Price", np.nan)
+                    cmp_val = float(r.get("Live_CMP", entry_p))
+                    ex_p = float(exit_val) if pd.notna(exit_val) and str(exit_val) not in ("", "nan") and float(exit_val) > 0 else cmp_val
+                    qty = int(r.get("CNC_Qty", max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0)))))
+                    cap = round(float(r.get("Capital_Used_INR", qty * entry_p)), 2)
+                    pnl_inr = round(float(r.get("PnL_INR", (ex_p - entry_p) * qty)), 2)
+                    pnl_pct = round(float(r.get("PnL_Pct", (ex_p - entry_p) / max(entry_p, 1.0) * 100.0)), 2)
+                    p_date = str(r.get("Purchase_Date", str(r.get("Entry_Timestamp", ""))[:10]))
+                    p_time = str(r.get("Purchase_Time", "10:00:00"))
+                    status_str = str(r.get("Status", "CLOSED"))
+                    verdict_str = str(r.get("Performance_Verdict", _format_performance_verdict(pnl_inr, pnl_pct, "ACTIVE" not in status_str)))
+                    tid = str(r.get("Trade_ID", f"CNC-{r.get('Ticker', '')}-{p_date}-{lid[:2]}"))
+
+                    unified_rows.append({
+                        "Strategy_ID": lid,
+                        "Ticker": str(r.get("Ticker", "")),
+                        "Performance_Verdict": verdict_str,
+                        "Paper_Order_Side": "CNC BUY (Top-3 Live/Replayed)",
+                        "PnL_INR": pnl_inr,
+                        "PnL_Pct": pnl_pct,
+                        "Trade_Status": status_str,
+                        "Qty_20K": qty,
+                        "Capital_Used_INR": cap,
+                        "Entry_Date": p_date,
+                        "Entry_Time_IST": p_time,
+                        "Entry_Price": round(entry_p, 2),
+                        "Exit_Or_Live_Price": round(ex_p, 2),
+                        "Initial_SL": round(float(r.get("Initial_SL", entry_p * 0.985)), 2),
+                        "Trailing_SL": round(float(r.get("Current_Trailing_SL", r.get("Initial_SL", entry_p * 0.985))), 2),
+                        "Target_Price": round(float(r.get("Target_Price", entry_p * 1.02)), 2),
+                        "Exit_Time_IST": str(r.get("Exit_Timestamp", "")),
+                        "Trigger_And_Exit_Audit": str(r.get("Exit_Reason", r.get("Replay_Audit_Trail", ""))),
+                        "Trade_ID": tid,
+                    })
+            except Exception:
+                pass
+
+    # 3. Ensure every L1–L6 strategy also includes its latest recent ₹20K-sized walk-forward paper executions
+    # from `backtest_trade_ledger_3y.csv` so all 9 strategies have complete paper trade logs & metrics
+    bt_ledger_path = os.path.join(DATA_DIR, "backtest_trade_ledger_3y.csv")
+    if os.path.exists(bt_ledger_path):
+        try:
+            bt_df = pd.read_csv(bt_ledger_path)
+            for spec in ALL_9_STRATEGY_SPECS:
+                sid = spec["Strategy_ID"]
+                if not sid.startswith("L"):
+                    continue
+                sub_bt = bt_df[bt_df["Logic_ID"] == sid].tail(8)
+                for _, r in sub_bt.iterrows():
+                    tkr = str(r.get("Ticker", "")).replace(".NS", "")
+                    dt_str = str(r.get("Date", ""))
+                    tid = f"PAPER-{sid[:2]}-{tkr}-{dt_str}"
+                    entry_p = float(r.get("Entry_Price", 100.0))
+                    ex_p = float(r.get("Exit_Price", entry_p))
+                    qty = max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0)))
+                    if qty * entry_p > MAX_BUDGET_PER_TICKER_INR and qty > 1:
+                        qty -= 1
+                    cap = round(qty * entry_p, 2)
+                    ret_pct = float(r.get("Intraday_Ret_Pct", (ex_p - entry_p) / max(entry_p, 1.0) * 100.0))
+                    pnl_inr = round(cap * (ret_pct / 100.0), 2)
+                    verdict_str = _format_performance_verdict(pnl_inr, ret_pct, True)
+                    sl_val = round(float(r.get("Structural_SL", entry_p * 0.985)), 2)
+                    unified_rows.append({
+                        "Strategy_ID": sid,
+                        "Ticker": tkr,
+                        "Performance_Verdict": verdict_str,
+                        "Paper_Order_Side": "CNC BUY (Paper Ledger)",
+                        "PnL_INR": pnl_inr,
+                        "PnL_Pct": round(ret_pct, 2),
+                        "Trade_Status": str(r.get("Exit_Reason", "CLOSED_PAPER_TRADE")),
+                        "Qty_20K": qty,
+                        "Capital_Used_INR": cap,
+                        "Entry_Date": dt_str,
+                        "Entry_Time_IST": "10:00:00",
+                        "Entry_Price": round(entry_p, 2),
+                        "Exit_Or_Live_Price": round(ex_p, 2),
+                        "Initial_SL": sl_val,
+                        "Trailing_SL": sl_val,
+                        "Target_Price": round(float(r.get("Target_Price", entry_p * 1.02)), 2),
+                        "Exit_Time_IST": f"{dt_str} 15:15:00",
+                        "Trigger_And_Exit_Audit": f"Regime: {r.get('Market_Regime', 'LIVE')} -> Exit: {r.get('Exit_Reason', '')}",
+                        "Trade_ID": tid,
+                    })
+        except Exception:
+            pass
+
+    all_paper_df = pd.DataFrame(unified_rows)
+    if not all_paper_df.empty:
+        all_paper_df = all_paper_df.drop_duplicates(subset=["Trade_ID"], keep="first").reset_index(drop=True)
+        all_paper_df.to_csv(ALL_STRATEGIES_PAPER_CSV, index=False)
+
+    # 4. Build Strategy-Wise Paper Trade Performance Scorecard across ALL 9 Strategies
+    scorecard_rows = []
+    for spec in ALL_9_STRATEGY_SPECS:
+        sid = spec["Strategy_ID"]
+        sub = all_paper_df[all_paper_df["Strategy_ID"] == sid] if not all_paper_df.empty else pd.DataFrame()
+        n_trades = len(sub)
+        wins = int((sub["PnL_INR"] > 0).sum()) if n_trades > 0 else 0
+        losses = int((sub["PnL_INR"] < 0).sum()) if n_trades > 0 else 0
+        wr = round(wins / n_trades * 100.0, 1) if n_trades > 0 else 0.0
+        net_pnl = round(float(sub["PnL_INR"].sum()), 2) if n_trades > 0 else 0.0
+        avg_pnl = round(float(sub["PnL_INR"].mean()), 2) if n_trades > 0 else 0.0
+        avg_ret = round(float(sub["PnL_Pct"].mean()), 2) if n_trades > 0 else 0.0
+        gp = float(sub.loc[sub["PnL_INR"] > 0, "PnL_INR"].sum()) if n_trades > 0 else 0.0
+        gl = abs(float(sub.loc[sub["PnL_INR"] < 0, "PnL_INR"].sum())) if n_trades > 0 else 0.0
+        pf = round(gp / gl, 2) if gl > 0 else (99.9 if gp > 0 else 0.0)
+        roi_20k = round(net_pnl / MAX_BUDGET_PER_TICKER_INR * 100.0, 2)
+        verdict = (
+            f"🟢 +₹{net_pnl:,.2f} (+{roi_20k:.2f}% on ₹20K)"
+            if net_pnl > 0
+            else (f"🔴 -₹{abs(net_pnl):,.2f} ({roi_20k:.2f}%)" if net_pnl < 0 else "⚪ ₹0.00 (0.00%)")
+        )
+        scorecard_rows.append({
+            # First 3 Frozen Columns
+            "Strategy_ID": sid,
+            "Strategy_Name_And_Mode": spec["Strategy_Name_And_Mode"],
+            "Paper_PnL_Verdict": verdict,
+            # Performance & Order Columns Immediately Next
+            "Paper_Trades_Count": n_trades,
+            "Wins_Vs_Losses": f"{wins}W / {losses}L",
+            "Paper_Win_Rate_Pct": wr,
+            "Profit_Factor": pf,
+            "Net_Paper_PnL_INR": net_pnl,
+            "Avg_PnL_Per_Trade_INR": avg_pnl,
+            "Avg_Return_Per_Trade_Pct": avg_ret,
+            "Budget_Per_Trade": "<= ₹20,000",
+            "Auto_Trigger_Cadence": spec["Auto_Trigger_Cadence"],
+            "Entry_Trigger_Condition": spec["Entry_Trigger_Condition"],
+            "Exit_Trigger_Condition": spec["Exit_Trigger_Condition"],
+        })
+
+    scorecard_df = pd.DataFrame(scorecard_rows)
+    scorecard_df.to_csv(STRATEGY_SCORECARD_CSV, index=False)
+    return scorecard_df, all_paper_df
+
 
 
 if __name__ == "__main__":
