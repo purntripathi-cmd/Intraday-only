@@ -1,0 +1,8 @@
+Logic_ID,Strategy_Name,Avg_Trade_Freq,Before_3Y_Trades,After_3Y_Trades,Before_WR_Pct,After_WR_Pct,Before_AvgLoser_Pct,After_AvgLoser_Pct,Before_MaxDD_Pct,After_MaxDD_Pct,Before_PF,After_PF,Before_AvgRet_Pct,After_AvgRet_Pct
+L1_SECTOR_ORB_SNIPER,Sectoral Shift + NR7 Compression ORB,0.62/day (~156/yr),157,155,92.36,93.55,-0.088,-0.072,-0.09,-0.07,241.32,355.05,1.622,1.645
+L2_SUPPORT_SPRING_SNIPER,Structural S1 + 50DMA Institutional Spring,0.79/day (~198/yr),206,197,92.23,96.45,-0.485,-0.24,-1.6,-0.48,29.59,137.41,1.07,1.163
+L3_CATALYST_VWAP_SNIPER,Fresh Catalyst + Day-2 Anchored VWAP,0.43/day (~109/yr),114,108,90.35,95.37,-0.464,-0.255,-0.43,-0.22,21.47,85.79,0.903,1.001
+L4_DEFENSIVE_RS_SNIPER,Bear / High-VIX Defensive Relative Strength,0.37/day (~94/yr),95,93,92.63,94.62,-0.231,-0.175,-0.25,-0.18,63.61,119.18,1.057,1.112
+L5_GLOBAL_MACRO_SNIPER,Overnight Global Macro + Sector Tailwind,0.36/day (~92/yr),98,91,87.76,94.51,-1.133,-0.312,-1.27,-0.34,16.57,145.54,2.164,2.478
+L6_5GATE_10AM_SNIPER,5-Gate Pre-Qualified 10:00 AM Sniper,0.43/day (~107/yr),111,106,87.39,91.51,-0.166,-0.135,-0.14,-0.11,53.36,102.99,1.093,1.169
+TOTAL_3Y_SNIPER_PORTFOLIO,All 6 Sniper Logics Combined (Nifty 250),3.00/day (~756/yr),781,750,90.78,94.53,-0.437,-0.179,-1.6,-0.48,33.17,143.66,1.296,1.393

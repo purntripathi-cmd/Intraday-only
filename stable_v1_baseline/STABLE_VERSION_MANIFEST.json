@@ -1,0 +1,66 @@
+{
+  "version_tag": "v1.0-First-Stable-Baseline (Engine v2.0 Post-Audit Institutional Stability)",
+  "saved_timestamp_ist": "2026-10-30T23:02:00+05:30",
+  "git_commit_hash": "7518cdba75fb83b92882f9d28246bc01a1612432",
+  "git_branch": "main",
+  "repository": "purntripathi-cmd/intraday-only",
+  "status": "LOCKED_FIRST_STABLE_VERSION_BEFORE_2_EXPERT_CRITIC_REVIEW",
+  "production_files_preserved": [
+    {
+      "file": "intraday_expert_engine.py",
+      "lines": 3872,
+      "role": "Core Intraday & CNC Hybrid Sniper Engine (L1-L6) + 1m Operator Footprint Engine (OP_S1-OP_S3) + Audit & FinOps Ledger"
+    },
+    {
+      "file": "backtest_engine_3y.py",
+      "lines": 1132,
+      "role": "3-Year Walk-Forward Historical Backtest & 60-Day 15m Verification Engine across Nifty 250 Universe"
+    },
+    {
+      "file": "app.py",
+      "lines": 1726,
+      "role": "Streamlit Institutional Trading Desk UI with 5-Min Auto-Refresh, Probable Candidates, Fresh Paper Ledger, FinOps XIRR & Regular Audit Log"
+    },
+    {
+      "file": "nifty250_universe.py",
+      "lines": 399,
+      "role": "Nifty 250 Universe (261 Validated Symbols across 16 Sectors)"
+    }
+  ],
+  "deployed_logics_inventory": {
+    "cnc_sniper_top3_logics": [
+      "L1_SECTOR_ORB_SNIPER (Sectoral Shift + NR7 Compression ORB Sniper)",
+      "L2_SUPPORT_SPRING_SNIPER (Structural S1 + 50DMA Institutional Spring Sniper)",
+      "L3_CATALYST_VWAP_SNIPER (Fresh Catalyst + Anchored VWAP Trend Sniper)",
+      "L4_5GATE_MORNING_SNIPER (5-Gate Institutional Morning Confluence Sniper)",
+      "L5_GLOBAL_MACRO_SNIPER (Overnight Global Macro + Sector Tailwind Sniper)",
+      "L6_5GATE_10AM_SNIPER (5-Gate Pre-Qualified 10:00 AM Intraday Sniper)"
+    ],
+    "operator_1m_auto_trade_logics": [
+      "OP_S1_Operator_Low_Absorption_BUY (Operator 1m Low-Absorption Reversal BUY)",
+      "OP_S2_Operator_VWAP_Breakout_BUY (Operator 1m High-Volume VWAP Breakout BUY)",
+      "OP_S3_Operator_High_Rejection_SELL (Operator 1m Supply-Dump High Rejection SELL)"
+    ]
+  },
+  "baseline_paper_trade_metrics_at_snapshot": {
+    "active_v2_ledger": {
+      "total_closed_trades": 25,
+      "gross_win_rate_pct": 88.0,
+      "net_win_rate_after_charges_pct": 88.0,
+      "total_capital_deployed_inr": 635742.55,
+      "gross_pnl_inr": 2546.84,
+      "total_charges_inr": 452.91,
+      "estimated_tax_inr": 418.79,
+      "net_post_tax_pnl_inr": 1675.14,
+      "portfolio_annualized_xirr_pct": 253.72
+    },
+    "pre_audit_v1_snapshot_ledger": {
+      "total_closed_trades": 61,
+      "gross_win_rate_pct": 70.49,
+      "net_win_rate_after_charges_pct": 49.18,
+      "gross_pnl_inr": 2033.24,
+      "net_post_tax_pnl_inr": 455.20
+    }
+  },
+  "note": "Zero modifications applied to active production files during the 2-Expert Critic Review."
+}
