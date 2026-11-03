@@ -499,14 +499,26 @@ def render_live_5m_auto_refresh_desk():
         eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
     )
 
-    # During live Indian market hours (09:15 AM – 03:30 PM IST on weekdays), automatically scan
-    # the NIFTY 250 funnel for new 1m Operator footprints every 5 minutes so paper trades auto-trigger
+    # During live Indian market hours (09:15 AM – 03:30 PM IST on weekdays) OR if the app is opened
+    # after 10:00 AM IST on a weekday and today's session hasn't been scanned yet (Post-Market Catch-Up),
+    # automatically scan the NIFTY 250 funnel for 1m Operator footprints so today's paper trades never get missed.
     now_ist_dt = pd.Timestamp.now(tz="Asia/Kolkata")
+    today_ist_str = now_ist_dt.strftime("%Y-%m-%d")
     is_live_market_hours = (
         now_ist_dt.weekday() < 5
         and ((now_ist_dt.hour == 9 and now_ist_dt.minute >= 15) or (10 <= now_ist_dt.hour <= 14) or (now_ist_dt.hour == 15 and now_ist_dt.minute <= 30))
     )
-    if is_live_market_hours:
+    existing_op_trades = load_csv("operator_auto_trades.csv")
+    needs_post_market_catchup = (
+        now_ist_dt.weekday() < 5
+        and now_ist_dt.hour >= 10
+        and (
+            existing_op_trades.empty
+            or "Entry_Date" not in existing_op_trades.columns
+            or today_ist_str not in existing_op_trades["Entry_Date"].astype(str).values
+        )
+    )
+    if is_live_market_hours or needs_post_market_catchup:
         try:
             cached_op_signals = scan_operator_1m_footprints()
         except Exception:
@@ -528,7 +540,8 @@ def render_live_5m_auto_refresh_desk():
             watchlist_df=load_csv("live_watchlist_radar.csv"),
             sniper_df=load_csv("live_sniper_signals.csv"),
             op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
-            force_rebuild_shadow=False,
+            force_rebuild_shadow=needs_post_market_catchup,
+            force_refresh=needs_post_market_catchup,
         )
     except Exception:
         v3_engine_out = {}
