@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-11-17 13:19:35 IST",
+  "timestamp": "2026-11-17 18:03:39 IST",
   "as_of_date": "2026-11-17",
   "regime_code": "SIDEWAYS_ROTATION",
   "regime_badge": "\ud83d\udfe1 Sideways / Sectoral Rotation",
-  "nifty_close": 25380.7,
-  "nifty_ret_1d_pct": 0.35,
-  "nifty_ret_5d_pct": 1.34,
-  "india_vix": 15.4,
+  "nifty_close": 25387.4,
+  "nifty_ret_1d_pct": 0.38,
+  "nifty_ret_5d_pct": 1.37,
+  "india_vix": 15.52,
   "global_cues": {
     "S&P 500 (^GSPC)": {
       "close": 7416.59,
@@ -25,25 +25,25 @@
       "sma200": 25142.65
     },
     "Gold Futures (GC=F)": {
-      "close": 3877.3,
-      "ret_1d": 0.63,
-      "ret_5d": -3.79,
-      "sma20": 4006.58,
-      "sma50": 4157.81,
-      "sma200": 4463.91
+      "close": 3866.7,
+      "ret_1d": 0.36,
+      "ret_5d": -4.06,
+      "sma20": 4006.05,
+      "sma50": 4157.59,
+      "sma200": 4463.86
     },
     "Brent Crude (BZ=F)": {
-      "close": 92.07,
-      "ret_1d": -0.4,
-      "ret_5d": 0.63,
-      "sma20": 103.44,
-      "sma50": 104.07,
-      "sma200": 94.23
+      "close": 92.89,
+      "ret_1d": 0.49,
+      "ret_5d": 1.53,
+      "sma20": 103.48,
+      "sma50": 104.08,
+      "sma200": 94.24
     },
     "USD/INR (INR=X)": {
-      "close": 93.57,
-      "ret_1d": -0.71,
-      "ret_5d": -0.4,
+      "close": 93.46,
+      "ret_1d": -0.83,
+      "ret_5d": -0.52,
       "sma20": 94.5,
       "sma50": 95.28,
       "sma200": 94.59
@@ -53,58 +53,58 @@
     {
       "symbol": "^NSEBANK",
       "sector": "Nifty Bank",
-      "ret_1d_pct": 0.9,
-      "ret_5d_pct": 4.0,
-      "rs_vs_nifty_5d_pct": 2.66,
+      "ret_1d_pct": 1.13,
+      "ret_5d_pct": 4.24,
+      "rs_vs_nifty_5d_pct": 2.87,
       "above_20dma": true
     },
     {
       "symbol": "^CNXFMCG",
       "sector": "Nifty FMCG",
-      "ret_1d_pct": -0.33,
-      "ret_5d_pct": 1.9,
-      "rs_vs_nifty_5d_pct": 0.56,
+      "ret_1d_pct": -0.2,
+      "ret_5d_pct": 2.04,
+      "rs_vs_nifty_5d_pct": 0.67,
       "above_20dma": true
     },
     {
       "symbol": "^CNXENERGY",
       "sector": "Nifty Energy",
-      "ret_1d_pct": -0.6,
-      "ret_5d_pct": -0.3,
-      "rs_vs_nifty_5d_pct": -1.64,
+      "ret_1d_pct": -0.27,
+      "ret_5d_pct": 0.03,
+      "rs_vs_nifty_5d_pct": -1.34,
       "above_20dma": true
     },
     {
       "symbol": "^CNXAUTO",
       "sector": "Nifty Auto",
-      "ret_1d_pct": 0.82,
-      "ret_5d_pct": -0.46,
-      "rs_vs_nifty_5d_pct": -1.8,
+      "ret_1d_pct": 0.72,
+      "ret_5d_pct": -0.56,
+      "rs_vs_nifty_5d_pct": -1.93,
       "above_20dma": true
     },
     {
       "symbol": "^CNXMETAL",
       "sector": "Nifty Metal",
-      "ret_1d_pct": 0.26,
-      "ret_5d_pct": -1.37,
-      "rs_vs_nifty_5d_pct": -2.71,
-      "above_20dma": true
-    },
-    {
-      "symbol": "^CNXPHARMA",
-      "sector": "Nifty Pharma",
-      "ret_1d_pct": 0.3,
-      "ret_5d_pct": -2.47,
-      "rs_vs_nifty_5d_pct": -3.81,
+      "ret_1d_pct": 0.58,
+      "ret_5d_pct": -1.06,
+      "rs_vs_nifty_5d_pct": -2.43,
       "above_20dma": true
     },
     {
       "symbol": "^CNXIT",
       "sector": "Nifty IT",
-      "ret_1d_pct": -1.01,
-      "ret_5d_pct": -2.62,
-      "rs_vs_nifty_5d_pct": -3.96,
+      "ret_1d_pct": -0.9,
+      "ret_5d_pct": -2.51,
+      "rs_vs_nifty_5d_pct": -3.88,
       "above_20dma": false
+    },
+    {
+      "symbol": "^CNXPHARMA",
+      "sector": "Nifty Pharma",
+      "ret_1d_pct": 0.21,
+      "ret_5d_pct": -2.56,
+      "rs_vs_nifty_5d_pct": -3.93,
+      "above_20dma": true
     }
   ],
   "authorized_sniper_logics": [

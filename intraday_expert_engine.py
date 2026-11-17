@@ -244,6 +244,18 @@ def _filter_df_as_of_date(df: pd.DataFrame, as_of_date: str | None) -> pd.DataFr
     return df[df.index.date <= cutoff_d].copy()
 
 
+def _canonical_regime_code(val: str | None) -> str:
+    """Normalizes emoji/display regime strings and legacy names to 4 canonical regime codes."""
+    raw = str(val or "").strip().upper()
+    if any(k in raw for k in ("BEAR", "CORRECTION", "RISK_OFF")):
+        return "BEAR_OR_CORRECTION"
+    if any(k in raw for k in ("HIGH_VOL", "HIGH-VOL", "MACRO", "SHOCK")):
+        return "HIGH_VOL_MACRO_SHOCK"
+    if any(k in raw for k in ("BULL", "EXPANSION")):
+        return "BULL_EXPANSION"
+    return "SIDEWAYS_ROTATION"
+
+
 def detect_global_and_indian_regime(raw_data: pd.DataFrame = None, as_of_date: str | None = None) -> dict:
     """
     Analyzes live or point-in-time (as_of_date) Nifty 50, India VIX, 7 NSE Sectoral Indices,
@@ -1702,6 +1714,19 @@ def auto_rollover_daily_top3_cnc(
     if os.path.exists(trades_csv_path):
         try:
             cur_df = pd.read_csv(trades_csv_path)
+            if not cur_df.empty and "Purchase_Date" in cur_df.columns:
+                latest_p_date = str(cur_df["Purchase_Date"].max())
+                has_stale_active = (
+                    latest_p_date < today_str
+                    and "Status" in cur_df.columns
+                    and cur_df["Status"].astype(str).str.upper().str.contains("ACTIVE|MONITORING|OPEN", na=False).any()
+                )
+                if has_stale_active:
+                    cur_df = evaluate_chronological_exits(
+                        trades_csv_path=trades_csv_path,
+                        force_full_replay=True,
+                        eod_315pm_auto_exit=True,
+                    )
             _sync_fresh_cnc_history(cur_df)
             if is_trading_day_eligible and not cur_df.empty and "Purchase_Date" in cur_df.columns:
                 latest_p_date = str(cur_df["Purchase_Date"].max())
@@ -4201,11 +4226,16 @@ def build_probable_intraday_candidates_sheet(
                 etime_str = shock_t[:8]
                 in_prime_win = ("09:40:00" <= etime_str <= "11:15:00")
                 in_late_block = (etime_str >= "14:00:00" and vol_mult >= 9.0 and shock_val >= 30_000_000.0)
-                regime_up = str(current_regime or "").strip().upper()
+                canon_reg = _canonical_regime_code(current_regime)
                 is_short_op = (side == "SELL" or strat_id == "OP_S3_Operator_Supply_Dump_SELL")
+                is_op_s2_choppy = (
+                    strat_id == "OP_S2_Operator_VWAP_Markup_BUY"
+                    and canon_reg in ("SIDEWAYS_ROTATION", "HIGH_VOL_MACRO_SHOCK")
+                )
                 qual_flag_str = str(r.get("Qualifies_StratB", True)).lower()
                 qual_b = (
-                    (not is_short_op or (enable_mis_short and "BEAR" in regime_up))
+                    (not is_short_op or (enable_mis_short and canon_reg == "BEAR_OR_CORRECTION"))
+                    and (not is_op_s2_choppy)
                     and (strat_id != "OP_S2_Operator_VWAP_Markup_BUY" or vol_mult <= 11.5)
                     and (in_prime_win or in_late_block)
                     and (5.0 <= vol_mult <= 13.5)
@@ -4352,6 +4382,71 @@ def build_probable_intraday_candidates_sheet(
                 f"#{i+1} (B) {str(r['Priority_And_Slot']).split(' ', 1)[-1]}"
                 for i, r in df_b.iterrows()
             ]
+            # Stamp provenance + live Tab 2 Execution Status (EXECUTED / WILL EXECUTE / STANDBY / SECTOR-CAPPED / SLOT-CAPPED)
+            now_ist_ts = pd.Timestamp.now(tz="Asia/Kolkata")
+            sess_date_str = now_ist_ts.strftime("%Y-%m-%d")
+            gen_at_str = now_ist_ts.strftime("%Y-%m-%d %H:%M:%S IST")
+            canon_reg_b = _canonical_regime_code(current_regime)
+            df_b["Session_Date"] = sess_date_str
+            df_b["Generated_At_IST"] = gen_at_str
+            df_b["Active_Regime_Code"] = canon_reg_b
+            exec_tickers_today = set()
+            used_sectors_today = set()
+            cnc_used_today = 0
+            op_used_today = 0
+            try:
+                shad_p = os.path.join(DATA_DIR, "v3_expert_shadow_validation_ledger.csv")
+                if os.path.exists(shad_p):
+                    shad_df = pd.read_csv(shad_p)
+                    if not shad_df.empty and "Entry_Date" in shad_df.columns:
+                        latest_sd = str(shad_df["Entry_Date"].max())
+                        if latest_sd == sess_date_str or now_ist_ts.weekday() >= 5:
+                            td_rows = shad_df[shad_df["Entry_Date"].astype(str) == latest_sd]
+                            exec_tickers_today = set(td_rows["Ticker"].astype(str).str.strip().tolist())
+                            if "Sector_Group" in td_rows.columns:
+                                used_sectors_today = {
+                                    str(s).strip() for s in td_rows["Sector_Group"].tolist()
+                                    if str(s).strip() and str(s).strip().lower() not in ("nan", "none", "null")
+                                }
+                            if "Strategy_ID" in td_rows.columns:
+                                is_op_mask = td_rows["Strategy_ID"].astype(str).str.startswith("OP_")
+                                op_used_today = int(is_op_mask.sum())
+                                cnc_used_today = int((~is_op_mask).sum())
+            except Exception:
+                pass
+            sim_cnc = cnc_used_today
+            sim_op = op_used_today
+            sim_sectors = set(used_sectors_today)
+            t2_statuses = []
+            for _, rb in df_b.iterrows():
+                tk = str(rb.get("Ticker", "")).strip()
+                sec = str(rb.get("Sector_Group", "")).strip() or tk
+                sid_b = str(rb.get("Strategy_ID", ""))
+                prox = str(rb.get("Trigger_Proximity_Status", "")).upper()
+                is_op_b = sid_b.startswith("OP_")
+                is_triggered = ("ABOVE ORB TRIGGER" in prox) or ("CONFIRMED" in prox)
+                if tk in exec_tickers_today:
+                    t2_statuses.append("✅ EXECUTED IN TAB 2")
+                elif (sid_b == "OP_S2_Operator_VWAP_Markup_BUY" and canon_reg_b in ("SIDEWAYS_ROTATION", "HIGH_VOL_MACRO_SHOCK")) or (
+                    sid_b in ("OP_S3_Operator_Supply_Dump_SELL", "L4_DEFENSIVE_RS_SNIPER") and canon_reg_b != "BEAR_OR_CORRECTION"
+                ):
+                    t2_statuses.append("🌧️ REGIME-BLOCKED")
+                elif not is_triggered:
+                    t2_statuses.append("⏳ STANDBY / TRIGGER PENDING")
+                elif sec in sim_sectors:
+                    t2_statuses.append("🚫 SECTOR-CAPPED (1/Sector)")
+                elif is_op_b and sim_op >= 2:
+                    t2_statuses.append("🧢 SLOT-CAPPED (2/2 Op)")
+                elif (not is_op_b) and sim_cnc >= 2:
+                    t2_statuses.append("🧢 SLOT-CAPPED (2/2 CNC)")
+                else:
+                    t2_statuses.append("🟢 WILL EXECUTE IN TAB 2")
+                    sim_sectors.add(sec)
+                    if is_op_b:
+                        sim_op += 1
+                    else:
+                        sim_cnc += 1
+            df_b["Tab2_Execution_Status"] = t2_statuses
             drop_b = [c for c in ["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"] if c in df_b.columns]
             df_b.drop(columns=drop_b).to_csv(PROBABLE_CANDIDATES_STRAT_B_CSV, index=False)
         else:
@@ -4955,7 +5050,7 @@ def run_v3_two_expert_monday_auto_engine(
             pt_a = round(net_a * 0.80 if net_a > 0 else net_a, 2)
             sec_raw = str(r.get("Sector_Group", "")).strip()
             sector = sec_raw if (sec_raw and sec_raw.lower() not in ("nan", "none", "null")) else (UNIVERSE_META.get(tkr, ("", tkr))[1] if tkr in UNIVERSE_META else tkr)
-            row_regime = str(r.get("Market_Regime", current_regime or "")).strip().upper()
+            row_regime = _canonical_regime_code(r.get("Market_Regime", current_regime or ""))
             side_str = str(r.get("Paper_Order_Side", "BUY")).upper()
             is_short = "SELL" in side_str or sid_a == "OP_S3_Operator_Supply_Dump_SELL"
             is_op = sid_a.startswith("OP_")
@@ -4986,8 +5081,10 @@ def run_v3_two_expert_monday_auto_engine(
                     filter_reason = f"Daily Operator Quality Cap (max 2 Op trades/day in B reached on {edate})"
                 elif is_short and not enable_mis_short:
                     filter_reason = "MIS Shorting Disabled in Portfolio Settings"
-                elif is_short and row_regime != "BEAR_RISK_OFF":
-                    filter_reason = f"Regime Short Gate (OP_S3 allowed in B only during BEAR_RISK_OFF, got {row_regime or 'SIDEWAYS'})"
+                elif is_short and row_regime != "BEAR_OR_CORRECTION":
+                    filter_reason = f"Regime Short Gate (OP_S3 allowed in B only during BEAR_OR_CORRECTION, got {row_regime})"
+                elif sid_a == "OP_S2_Operator_VWAP_Markup_BUY" and row_regime in ("SIDEWAYS_ROTATION", "HIGH_VOL_MACRO_SHOCK"):
+                    filter_reason = f"OP_S2 Choppy-Regime Quarantine (28.6% WR / -₹651.78 in {row_regime})"
                 elif sid_a == "OP_S2_Operator_VWAP_Markup_BUY" and vol_m > 11.5:
                     filter_reason = f"OP_S2 Blow-Off Chasing Gate ({vol_m:.1f}x > 11.5x exhaustion spike)"
                 elif not (in_prime_win or in_late_block):
@@ -5003,8 +5100,8 @@ def run_v3_two_expert_monday_auto_engine(
             else:
                 if day_cnc_cnt >= 2:
                     filter_reason = f"Daily CNC Quality Cap (max 2 top CNC trades/day in B reached on {edate})"
-                elif sid_a == "L4_DEFENSIVE_RS_SNIPER" and row_regime != "BEAR_RISK_OFF":
-                    filter_reason = f"Regime-Mismatched Defensive Shield (L4 only in BEAR_RISK_OFF, got {row_regime or 'SIDEWAYS'})"
+                elif sid_a == "L4_DEFENSIVE_RS_SNIPER" and row_regime != "BEAR_OR_CORRECTION":
+                    filter_reason = f"Regime-Mismatched Defensive Shield (L4 only in BEAR_OR_CORRECTION, got {row_regime})"
                 elif rr_forward > 0 and rr_forward < 1.25:
                     filter_reason = f"CNC Reward-to-Risk Gate (R:R {rr_forward:.2f} < 1.25 structural minimum)"
 
@@ -5418,7 +5515,7 @@ def rebuild_all_real_paper_history(
       6. Forward candidate queue + continuous critic audit memory check
     """
     report, snipers, watchlist = scan_live_sniper_opportunities()
-    cur_regime = str(report.get("regime", ""))
+    cur_regime = _canonical_regime_code(report.get("regime_code", report.get("regime_badge", "")))
     cnc_hist = rebuild_clean_cnc_history_from_market(
         start_date=start_date, eod_315pm_auto_exit=eod_315pm_auto_exit
     )

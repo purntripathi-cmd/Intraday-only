@@ -1506,6 +1506,29 @@ def render_live_signals_tab():
             "Auto-ranked across sessions using 14-day exponential decay + current-regime fit + Wilson Lower Bound (`z=1.645`) + Bayesian-shrunk XIRR — "
             "**highest success probability with max XIRR always on top**. Strict `<= ₹20,000` budget & prime window."
         )
+        # Live Scenario & Tab 2 Slot-Budget Strip
+        _shad_live = load_csv("v3_expert_shadow_validation_ledger.csv")
+        _cnc_used_s, _op_used_s, _secs_used_s = 0, 0, []
+        if not _shad_live.empty and "Entry_Date" in _shad_live.columns:
+            _lsd = str(_shad_live["Entry_Date"].max())
+            _td = _shad_live[_shad_live["Entry_Date"].astype(str) == _lsd]
+            if "Strategy_ID" in _td.columns:
+                _is_op_m = _td["Strategy_ID"].astype(str).str.startswith("OP_")
+                _op_used_s = int(_is_op_m.sum())
+                _cnc_used_s = int((~_is_op_m).sum())
+            if "Sector_Group" in _td.columns:
+                _secs_used_s = sorted({str(s).strip() for s in _td["Sector_Group"] if str(s).strip() and str(s).strip().lower() not in ("nan", "none", "null")})
+        _reg_label = regime_rep.get("regime_badge", "🟡 Sideways / Sectoral Rotation") if isinstance(regime_rep, dict) else "🟡 Sideways / Sectoral Rotation"
+        _auth_logics = ", ".join(regime_rep.get("authorized_sniper_logics", [])) if isinstance(regime_rep, dict) else ""
+        st.info(
+            f"**Scenario:** `{_reg_label}` | **CNC Slots (`{_lsd if not _shad_live.empty else 'Today'}`):** `{_cnc_used_s}/2` | "
+            f"**Op Slots:** `{_op_used_s}/2` | **Sectors Used (1/Sector Cap):** `{', '.join(_secs_used_s) if _secs_used_s else 'None'}`"
+            + (f" | **Active CNC Logics:** `{_auth_logics}`" if _auth_logics else "")
+        )
+        if cnc_capital < float(MAX_BUDGET_PER_TICKER_INR):
+            st.warning(
+                f"Budget slider is `₹{int(cnc_capital):,}`, whereas Tab 2 auto-execution uses the fixed `₹{int(MAX_BUDGET_PER_TICKER_INR):,}`/slot engine cap."
+            )
 
         if not top10_df.empty:
             card_cols = st.columns(min(4, len(top10_df) + 1))
@@ -1516,7 +1539,7 @@ def render_live_signals_tab():
                 card_cols[idx].metric(
                     f"{badge} {direction}: {rc.get('Ticker', '')}",
                     f"Entry ₹{float(rc.get('Recommended_Entry_Price', 0)):,.2f} ({int(rc.get('Raw_Qty', 1))} Qty)",
-                    f"{str(rc.get('Strategy_ID', ''))} | {str(rc.get('Confidence_Level', ''))[:20]}",
+                    f"{str(rc.get('Strategy_ID', ''))} | {str(rc.get('Tab2_Execution_Status', rc.get('Confidence_Level', '')))[:24]}",
                 )
             if len(top10_df) > 3:
                 card_cols[-1].metric(
@@ -1528,6 +1551,8 @@ def render_live_signals_tab():
             signal_display_cols = [
                 "Signal_Direction",
                 "Ticker",
+                "Tab2_Execution_Status",
+                "Sector_Group",
                 "Strategy_Name",
                 "Product_Mode",
                 "Paper_Trade_Success_Rate",
@@ -1543,6 +1568,7 @@ def render_live_signals_tab():
                 "Qty_For_20K_And_Capital",
                 "Est_Profit_Vs_Risk_INR",
                 "Time_Exit_And_315PM_Rule",
+                "Priority_And_Slot",
                 "Strategy_ID",
                 "Pre_Configure_Broker_Order_Guide",
             ]
@@ -1556,9 +1582,10 @@ def render_live_signals_tab():
     sniper_trades_live = load_csv("sniper_telemetry_trades.csv")
 
     with st.container(border=True):
-        st.markdown("### 📌 Section B: Current Open Positions & Active Exit Alerts (Live P&L)")
+        st.markdown("### 📌 Section B: Already Executed in Tab 2 — Open Positions & Active Exit Alerts (Live P&L)")
         st.caption(
-            "Active CNC and 1m Operator positions currently open in intraday replay (`ACTIVE`, `ACTIVE_INTRADAY`, `SWING_CONVERTED`, `ACTIVE_OPERATOR_TRADE`)."
+            "Open CNC and 1m Operator positions executed earlier in Tab 2 (`ACTIVE`, `ACTIVE_INTRADAY`, `SWING_CONVERTED`, `ACTIVE_OPERATOR_TRADE`). "
+            "These remain locked and exit-tracked here even if afternoon market scenario shifts Tab 1's Top-10 candidates."
         )
 
         active_positions = []
@@ -1668,12 +1695,13 @@ def render_live_signals_tab():
     with st.expander(f"📋 All Qualified Strategy B Candidates ({len(probable_b_df)} Setups <= ₹{int(cnc_capital):,})", expanded=False):
         if not probable_b_df.empty:
             full_cols = [
-                "Signal_Direction", "Ticker", "Strategy_Name", "Product_Mode",
+                "Signal_Direction", "Ticker", "Tab2_Execution_Status", "Sector_Group",
+                "Strategy_Name", "Product_Mode",
                 "Paper_Trade_Success_Rate", "Confidence_Level", "StratB_WLB_Pct", "StratB_XIRR_Pct",
                 "Order_Side", "Recommended_Entry_Price",
                 "Recommended_Stop_Loss", "Safe_T1_And_Trail_SL_Levels",
                 "Recommended_Exit_Target", "Trigger_Proximity_Status",
-                "Live_LTP_And_Gap", "Qty_For_20K_And_Capital", "Strategy_ID",
+                "Live_LTP_And_Gap", "Qty_For_20K_And_Capital", "Priority_And_Slot", "Strategy_ID",
             ]
             avail_full = [c for c in full_cols if c in probable_b_df.columns]
             render_frozen_3col_dataframe(probable_b_df[avail_full], height=400, auto_add_direction=False)
