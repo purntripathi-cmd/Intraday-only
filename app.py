@@ -35,6 +35,8 @@ if (
     or not hasattr(intraday_expert_engine, "REGULAR_AUDIT_LOG_CSV")
     or not hasattr(intraday_expert_engine, "run_v3_two_expert_monday_auto_engine")
     or not hasattr(intraday_expert_engine, "V3_EXPERT_MONDAY_START_DATE")
+    or not hasattr(intraday_expert_engine, "compute_adaptive_strategy_scores")
+    or not hasattr(intraday_expert_engine, "rebuild_all_real_paper_history")
 ):
     importlib.reload(nifty250_universe)
     importlib.reload(backtest_engine_3y)
@@ -215,6 +217,21 @@ V1_PRE_AUDIT_SNAPSHOT_CSV = getattr(
     "V1_PRE_AUDIT_SNAPSHOT_CSV",
     os.path.join(DATA_DIR, "v1_pre_audit_fresh_trades_snapshot.csv"),
 )
+ADAPTIVE_STRATEGY_RANKING_CSV = getattr(
+    intraday_expert_engine,
+    "ADAPTIVE_STRATEGY_RANKING_CSV",
+    os.path.join(DATA_DIR, "adaptive_strategy_ranking.csv"),
+)
+compute_adaptive_strategy_scores = getattr(
+    intraday_expert_engine,
+    "compute_adaptive_strategy_scores",
+    lambda *a, **kw: pd.DataFrame(),
+)
+rebuild_all_real_paper_history = getattr(
+    intraday_expert_engine,
+    "rebuild_all_real_paper_history",
+    lambda *a, **kw: {},
+)
 auto_rollover_daily_top3_cnc = getattr(
     intraday_expert_engine,
     "auto_rollover_daily_top3_cnc",
@@ -243,7 +260,7 @@ build_probable_intraday_candidates_sheet = getattr(
 run_continuous_critic_audit_and_memory_check = getattr(
     intraday_expert_engine,
     "run_continuous_critic_audit_and_memory_check",
-    lambda *a, **kw: (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}),
+    lambda *a, **kw: {},
 )
 
 st.set_page_config(
@@ -266,11 +283,38 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🎯 Institutional CNC Intraday Sniper, 5m Auto-Exit & 1m Operator Footprint Desk")
+# Sidebar Controls (initialized before st.tabs so all tabs observe consistent state)
+with st.sidebar:
+    st.markdown("### ⚙️ Execution & Quality Controls")
+    st.toggle(
+        "⏰ Auto-Exit Intraday at 3:15 PM IST",
+        value=True,
+        key="eod_315pm_auto_exit_toggle",
+        help="Automatically square off open intraday CNC/Operator positions at 3:15 PM IST unless gated for swing hold.",
+    )
+    st.toggle(
+        "🔴 Enable MIS Short Selling (OP_S3)",
+        value=True,
+        key="enable_mis_short_toggle",
+        help="When ON, allows 1m Operator Breakdown SHORT SELL (MIS Only) signals during Bearish/Sideways regimes. Turn OFF for 100% CNC Long-Only.",
+    )
+    st.caption(
+        "**Adaptive Strategy Ranking**: 14-day exponential decay + regime match (`λ=0.25`) + "
+        "Wilson Lower Bound (`z=1.645`) + Bayesian-shrunk XIRR (`N>=5d` guard). Strictly Closed Trades Only."
+    )
+    if st.button("🔄 Rebuild Real Paper History (>= 2026-10-27)", use_container_width=True, key="sidebar_rebuild_real_btn"):
+        with st.spinner("Rebuilding all paper ledgers strictly from genuine NSE OHLCV since 2026-10-27..."):
+            rebuild_all_real_paper_history(
+                enable_mis_short=st.session_state.get("enable_mis_short_toggle", True)
+            )
+        st.toast("Clean real-market rebuild complete!", icon="✅")
+        st.rerun()
+
+st.title("🎯 Institutional Intraday Desk — Strategy B Quality Engine & Adaptive Top-10")
 st.caption(
-    f"Universe: **Full NIFTY 250 + Sectoral/Global ETFs (`{len(UNIVERSE_META)}` Instruments)** | "
-    "Execution Mode: **100% CNC Only (Top 3 <= `₹20,000` each) + Separate 1m Operator Auto-Trade (`BUY` & `SELL`) Tracker** | "
-    "**5-Minute Auto-Refresh (`@st.fragment(run_every='5m')`) + Chronological Candle Replay**"
+    f"Universe: **NIFTY 250 + ETFs (`{len(UNIVERSE_META)}` Instruments)** | "
+    "**🟢 BUY (CNC / CNC-MIS)** vs **🔴 SHORT SELL (MIS Only)** | "
+    "Strict **≤ ₹20,000/Ticker** | **Zero Artificial Data — Strictly Real Closed-Trade Telemetry (>= 2026-10-27)**"
 )
 
 
@@ -291,40 +335,49 @@ def load_json(filename: str) -> dict:
 
 def _add_signal_direction(df_in: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensures every trade / signal / strategy table clearly indicates 🟢 BUY or 🔴 SELL in the very first column.
+    Ensures every trade / signal / strategy table clearly indicates explicit Buy/Short-Sell product mode:
+    `🟢 BUY (CNC)`, `🟢 BUY (CNC/MIS)`, or `🔴 SHORT SELL (MIS Only)`.
     """
     if df_in is None or df_in.empty:
         return df_in
     df = df_in.copy()
-    if "Signal_Direction" not in df.columns:
-        has_signal_context = any(
-            c in df.columns
-            for c in [
-                "Strategy_ID", "StratB_Strategy_ID", "Logic_ID", "Signal_Side",
-                "Paper_Order_Side", "Order_Side", "Auto_Trade_Action", "Ticker",
-                "symbol", "Strategy_Name", "Candidate_Group"
-            ]
-        )
-        if not has_signal_context:
-            return df
+    has_signal_context = any(
+        c in df.columns
+        for c in [
+            "Strategy_ID", "StratB_Strategy_ID", "Logic_ID", "Signal_Side",
+            "Paper_Order_Side", "Order_Side", "Auto_Trade_Action", "Ticker",
+            "symbol", "Strategy_Name", "Candidate_Group",
+        ]
+    )
+    if not has_signal_context:
+        return df
 
-        def _determine_direction(r):
-            side_fields = [
-                str(r.get("Signal_Side", "")),
-                str(r.get("Paper_Order_Side", "")),
-                str(r.get("Order_Side", "")),
-                str(r.get("Auto_Trade_Action", "")),
-                str(r.get("Action", "")),
-                str(r.get("Signal", "")),
-            ]
-            combined_side = " ".join(side_fields).upper()
-            strat_id = str(r.get("Strategy_ID", r.get("StratB_Strategy_ID", r.get("Logic_ID", "")))).upper()
-            
-            if "SELL" in combined_side or "SHORT" in combined_side or "OP_S3" in strat_id or "EXIT" in combined_side:
-                return "🔴 SELL"
-            return "🟢 BUY"
-            
-        dir_col = df.apply(_determine_direction, axis=1)
+    def _determine_direction(r):
+        existing = str(r.get("Signal_Direction", "")).strip()
+        if existing in ("🟢 BUY (CNC)", "🟢 BUY (CNC/MIS)", "🔴 SHORT SELL (MIS Only)"):
+            return existing
+        side_fields = [
+            str(r.get("Signal_Side", "")),
+            str(r.get("Paper_Order_Side", "")),
+            str(r.get("Order_Side", "")),
+            str(r.get("Auto_Trade_Action", "")),
+            str(r.get("Action", "")),
+            str(r.get("Signal", "")),
+            existing,
+        ]
+        combined_side = " ".join(side_fields).upper()
+        strat_id = str(r.get("Strategy_ID", r.get("StratB_Strategy_ID", r.get("Logic_ID", "")))).upper()
+        prod = str(r.get("Product_Mode", r.get("Product_Type", ""))).upper()
+        if "SELL" in combined_side or "SHORT" in combined_side or "OP_S3" in strat_id:
+            return "🔴 SHORT SELL (MIS Only)"
+        if strat_id.startswith("OP_") or "CNC/MIS" in prod:
+            return "🟢 BUY (CNC/MIS)"
+        return "🟢 BUY (CNC)"
+
+    dir_col = df.apply(_determine_direction, axis=1)
+    if "Signal_Direction" in df.columns:
+        df["Signal_Direction"] = dir_col
+    else:
         df.insert(0, "Signal_Direction", dir_col)
     return df
 
@@ -332,8 +385,7 @@ def _add_signal_direction(df_in: pd.DataFrame) -> pd.DataFrame:
 def render_frozen_3col_dataframe(df: pd.DataFrame, height: int = None, auto_add_direction: bool = True):
     """
     Freezes the first 3 columns of any DataFrame in Streamlit's interactive Glide Data Grid
-    by setting the first 3 columns as a 3-level pinned MultiIndex (`hide_index=False`).
-    Also ensures Level-0 index values are distinct per row so no cells are visually merged.
+    without mutating visible cell labels (uses invisible zero-width disambiguator only on repeated triples).
     """
     if df is None or df.empty:
         st.info("No records available.")
@@ -347,15 +399,13 @@ def render_frozen_3col_dataframe(df: pd.DataFrame, height: int = None, auto_add_
     freeze_cols = list(work.columns[:3])
     col0 = freeze_cols[0]
 
-    seen = {}
+    seen: dict[str, int] = {}
     unique_col0 = []
     for val in work[col0].astype(str):
-        if val in seen:
-            seen[val] += 1
-            unique_col0.append(f"{val} ({seen[val]})")
-        else:
-            seen[val] = 1
-            unique_col0.append(val)
+        cnt = seen.get(val, 0)
+        seen[val] = cnt + 1
+        # Keep display clean — append zero-width spaces only when identical text repeats
+        unique_col0.append(val + ("\u200b" * cnt))
     work[col0] = unique_col0
 
     for c in freeze_cols[1:]:
@@ -370,22 +420,50 @@ def render_frozen_3col_dataframe(df: pd.DataFrame, height: int = None, auto_add_
 
 def recalculate_cnc_sizing(df: pd.DataFrame, cnc_capital_inr: float) -> pd.DataFrame:
     """
-    Dynamically updates CNC order quantity, order value, and rupee stop risk based on user's CNC capital
-    (strictly capped at ₹20,000 per ticker).
+    Dynamically updates CNC/Intraday order quantity strictly under <= ₹20,000 budget cap
+    and excludes any instrument whose 1-share price exceeds the capped budget (`qty == 0`).
     """
-    if df.empty or "CNC_Buy_Limit_Price" not in df.columns:
+    if df is None or df.empty:
+        return df
+    price_col = (
+        "CNC_Buy_Limit_Price"
+        if "CNC_Buy_Limit_Price" in df.columns
+        else ("Recommended_Entry_Price" if "Recommended_Entry_Price" in df.columns else None)
+    )
+    if price_col is None:
         return df
     out = df.copy()
     capped_capital = min(MAX_BUDGET_PER_TICKER_INR, max(1000.0, float(cnc_capital_inr)))
-    prices = pd.to_numeric(out["CNC_Buy_Limit_Price"], errors="coerce").fillna(1.0).clip(lower=1.0)
-    sl_prices = pd.to_numeric(out["Initial_Protected_SL"], errors="coerce").fillna(prices * 0.98)
-    qtys = (capped_capital // prices).clip(lower=1).astype(int)
-    # Ensure qty * price never exceeds capped_capital when qty > 1
+    prices = pd.to_numeric(out[price_col], errors="coerce").fillna(0.0)
+    # Strict budget guard: exclude 0-qty / over-budget tickers cleanly
+    valid_mask = (prices > 0.0) & (prices <= capped_capital)
+    out = out[valid_mask].copy().reset_index(drop=True)
+    if out.empty:
+        return out
+    prices = pd.to_numeric(out[price_col], errors="coerce")
+    qtys = (capped_capital // prices).astype(int)
     over_mask = (qtys * prices > capped_capital) & (qtys > 1)
     qtys = qtys.where(~over_mask, qtys - 1)
+    qtys = qtys.where(qtys >= 1, 0)
+    out = out[qtys >= 1].copy().reset_index(drop=True)
+    if out.empty:
+        return out
+    prices = pd.to_numeric(out[price_col], errors="coerce")
+    qtys = (capped_capital // prices).astype(int)
+    if "Initial_Protected_SL" in out.columns:
+        sl_prices = pd.to_numeric(out["Initial_Protected_SL"], errors="coerce").fillna(prices * 0.985)
+    elif "Recommended_Stop_Loss" in out.columns:
+        sl_prices = pd.to_numeric(out["Recommended_Stop_Loss"], errors="coerce").fillna(prices * 0.985)
+    else:
+        sl_prices = prices * 0.985
+
     out["Suggested_CNC_Qty"] = qtys
     out["CNC_Order_Value_INR"] = (qtys * prices).round(2)
-    out["Max_Stop_Risk_INR"] = (qtys * (prices - sl_prices).clip(lower=0.05)).round(2)
+    out["Max_Stop_Risk_INR"] = (qtys * (prices - sl_prices).abs().clip(lower=0.05)).round(2)
+    if "Raw_Qty" in out.columns:
+        out["Raw_Qty"] = qtys
+    if "Qty_For_20K_And_Capital" in out.columns:
+        out["Qty_For_20K_And_Capital"] = [f"{int(q)} Qty (₹{float(q * p):,.0f})" for q, p in zip(qtys, prices)]
     return out
 
 
@@ -528,967 +606,13 @@ def build_operator_initial_rows_ticket_table(op_df: pd.DataFrame) -> pd.DataFram
     return pd.DataFrame(records)
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🎯 Tab 1: Live Signals — Strategy B Entry/Exit Recommendations",
-    "📊 Tab 2: Paper Trade Performance & Detailed Trade Log",
-    "🛠️ Tab 3: Manual Order Builder, 1m Shock Scanner & Full Nifty-250 Radar",
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🎯 Tab 1: Live Signals — Adaptive Top 10 (BUY/SELL)",
+    "📊 Tab 2: Paper Trade Performance & 9-Strategy Scorecard",
+    "🛠️ Tab 3: Manual Order Builder, 1m Shock Scanner & Radar",
     "🛡️ Tab 4: Downside Protection & Trailing SL Ladder",
-    "🔄 Tab 5: 3:10 PM Swing Predictor, Backtest & Historical Archive",
-    "📋 Tab 6: Continuous Critic Audit, Gap Ledger & XIRR Governance",
+    "🔄 Tab 5: 3:10 PM Swing Predictor, 3Y Backtest & Critic Audit",
 ])
-
-
-@st.fragment(run_every="5m")
-def render_live_5m_auto_refresh_desk():
-    """
-    Scheduled Paper Trade Performance Desk (Tab 1) — Auto-refreshes every 5 minutes (300 seconds) and evaluates:
-    1. Probable Intraday Entry–Exit Candidates (Advance Broker Configuration at top).
-    2. Strategy A (1st Stable Version — Ongoing Since 2026-10-27): Top-3 CNC 5m Exits + 1m Operator Auto-Trades + XIRR.
-    3. Strategy B (2-Expert Critic Strategy — Armed to Start Live Auto-Trade from Monday 2026-11-02):
-       Separate Auto-Trade Ledger, Daily Capital/Charges/20% Tax/XIRR, 9-Strategy Scorecard & Blocked Falling-Knife Audit.
-    """
-    # Automatically roll over prior day's Top-3 CNC paper trades into fresh_cnc_trades_history.csv
-    # and auto-stage today's Top-3 CNC entries on a new live NSE trading session (>= 09:30 IST)
-    try:
-        auto_rollover_daily_top3_cnc(
-            eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True)
-        )
-    except Exception:
-        pass
-
-    # Automatically evaluate chronological 5m exits on every 5-minute cycle (Strategy A: 1st Stable Version)
-    auto_eval_df = evaluate_chronological_exits(
-        trades_csv_path=SNIPER_TELEMETRY_CSV,
-        force_full_replay=False,
-        eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
-    )
-
-    # During live Indian market hours (09:15 AM – 03:30 PM IST on weekdays) OR if the app is opened
-    # after 10:00 AM IST on a weekday and today's session hasn't been scanned yet (Post-Market Catch-Up),
-    # automatically scan the NIFTY 250 funnel for 1m Operator footprints so today's paper trades never get missed.
-    now_ist_dt = pd.Timestamp.now(tz="Asia/Kolkata")
-    today_ist_str = now_ist_dt.strftime("%Y-%m-%d")
-    is_live_market_hours = (
-        now_ist_dt.weekday() < 5
-        and ((now_ist_dt.hour == 9 and now_ist_dt.minute >= 15) or (10 <= now_ist_dt.hour <= 14) or (now_ist_dt.hour == 15 and now_ist_dt.minute <= 30))
-    )
-    existing_op_trades = load_csv("operator_auto_trades.csv")
-    needs_post_market_catchup = (
-        now_ist_dt.weekday() < 5
-        and now_ist_dt.hour >= 10
-        and (
-            existing_op_trades.empty
-            or "Entry_Date" not in existing_op_trades.columns
-            or today_ist_str not in existing_op_trades["Entry_Date"].astype(str).values
-        )
-    )
-    if is_live_market_hours or needs_post_market_catchup:
-        try:
-            cached_op_signals = scan_operator_1m_footprints()
-        except Exception:
-            cached_op_signals = load_csv("live_operator_1m_signals.csv")
-    else:
-        cached_op_signals = load_csv("live_operator_1m_signals.csv")
-
-    # Evaluate/refresh Strategy A (1st Stable Version) Operator Auto-Trade (BUY & SELL) ledger every 5m cycle
-    op_trades_df, op_perf_summary = auto_execute_and_evaluate_operator_trades(
-        cached_op_signals if not cached_op_signals.empty else None
-    )
-    strat_scorecard_df, all_paper_trades_df = build_all_strategies_paper_ledger_and_scorecard(
-        op_trades_df=op_trades_df if not op_trades_df.empty else None
-    )
-
-    # Evaluate/refresh Strategy B (2-Expert Critic Strategy — Locked to Start Live Auto-Trade from Monday 2026-11-02)
-    try:
-        v3_engine_out = run_v3_two_expert_monday_auto_engine(
-            watchlist_df=load_csv("live_watchlist_radar.csv"),
-            sniper_df=load_csv("live_sniper_signals.csv"),
-            op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
-            force_rebuild_shadow=needs_post_market_catchup,
-            force_refresh=needs_post_market_catchup,
-        )
-    except Exception:
-        v3_engine_out = {}
-
-    now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
-    st.markdown(
-        f"⏱️ **5-Minute Scheduled Paper Trade Engine: `ACTIVE (Every 5 Minutes)`** | "
-        f"Last 5m Check: **`{now_ist_str}`** | "
-        f"**Tab 1 Scope: `Strategy A (1st Stable Version — Ongoing)` vs `Strategy B (2-Expert Critic Strategy — Starts Monday {V3_EXPERT_MONDAY_START_DATE})`** | "
-        f"*(Manual Order Builders, 1m Raw Scanner & Backtests moved to Tabs 2–7)*"
-    )
-
-    # Top Control Bar for Scheduled Paper Trade Desk
-    ctrl1, ctrl2, ctrl3 = st.columns([1.8, 1.8, 1.4])
-    with ctrl1:
-        if st.button("🔄 Refresh Strategy A (1st Stable) & Strategy B (2-Expert) Paper Trades Now", type="primary", use_container_width=True):
-            with st.spinner(f"Scanning {len(UNIVERSE_META)} NIFTY 250 instruments & evaluating Strategy A + Strategy B (2-Expert) paper trades..."):
-                scan_live_sniper_opportunities()
-                evaluate_chronological_exits(
-                    trades_csv_path=SNIPER_TELEMETRY_CSV,
-                    force_full_replay=True,
-                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
-                )
-                new_op_sig = scan_operator_1m_footprints()
-                new_op_tr, _ = auto_execute_and_evaluate_operator_trades(new_op_sig)
-                build_all_strategies_paper_ledger_and_scorecard(
-                    op_trades_df=new_op_tr if not new_op_tr.empty else None
-                )
-                run_v3_two_expert_monday_auto_engine(
-                    watchlist_df=load_csv("live_watchlist_radar.csv"),
-                    sniper_df=load_csv("live_sniper_signals.csv"),
-                    op_signals_df=new_op_sig if not new_op_sig.empty else None,
-                    force_rebuild_shadow=True,
-                    force_refresh=True,
-                )
-                build_probable_intraday_candidates_sheet(
-                    watchlist_df=load_csv("live_watchlist_radar.csv"),
-                    sniper_df=load_csv("live_sniper_signals.csv"),
-                    op_signals_df=new_op_sig if not new_op_sig.empty else None,
-                    top3_ledger_df=load_csv("sniper_telemetry_trades.csv"),
-                )
-            st.rerun()
-    with ctrl2:
-        if st.button("🏆 Reset / Sync Today's Top 3 CNC Slots (<=₹20K)", use_container_width=True):
-            with st.spinner("Loading Top 3 CNC entries (<= ₹20,000 each) & replaying 5m candles from 10:05 to 3:15 PM..."):
-                rep_tmp = load_json("live_regime_report.json")
-                wl_tmp = load_csv("live_watchlist_radar.csv")
-                sn_tmp = load_csv("live_sniper_signals.csv")
-                src_tmp = sn_tmp if not sn_tmp.empty else wl_tmp
-                stage_top3_daily_cnc_entries(
-                    watchlist_df=src_tmp,
-                    regime_badge=rep_tmp.get("regime_badge", "TRENDING_OR_ROTATION"),
-                    purchase_time_str="10:00:00",
-                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
-                    sync_purchase_candle_price=True,
-                    trades_csv_path=SNIPER_TELEMETRY_CSV,
-                )
-            st.rerun()
-    with ctrl3:
-        cnc_capital = st.number_input(
-            "💰 Max Budget / Ticker (₹, <= 20K)",
-            min_value=2000.0,
-            max_value=float(MAX_BUDGET_PER_TICKER_INR),
-            value=float(MAX_BUDGET_PER_TICKER_INR),
-            step=2000.0,
-            help="Strict ₹20,000 maximum budget per ticker in CNC Delivery (max 3 entries/day = ₹60,000 total).",
-        )
-
-    regime_rep = load_json("live_regime_report.json")
-    sniper_df = load_csv("live_sniper_signals.csv")
-    watchlist_df = load_csv("live_watchlist_radar.csv")
-    top3_ledger_df = load_csv("sniper_telemetry_trades.csv")
-    if top3_ledger_df.empty:
-        top3_ledger_df = auto_eval_df
-
-    watchlist_df = recalculate_cnc_sizing(watchlist_df, cnc_capital)
-    sniper_df = recalculate_cnc_sizing(sniper_df, cnc_capital)
-
-    v3_summary_meta = load_json("v3_expert_performance_summary.json") if isinstance(load_json("v3_expert_performance_summary.json"), dict) else {}
-    v3_shadow_meta = v3_summary_meta.get("shadow_validation_oct27_28", {}) if isinstance(v3_summary_meta, dict) else {}
-    v3_alpha_meta = v3_summary_meta.get("alpha_vs_1st_stable", {}) if isinstance(v3_summary_meta, dict) else {}
-
-    if regime_rep:
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"), f"Universe: {len(watchlist_df)} / {len(UNIVERSE_META)} Tickers")
-        m2.metric("Nifty 50 (^NSEI)", f"{regime_rep.get('nifty_close', 0):,.2f}", f"{regime_rep.get('nifty_ret_1d_pct', 0):+.2f}% (1D)")
-        m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "Max ₹20K/Ticker | Max 3 CNC/Day")
-        m4.metric(
-            "🟢 Strategy A (1st Stable) Post-Tax",
-            f"₹+{float(v3_summary_meta.get('strat_a_post_tax_pnl_inr', 1765.61)):,.2f} (+{float(v3_summary_meta.get('strat_a_annualized_xirr_pct', 209.53)):.2f}% XIRR)",
-            f"{int(v3_summary_meta.get('strat_a_total_trades', 37))} Trades (12.3/day) | {float(v3_summary_meta.get('strat_a_net_wr_pct', 78.4)):.1f}% Net WR",
-        )
-        m5.metric(
-            f"🟣 Strategy B (2-Expert | Live Mon {V3_EXPERT_MONDAY_START_DATE})",
-            f"₹+{float(v3_summary_meta.get('shadow_post_tax_pnl_inr', 2757.39)):,.2f} (+{float(v3_summary_meta.get('shadow_annualized_xirr_pct', 594.97)):.2f}% XIRR)",
-            f"🟢 Mon Live: {int(v3_summary_meta.get('monday_live_trades_count', 11))} Trades | Total: {int(v3_summary_meta.get('shadow_validated_trades', 34))} ({float(v3_summary_meta.get('shadow_net_wr_pct', 97.1)):.1f}% WR)",
-        )
-
-    # =========================================================================
-    # SECTION 1 (TOP OF TAB 1 — ABOVE SCHEDULED STRATEGY LOGS):
-    # PROBABLE INTRADAY ENTRY-EXIT CANDIDATES FOR STRATEGY A & STRATEGY B
-    # (SORTED WITH BEST-PERFORMING STRATEGIES ON TOP + STRATEGY NAME,
-    #  PAPER TRADE SUCCESS RATE & CONFIDENCE LEVEL | 5M AUTO-REFRESH)
-    # =========================================================================
-    st.markdown("---")
-    probable_df = build_probable_intraday_candidates_sheet(
-        watchlist_df=watchlist_df,
-        sniper_df=sniper_df,
-        op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
-        top3_ledger_df=top3_ledger_df,
-        budget_per_ticker=cnc_capital,
-    )
-    if probable_df.empty:
-        probable_df = load_csv("probable_intraday_candidates.csv")
-    probable_b_df = load_csv("probable_candidates_strategy_b.csv")
-    probable_a_df = load_csv("probable_candidates_strategy_a.csv")
-
-    perf_map_live = _get_strategy_paper_performance_map()
-
-    def _enrich_and_sort_best_strategies_top(
-        df_in: pd.DataFrame,
-        engine_mode: str = "B",
-        sort_by_best_perf: bool = True,
-        is_candidate_table: bool = False,
-    ) -> pd.DataFrame:
-        if df_in is None or df_in.empty:
-            return pd.DataFrame()
-        df = df_in.copy()
-        sid_col = (
-            "Strategy_ID"
-            if "Strategy_ID" in df.columns
-            else ("StratB_Strategy_ID" if "StratB_Strategy_ID" in df.columns else None)
-        )
-        if sid_col is not None:
-            if "Strategy_Name" not in df.columns:
-                df["Strategy_Name"] = ""
-            df["Strategy_Name"] = df.apply(
-                lambda r: (
-                    str(r.get("Strategy_Name", "")).strip()
-                    if str(r.get("Strategy_Name", "")).strip() not in ("", "nan", "None")
-                    else CANONICAL_STRATEGY_NAMES.get(
-                        str(r.get(sid_col, "")).strip(),
-                        str(r.get("Strategy_Name_And_Mode", r.get(sid_col, "Confirmed Intraday Strategy"))),
-                    )
-                ),
-                axis=1,
-            )
-            if "Paper_Trade_Success_Rate" not in df.columns:
-                df["Paper_Trade_Success_Rate"] = ""
-            df["Paper_Trade_Success_Rate"] = df.apply(
-                lambda r: (
-                    str(r.get("Paper_Trade_Success_Rate", "")).strip()
-                    if str(r.get("Paper_Trade_Success_Rate", "")).strip() not in ("", "nan", "None")
-                    else perf_map_live.get(str(r.get(sid_col, "")).strip(), {}).get(
-                        "b_badge" if engine_mode == "B" else ("a_badge" if engine_mode == "A" else "ab_combined_badge"),
-                        "🟢 97.1% Paper WR (33W/1L)",
-                    )
-                ),
-                axis=1,
-            )
-            wr_key = "b_wr" if engine_mode != "A" else "a_wr"
-            pt_key = "b_post_tax" if engine_mode != "A" else "a_post_tax"
-            if "Strategy_Paper_WR_Pct" not in df.columns:
-                df["Strategy_Paper_WR_Pct"] = df[sid_col].apply(
-                    lambda s: float(perf_map_live.get(str(s).strip(), {}).get(wr_key, 85.0))
-                )
-            if "Strategy_Paper_PostTax_INR" not in df.columns:
-                df["Strategy_Paper_PostTax_INR"] = df[sid_col].apply(
-                    lambda s: float(perf_map_live.get(str(s).strip(), {}).get(pt_key, 0.0))
-                )
-            if "Confidence_Level" not in df.columns or (df["Confidence_Level"].astype(str).str.strip() == "").any():
-                conf_scores = []
-                conf_badges = []
-                for _, r in df.iterrows():
-                    sid_v = str(r.get(sid_col, "")).strip()
-                    ex_badge = str(r.get("Confidence_Level", "")).strip()
-                    ex_score = float(r.get("Confidence_Score_Pct", 0.0) or 0.0)
-                    if ex_badge not in ("", "nan", "None") and ex_score > 0:
-                        conf_scores.append(ex_score)
-                        conf_badges.append(ex_badge)
-                    else:
-                        c_sc, c_bd = _compute_confidence_badge(
-                            strat_id=sid_v,
-                            perf_map=perf_map_live,
-                            readiness_or_conf=float(r.get("Raw_Readiness_Score", 90.0) or 90.0),
-                            vol_mult=2.5,
-                            gap_pct=float(r.get("Raw_Gap_Pct", 0.0) or 0.0),
-                            is_blocked_in_b=False,
-                            prefer_engine="B" if engine_mode != "A" else "A",
-                        )
-                        conf_scores.append(c_sc)
-                        conf_badges.append(c_bd)
-                df["Confidence_Score_Pct"] = conf_scores
-                df["Confidence_Level"] = conf_badges
-
-        if sort_by_best_perf:
-            wr_col = "Paper_Trade_Win_Rate_Pct" if "Paper_Trade_Win_Rate_Pct" in df.columns else "Strategy_Paper_WR_Pct"
-            pt_col = "Strategy_Paper_PostTax_INR"
-            cf_col = "Confidence_Score_Pct"
-            sort_cols = [c for c in [wr_col, pt_col, cf_col] if c in df.columns]
-            asc_flags = [False] * len(sort_cols)
-            if is_candidate_table and "Raw_Gap_Pct" in df.columns:
-                sort_cols.append("Raw_Gap_Pct")
-                asc_flags.append(True)
-            elif "Entry_Date" in df.columns:
-                sort_cols.append("Entry_Date")
-                asc_flags.append(False)
-            if sort_cols:
-                df = df.sort_values(by=sort_cols, ascending=asc_flags).reset_index(drop=True)
-        return df
-
-    probable_df = _enrich_and_sort_best_strategies_top(probable_df, engine_mode="AB", sort_by_best_perf=True, is_candidate_table=True)
-    if probable_b_df.empty and not probable_df.empty and "Executes_In_Strategy_B" in probable_df.columns:
-        probable_b_df = probable_df[probable_df["Executes_In_Strategy_B"] == True].copy()
-    if probable_a_df.empty and not probable_df.empty and "Executes_In_Strategy_A" in probable_df.columns:
-        probable_a_df = probable_df[probable_df["Executes_In_Strategy_A"] == True].copy()
-    probable_b_df = _enrich_and_sort_best_strategies_top(probable_b_df, engine_mode="B", sort_by_best_perf=True, is_candidate_table=True)
-    probable_a_df = _enrich_and_sort_best_strategies_top(probable_a_df, engine_mode="A", sort_by_best_perf=True, is_candidate_table=True)
-
-    with st.container(border=True):
-        st.markdown(
-            "### 🎯 Section 1: Probable Intraday Entry–Exit Candidates (`Strategy A` & `Strategy B`) — Know in Advance Which Trades Will Happen (`5m Auto-Refresh`)"
-        )
-        st.caption(
-            "**Advance Trade Queue for Both `Strategy A (1st Stable Version)` and `Strategy B (2-Expert Critic Strategy)` (`<= ₹20,000 / Ticker` | Auto-Refreshes Every 5 Minutes & on Manual Refresh Click)**: "
-            "Sorted by default with **Best-Performing Paper-Trade Strategies on Top** (`100.0% Paper Win Rate` strategies `L4_DEFENSIVE_RS_SHIELD`, `L1_SECTOR_NR7_ORB`, `OP_S2`, `OP_S1`, `OP_S3` first). "
-            "Every table confirms **`Strategy_Name`**, **`Paper_Trade_Success_Rate`**, **`Confidence_Level`**, and **`Strategy_A_vs_B_Execution_Plan`** so you know in advance which trades are going to happen as and when triggered."
-        )
-
-        if not probable_df.empty:
-            cnc_prob_sub = probable_df[probable_df["Candidate_Group"] == "CNC_OR_INTRADAY_SNIPER"].reset_index(drop=True)
-            imminent_sub = probable_df[probable_df["Raw_Gap_Pct"] <= 0.85] if "Raw_Gap_Pct" in probable_df.columns else pd.DataFrame()
-            b_ready_cnt = len(probable_b_df) if not probable_b_df.empty else 0
-            a_ready_cnt = len(probable_a_df) if not probable_a_df.empty else 0
-
-            pc1, pc2, pc3, pc4 = st.columns(4)
-            for idx_card, col_card in enumerate([pc1, pc2, pc3]):
-                if idx_card < len(probable_b_df):
-                    rc = probable_b_df.iloc[idx_card]
-                    badge_icon = ["🏆 #1 Top Perf Strategy", "🥈 #2 Top Perf Strategy", "🥉 #3 Top Perf Strategy"][idx_card]
-                    col_card.metric(
-                        f"{badge_icon}: {rc['Ticker']}",
-                        f"Entry ₹{float(rc['Recommended_Entry_Price']):,.2f} ({int(rc.get('Raw_Qty', 1))} Qty)",
-                        f"{str(rc.get('Strategy_ID', ''))} | {str(rc.get('Confidence_Level', ''))[:24]}",
-                    )
-            imm_tickers = ", ".join(imminent_sub["Ticker"].head(5).tolist()) if not imminent_sub.empty else "Scanning..."
-            pc4.metric(
-                "⚡ Advance Queue (Strategy B vs A)",
-                f"B: {b_ready_cnt} Setups | A: {a_ready_cnt} Setups",
-                f"Imminent (<0.85%): {len(imminent_sub)} ({imm_tickers})",
-            )
-
-            pf1, pf2, pf3 = st.columns([1.8, 1.5, 1.2])
-            prob_view_mode = pf1.selectbox(
-                "🎯 Filter Advance Probable Candidates (`Strategy A` & `Strategy B`)",
-                options=[
-                    f"All Advance Probable Trades — Strategy A & Strategy B ({len(probable_df)} Setups)",
-                    f"🟣 Strategy B (2-Expert Critic) Qualified Advance Queue Only ({len(probable_b_df)} Setups)",
-                    f"🟢 Strategy A (1st Stable Version) Advance Queue Only ({len(probable_a_df)} Setups)",
-                    "Top 15 Best-Performing Strategy Setups (Recommended Pre-Set List)",
-                    "Ready Now & Imminent Breakouts Only (<= 0.85% from Entry Trigger)",
-                    "1-Minute Operator Volume-Shock Candidates (OP_S1 / OP_S2 / OP_S3)",
-                ],
-                index=0,
-                key="probable_candidates_view_filter",
-            )
-            prob_sort_mode = pf2.selectbox(
-                "🏆 Sort Advance Candidates By",
-                options=[
-                    "🏆 Best-Performing Strategies on Top (Paper Trade Success Rate -> Post-Tax P&L -> Confidence Level)",
-                    "⚡ Closest to Entry Trigger First (Smallest Gap % -> Confidence Level)",
-                    "🎯 Highest Confidence Level First (Confidence Score % -> Paper Trade Success Rate)",
-                ],
-                index=0,
-                key="probable_candidates_sort_mode",
-            )
-            sectors_avail = ["All Sectors"] + sorted(probable_df["Sector_Group"].dropna().astype(str).unique().tolist()) if "Sector_Group" in probable_df.columns else ["All Sectors"]
-            sel_prob_sector = pf3.selectbox(
-                "🏭 Filter by NSE Sector",
-                options=sectors_avail,
-                index=0,
-                key="probable_candidates_sector_filter",
-            )
-
-            def _apply_sec1_sort_and_sector(df_target: pd.DataFrame) -> pd.DataFrame:
-                if df_target is None or df_target.empty:
-                    return pd.DataFrame()
-                out = df_target.copy()
-                if sel_prob_sector != "All Sectors" and "Sector_Group" in out.columns:
-                    out = out[out["Sector_Group"].astype(str) == sel_prob_sector].copy()
-                if prob_sort_mode.startswith("⚡ Closest"):
-                    s_cols = [c for c in ["Raw_Gap_Pct", "Confidence_Score_Pct", "Paper_Trade_Win_Rate_Pct"] if c in out.columns]
-                    s_asc = [True, False, False][: len(s_cols)]
-                    if s_cols:
-                        out = out.sort_values(by=s_cols, ascending=s_asc).reset_index(drop=True)
-                elif prob_sort_mode.startswith("🎯 Highest Confidence"):
-                    s_cols = [c for c in ["Confidence_Score_Pct", "Paper_Trade_Win_Rate_Pct", "Strategy_Paper_PostTax_INR", "Raw_Gap_Pct"] if c in out.columns]
-                    s_asc = [False, False, False, True][: len(s_cols)]
-                    if s_cols:
-                        out = out.sort_values(by=s_cols, ascending=s_asc).reset_index(drop=True)
-                else:
-                    s_cols = [c for c in ["Paper_Trade_Win_Rate_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct", "Raw_Gap_Pct"] if c in out.columns]
-                    s_asc = [False, False, False, True][: len(s_cols)]
-                    if s_cols:
-                        out = out.sort_values(by=s_cols, ascending=s_asc).reset_index(drop=True)
-                return out
-
-            prob_view_df = _apply_sec1_sort_and_sector(probable_df)
-            prob_b_view_df = _apply_sec1_sort_and_sector(probable_b_df)
-            prob_a_view_df = _apply_sec1_sort_and_sector(probable_a_df)
-
-            if prob_view_mode.startswith("🟣 Strategy B"):
-                prob_view_df = prob_b_view_df.copy()
-            elif prob_view_mode.startswith("🟢 Strategy A"):
-                prob_view_df = prob_a_view_df.copy()
-            elif prob_view_mode.startswith("Top 15"):
-                prob_view_df = prob_view_df.head(15).copy()
-            elif prob_view_mode.startswith("Ready Now"):
-                prob_view_df = prob_view_df[prob_view_df["Raw_Gap_Pct"] <= 0.85].copy()
-            elif prob_view_mode.startswith("1-Minute Operator"):
-                prob_view_df = prob_view_df[prob_view_df["Candidate_Group"] == "1M_OPERATOR_FOOTPRINT"].copy()
-
-            display_prob_cols = [
-                "Priority_And_Slot",
-                "Ticker",
-                "Strategy_Name",
-                "Paper_Trade_Success_Rate",
-                "Confidence_Level",
-                "Strategy_A_vs_B_Execution_Plan",
-                "Advance_Entry_To_Exit_Config",
-                "Order_Side",
-                "Recommended_Entry_Price",
-                "Recommended_Stop_Loss",
-                "Safe_T1_And_Trail_SL_Levels",
-                "Recommended_Exit_Target",
-                "Trigger_Proximity_Status",
-                "Live_LTP_And_Gap",
-                "Qty_For_20K_And_Capital",
-                "Est_Profit_Vs_Risk_INR",
-                "Time_Exit_And_315PM_Rule",
-                "Strategy_ID",
-                "Pre_Configure_Broker_Order_Guide",
-            ]
-
-            st.markdown(
-                "##### ⚖️ 1A. Master Advance Probable Trades Table (`Strategy A` & `Strategy B` Combined — Sorted with Best-Performing Strategies on Top | `First 3 Columns Frozen`)"
-            )
-            avail_prob_cols = [c for c in display_prob_cols if c in prob_view_df.columns]
-            render_frozen_3col_dataframe(prob_view_df[avail_prob_cols], height=370)
-
-            s1_col_b, s1_col_a = st.columns(2)
-            with s1_col_b:
-                st.markdown(
-                    f"##### 🟣 1B. Strategy B (`2-Expert Critic`) Advance Probable Trades (`{len(prob_b_view_df)}` Setups Going to Happen in Strategy B — Best Strategies on Top)"
-                )
-                b_prob_cols = [
-                    "Priority_And_Slot",
-                    "Ticker",
-                    "Strategy_Name",
-                    "Paper_Trade_Success_Rate",
-                    "Confidence_Level",
-                    "Strategy_A_vs_B_Execution_Plan",
-                    "Order_Side",
-                    "Recommended_Entry_Price",
-                    "Recommended_Stop_Loss",
-                    "Safe_T1_And_Trail_SL_Levels",
-                    "Recommended_Exit_Target",
-                    "Trigger_Proximity_Status",
-                    "Live_LTP_And_Gap",
-                    "Qty_For_20K_And_Capital",
-                    "Strategy_ID",
-                ]
-                avail_b_prob = [c for c in b_prob_cols if c in prob_b_view_df.columns]
-                render_frozen_3col_dataframe(prob_b_view_df[avail_b_prob], height=320)
-
-            with s1_col_a:
-                st.markdown(
-                    f"##### 🟢 1C. Strategy A (`1st Stable Version`) Advance Probable Trades (`{len(prob_a_view_df)}` Setups Going to Happen in Strategy A — Best Strategies on Top)"
-                )
-                a_prob_cols = [
-                    "Priority_And_Slot",
-                    "Ticker",
-                    "Strategy_Name",
-                    "Paper_Trade_Success_Rate",
-                    "Confidence_Level",
-                    "Strategy_A_vs_B_Execution_Plan",
-                    "Order_Side",
-                    "Recommended_Entry_Price",
-                    "Recommended_Stop_Loss",
-                    "Safe_T1_And_Trail_SL_Levels",
-                    "Recommended_Exit_Target",
-                    "Trigger_Proximity_Status",
-                    "Live_LTP_And_Gap",
-                    "Qty_For_20K_And_Capital",
-                    "Strategy_ID",
-                ]
-                avail_a_prob = [c for c in a_prob_cols if c in prob_a_view_df.columns]
-                render_frozen_3col_dataframe(prob_a_view_df[avail_a_prob], height=320)
-
-            with st.expander("📌 Configured a Candidate in Your Broker? Click Here to Lock It into the Top-3 Active 5m Exit Tracker (`<= ₹20K`)", expanded=False):
-                lk1, lk2, lk3, lk4 = st.columns([1.8, 1.0, 1.0, 1.5])
-                cand_tickers = cnc_prob_sub["Ticker"].tolist() if not cnc_prob_sub.empty else probable_df["Ticker"].tolist()
-                sel_cand_ticker = lk1.selectbox(
-                    "Select Probable Candidate Configured in Broker",
-                    options=cand_tickers,
-                    format_func=lambda t: (
-                        f"{t} | Entry ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Recommended_Entry_Price'].iloc[0]):,.2f} | "
-                        f"SL ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_SL_Price'].iloc[0]):,.2f} -> "
-                        f"TGT ₹{float(probable_df.loc[probable_df['Ticker']==t, 'Raw_Target_Price'].iloc[0]):,.2f}"
-                    ) if t in probable_df["Ticker"].values else t,
-                    key="top_prob_lock_ticker",
-                )
-                default_ep = (
-                    float(probable_df.loc[probable_df["Ticker"] == sel_cand_ticker, "Recommended_Entry_Price"].iloc[0])
-                    if sel_cand_ticker in probable_df["Ticker"].values
-                    else 100.0
-                )
-                cfg_ep = lk2.number_input(
-                    "Configured Entry Price (₹)",
-                    min_value=1.0,
-                    value=float(default_ep),
-                    step=0.5,
-                    key="top_prob_lock_price",
-                )
-                cfg_time = lk3.text_input(
-                    "Order / Entry Time (IST)",
-                    value="10:00:00",
-                    key="top_prob_lock_time",
-                )
-                lk4.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if lk4.button(
-                    f"✅ Lock {sel_cand_ticker} into Top-3 Active 5m Tracker",
-                    type="primary",
-                    use_container_width=True,
-                    key="top_prob_lock_btn",
-                ):
-                    row_match = watchlist_df[watchlist_df["Ticker"] == sel_cand_ticker]
-                    r_dict = row_match.iloc[0].to_dict() if not row_match.empty else {"Ticker": sel_cand_ticker, "Live_Price": cfg_ep}
-                    ok, msg, _ = stage_ticker_into_top3_cnc(
-                        ticker=sel_cand_ticker,
-                        row_data=r_dict,
-                        purchase_time_str=cfg_time.strip(),
-                        entry_price_override=float(cfg_ep),
-                        budget_per_ticker=float(cnc_capital),
-                        regime_badge=regime_rep.get("regime_badge", "TRENDING_OR_ROTATION"),
-                        eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
-                        sync_purchase_candle_price=False,
-                        trades_csv_path=SNIPER_TELEMETRY_CSV,
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.warning(msg)
-
-    # =========================================================================
-    # SECTION 2: STRATEGY A (1ST STABLE VERSION) & STRATEGY B (2-EXPERT CRITIC)
-    #   ADVANCE UPCOMING QUEUE, SCHEDULED PAPER TRADE TABLES & SCORECARDS
-    #   (SORTED WITH BEST-PERFORMING STRATEGIES ON TOP + STRATEGY NAME,
-    #    PAPER TRADE SUCCESS RATE & CONFIDENCE LEVEL | 5M AUTO-REFRESH)
-    # =========================================================================
-    st.markdown("---")
-    daily_summary_df = load_csv("daily_paper_trade_summary.csv")
-    fresh_paper_df = load_csv("fresh_paper_trades_since_inception.csv")
-    if fresh_paper_df.empty:
-        fresh_paper_df = all_paper_trades_df.copy()
-    if strat_scorecard_df.empty:
-        strat_scorecard_df = load_csv("strategy_wise_paper_scorecard.csv")
-
-    v3_live_sec2_df = load_csv("v3_expert_fresh_paper_ledger.csv")
-    v3_shadow_sec2_df = load_csv("v3_expert_shadow_validation_ledger.csv")
-    v3_scorecard_sec2_df = load_csv("v3_expert_strategy_scorecard.csv")
-
-    with st.container(border=True):
-        st.markdown(
-            f"### 🟢🟣 Section 2: Strategy A (`1st Stable Version`) & Strategy B (`2-Expert Critic Strategy`) — Advance Upcoming Trades, Active/Executed Paper Trade Tables & Strategy Success Rates (`5m Auto-Refresh`)"
-        )
-        st.caption(
-            f"**Includes Tables for Both `Strategy A (1st Stable Version)` and `Strategy B (2-Expert Critic Strategy — Live From Monday {V3_EXPERT_MONDAY_START_DATE})`**: "
-            f"All tables in Section 2 are **sorted with the Best-Performing Strategies on Top** (`Paper_Trade_Success_Rate` -> `Strategy Post-Tax P&L` -> `Confidence_Level`) and confirm **`Strategy_Name`** (never missing), **`Paper_Trade_Success_Rate`**, and **`Confidence_Level`**. Auto-refreshes every 5 minutes or when you click the **Refresh** button above."
-        )
-
-        if not fresh_paper_df.empty and "Entry_Date" in fresh_paper_df.columns:
-            today_str = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
-            today_sub = fresh_paper_df[fresh_paper_df["Entry_Date"].astype(str) == today_str]
-            if today_sub.empty:
-                today_sub = fresh_paper_df[fresh_paper_df["Entry_Date"].astype(str) == V3_EXPERT_MONDAY_START_DATE]
-
-            td_pnl = float(today_sub["PnL_INR"].sum()) if not today_sub.empty else 0.0
-            td_net_chg = float(today_sub["Net_PnL_After_Charges_INR"].sum()) if (not today_sub.empty and "Net_PnL_After_Charges_INR" in today_sub.columns) else td_pnl
-            td_post_tax = float(today_sub["Post_Tax_PnL_INR"].sum()) if (not today_sub.empty and "Post_Tax_PnL_INR" in today_sub.columns) else td_net_chg * 0.80
-            td_cnt = len(today_sub)
-
-            tot_f_pnl = float(fresh_paper_df["PnL_INR"].sum())
-            tot_f_chg = float(fresh_paper_df["Platform_Charges_INR"].sum()) if "Platform_Charges_INR" in fresh_paper_df.columns else (len(fresh_paper_df) * 20.02)
-            tot_f_net_chg = float(fresh_paper_df["Net_PnL_After_Charges_INR"].sum()) if "Net_PnL_After_Charges_INR" in fresh_paper_df.columns else (tot_f_pnl - tot_f_chg)
-            tot_f_cnt = len(fresh_paper_df)
-            tot_f_wins = int((fresh_paper_df["PnL_INR"] > 0).sum())
-            tot_f_wr = (tot_f_wins / tot_f_cnt * 100.0) if tot_f_cnt > 0 else 0.0
-
-            strat_a_m = v3_summary_meta.get("strategy_a_baseline_metrics", {}) if isinstance(v3_summary_meta, dict) else {}
-            post_tax_a_profit = float(strat_a_m.get("post_tax_profit_inr", max(0.0, tot_f_net_chg) * 0.80))
-            xirr_a_pct = float(strat_a_m.get("annualized_xirr_pct", 209.53))
-
-            b_tot_cnt = int(v3_summary_meta.get("shadow_validated_trades", len(v3_shadow_sec2_df)))
-            b_mon_cnt = int(v3_summary_meta.get("monday_live_trades_count", len(v3_live_sec2_df)))
-            b_wr_pct = float(v3_summary_meta.get("shadow_net_wr_pct", 97.1))
-            b_post_tax = float(v3_summary_meta.get("shadow_post_tax_pnl_inr", 2757.39))
-            b_mon_pt = float(v3_summary_meta.get("monday_live_post_tax_pnl_inr", 1187.42))
-            b_xirr_pct = float(v3_summary_meta.get("shadow_annualized_xirr_pct", 594.97))
-
-            fk1, fk2, fk3, fk4 = st.columns(4)
-            fk1.metric(
-                f"🟣 Strategy B (2-Expert) Mon ({V3_EXPERT_MONDAY_START_DATE}) & Total",
-                f"Mon: ₹+{b_mon_pt:,.2f} ({b_mon_cnt} Trades) | Total: ₹+{b_post_tax:,.2f}",
-                f"Paper WR: {b_wr_pct:.1f}% ({b_tot_cnt} Trades) | +{b_xirr_pct:.1f}% XIRR",
-            )
-            fk2.metric(
-                f"🟢 Strategy A (1st Stable) Mon ({V3_EXPERT_MONDAY_START_DATE}) & Total",
-                f"Mon: ₹+{td_post_tax:,.2f} ({td_cnt} Trades) | Total: ₹+{post_tax_a_profit:,.2f}",
-                f"Paper WR: {tot_f_wr:.1f}% ({tot_f_cnt} Trades) | +{xirr_a_pct:.1f}% XIRR",
-            )
-            fk3.metric(
-                "🔮 Advance Upcoming Trades Ready (Strategy B vs A)",
-                f"Strategy B: {len(probable_b_df)} | Strategy A: {len(probable_a_df)}",
-                "Sorted by Best-Performing Strategy on Top (100% Paper WR First)",
-            )
-            fk4.metric(
-                "🏆 Top-Performing Paper Strategies (100% WR in B)",
-                "L4 Shield, L1 ORB, OP_S2, OP_S1, OP_S3",
-                "100.0% Paper Win Rate in Strategy B | Auto-Refreshes Every 5m",
-            )
-
-        s2_ctrl1, s2_ctrl2, s2_ctrl3 = st.columns([1.8, 1.4, 1.4])
-        sec2_sort_mode = s2_ctrl1.selectbox(
-            "🏆 Sort Section 2 Strategy A & Strategy B Tables By",
-            options=[
-                "🏆 Best-Performing Strategies on Top (Highest Paper Trade Success Rate -> Strategy Post-Tax P&L -> Confidence Level)",
-                "🕒 Chronological Order (Latest Date & Entry Time First)",
-                "🎯 Highest Confidence Level First (Confidence Score % -> Paper Trade Success Rate)",
-            ],
-            index=0,
-            key="sec2_sort_mode_select",
-        )
-        unique_dates = (
-            sorted(fresh_paper_df["Entry_Date"].astype(str).unique().tolist(), reverse=True)
-            if not fresh_paper_df.empty and "Entry_Date" in fresh_paper_df.columns
-            else [V3_EXPERT_MONDAY_START_DATE, "2026-10-28", APP_CREATED_DATE]
-        )
-        date_filter_opts = ["All Sessions (" + ", ".join(unique_dates) + ")"] + [
-            f"{d} (Monday Live Session)" if d == V3_EXPERT_MONDAY_START_DATE
-            else (f"{d} (Day 1 - App Created)" if d == APP_CREATED_DATE else d)
-            for d in unique_dates
-        ]
-        sel_date_opt = s2_ctrl2.selectbox(
-            "📅 Filter Section 2 Trades by Session Date",
-            options=date_filter_opts,
-            index=0,
-            key="fresh_paper_date_filter",
-        )
-        strat_list_opts = (
-            [
-                "All Strategies (Top-3 CNC L1–L6 + 1m Operator OP_S1–OP_S3)",
-                "Top-3 Daily CNC Sniper Paper Trades Only (L1–L6 | 5m Replay)",
-                "1-Minute Operator Auto-Trades Only (OP_S1–OP_S3 | 1m Replay)",
-            ]
-            + (strat_scorecard_df["Strategy_ID"].tolist() if not strat_scorecard_df.empty else [])
-        )
-        sel_strat_opt = s2_ctrl3.selectbox(
-            "🎯 Filter Section 2 Trades by Strategy / Desk",
-            options=strat_list_opts,
-            index=0,
-            key="fresh_paper_strat_filter",
-        )
-
-        def _sort_sec2_trade_df(df_tr: pd.DataFrame, engine_tag: str) -> pd.DataFrame:
-            df_e = _enrich_and_sort_best_strategies_top(
-                df_tr,
-                engine_mode=engine_tag,
-                sort_by_best_perf=sec2_sort_mode.startswith("🏆"),
-                is_candidate_table=False,
-            )
-            if df_e.empty:
-                return df_e
-            if not sel_date_opt.startswith("All Sessions"):
-                picked_d = sel_date_opt.split(" ")[0].strip()
-                df_e = df_e[df_e["Entry_Date"].astype(str) == picked_d].copy()
-            if sel_strat_opt.startswith("Top-3 Daily CNC"):
-                df_e = df_e[df_e["Strategy_ID"].astype(str).str.startswith("L")].copy()
-            elif sel_strat_opt.startswith("1-Minute Operator"):
-                df_e = df_e[df_e["Strategy_ID"].astype(str).str.startswith("OP_")].copy()
-            elif not sel_strat_opt.startswith("All Strategies"):
-                df_e = df_e[df_e["Strategy_ID"] == sel_strat_opt].copy()
-
-            if sec2_sort_mode.startswith("🕒 Chronological"):
-                s_c = [c for c in ["Entry_Date", "Entry_Time_IST"] if c in df_e.columns]
-                if s_c:
-                    df_e = df_e.sort_values(by=s_c, ascending=[False] * len(s_c)).reset_index(drop=True)
-            elif sec2_sort_mode.startswith("🎯 Highest Confidence"):
-                s_c = [c for c in ["Confidence_Score_Pct", "Strategy_Paper_WR_Pct", "Strategy_Paper_PostTax_INR", "PnL_INR"] if c in df_e.columns]
-                if s_c:
-                    df_e = df_e.sort_values(by=s_c, ascending=[False] * len(s_c)).reset_index(drop=True)
-            else:
-                s_c = [c for c in ["Strategy_Paper_WR_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct", "PnL_INR"] if c in df_e.columns]
-                if s_c:
-                    df_e = df_e.sort_values(by=s_c, ascending=[False] * len(s_c)).reset_index(drop=True)
-            return df_e
-
-        st.markdown(
-            "##### 🔮 2A. Advance Queue of Trades Going to Happen Next (`Strategy A` & `Strategy B` — Sorted by Best-Performing Strategy on Top | `First 3 Columns Frozen`)"
-        )
-        if not probable_df.empty:
-            sec2_adv_df = probable_df.copy()
-            if sel_strat_opt.startswith("Top-3 Daily CNC"):
-                sec2_adv_df = sec2_adv_df[sec2_adv_df["Strategy_ID"].astype(str).str.startswith("L")].copy()
-            elif sel_strat_opt.startswith("1-Minute Operator"):
-                sec2_adv_df = sec2_adv_df[sec2_adv_df["Strategy_ID"].astype(str).str.startswith("OP_")].copy()
-            elif not sel_strat_opt.startswith("All Strategies"):
-                sec2_adv_df = sec2_adv_df[sec2_adv_df["Strategy_ID"] == sel_strat_opt].copy()
-
-            sec2_adv_cols = [
-                "Priority_And_Slot",
-                "Ticker",
-                "Strategy_Name",
-                "Paper_Trade_Success_Rate",
-                "Confidence_Level",
-                "Strategy_A_vs_B_Execution_Plan",
-                "Trigger_Proximity_Status",
-                "Order_Side",
-                "Recommended_Entry_Price",
-                "Recommended_Stop_Loss",
-                "Safe_T1_And_Trail_SL_Levels",
-                "Recommended_Exit_Target",
-                "Live_LTP_And_Gap",
-                "Qty_For_20K_And_Capital",
-                "Est_Profit_Vs_Risk_INR",
-                "Strategy_ID",
-            ]
-            avail_s2_adv = [c for c in sec2_adv_cols if c in sec2_adv_df.columns]
-            render_frozen_3col_dataframe(sec2_adv_df[avail_s2_adv].head(18), height=300)
-
-        sec2_trade_display_cols = [
-            "Entry_Date",
-            "Ticker",
-            "Strategy_Name",
-            "Paper_Trade_Success_Rate",
-            "Confidence_Level",
-            "Performance_Verdict",
-            "Entry_To_Exit_Time",
-            "Entry_Time_IST",
-            "Exit_Time_IST",
-            "Exit_Trigger_Reason",
-            "Strategy_ID",
-            "Paper_Order_Side",
-            "Entry_Price",
-            "Exit_Or_Live_Price",
-            "Qty_20K",
-            "Capital_Used_INR",
-            "PnL_INR",
-            "Platform_Charges_INR",
-            "Net_PnL_After_Charges_INR",
-            "Post_Tax_PnL_INR",
-            "PnL_Pct",
-            "Initial_SL",
-            "Trailing_SL",
-            "Target_Price",
-            "Trade_Status",
-            "Trigger_And_Exit_Audit",
-            "Trade_ID",
-        ]
-
-        st.markdown(
-            f"##### 🟣 2B. Strategy B (`2-Expert Critic Strategy`) Paper Trade Execution Table — Confirmed `Strategy_Name`, `Paper_Trade_Success_Rate` & `Confidence_Level` (`Best-Performing Strategies on Top` | `First 3 Columns Frozen`)"
-        )
-        view_b_sec2_df = _sort_sec2_trade_df(v3_shadow_sec2_df, engine_tag="B")
-        if not view_b_sec2_df.empty:
-            avail_b_s2_cols = [c for c in sec2_trade_display_cols if c in view_b_sec2_df.columns]
-            render_frozen_3col_dataframe(view_b_sec2_df[avail_b_s2_cols], height=350)
-
-        st.markdown(
-            f"##### 🟢 2C. Strategy A (`1st Stable Version`) Paper Trade Execution Table — Confirmed `Strategy_Name`, `Paper_Trade_Success_Rate` & `Confidence_Level` (`Best-Performing Strategies on Top` | `First 3 Columns Frozen`)"
-        )
-        view_a_sec2_df = _sort_sec2_trade_df(fresh_paper_df, engine_tag="A")
-        if not view_a_sec2_df.empty:
-            avail_a_s2_cols = [c for c in sec2_trade_display_cols if c in view_a_sec2_df.columns]
-            render_frozen_3col_dataframe(view_a_sec2_df[avail_a_s2_cols], height=350)
-
-        st.markdown(
-            f"##### 🏆 2D. All 9 Strategies Ranked by Paper-Trade Performance (`Strategy A` vs `Strategy B` — Best-Performing Strategies on Top | `First 3 Columns Frozen`)"
-        )
-        if not v3_scorecard_sec2_df.empty:
-            sc_sec2 = v3_scorecard_sec2_df.copy()
-            if "Strategy_Name" not in sc_sec2.columns and "Strategy_Name_And_Mode" in sc_sec2.columns:
-                sc_sec2["Strategy_Name"] = sc_sec2["Strategy_Name_And_Mode"]
-            s2_sc_cols = [
-                "Strategy_ID",
-                "Strategy_Name",
-                "Paper_Trade_Success_Rate",
-                "Confidence_Level",
-                "StratB_Total_Trades_3D",
-                "StratB_Net_WR_Pct",
-                "StratB_Post_Tax_PnL_INR",
-                "StratA_Total_Trades_3D",
-                "StratA_Net_WR_Pct",
-                "StratA_Post_Tax_PnL_INR",
-                "Post_Tax_Alpha_B_vs_A_INR",
-                "Two_Expert_Active_Rule_In_Strategy_B",
-            ]
-            avail_s2_sc = [c for c in s2_sc_cols if c in sc_sec2.columns]
-            render_frozen_3col_dataframe(sc_sec2[avail_s2_sc], height=330)
-        elif not strat_scorecard_df.empty:
-            render_frozen_3col_dataframe(strat_scorecard_df, height=330)
-
-        with st.expander("🗓️ View Strategy A Standalone Day-by-Day Capital, Platform Charges, 20% Tax & XIRR Table", expanded=False):
-            if not daily_summary_df.empty:
-                render_frozen_3col_dataframe(daily_summary_df, height=195)
-
-    # =========================================================================
-    # SECTION 3: STRATEGY A (1ST STABLE VERSION) vs STRATEGY B (2-EXPERT CRITIC
-    #   STRATEGY — LIVE FROM MONDAY 2026-11-02)
-    #   Side-by-Side Comparison Across ALL 4 Tables (3A, 3B, 3C, 3D)
-    # =========================================================================
-    st.markdown("---")
-    v3_live_df = load_csv("v3_expert_fresh_paper_ledger.csv")
-    v3_shadow_df = load_csv("v3_expert_shadow_validation_ledger.csv")
-    v3_daily_df = load_csv("v3_expert_daily_summary.csv")
-    v3_scorecard_df = load_csv("v3_expert_strategy_scorecard.csv")
-    v3_ab_trades_df = load_csv("v3_expert_ab_trade_by_trade_log.csv")
-    v3_traps_df = load_csv("v3_expert_rejected_traps_log.csv")
-    strat_a_meta = v3_summary_meta.get("strategy_a_baseline_metrics", {}) if isinstance(v3_summary_meta, dict) else {}
-
-    with st.container(border=True):
-        st.markdown(
-            f"### ⚖️🟣 Section 3: Strategy A (`1st Stable Version`) vs Strategy B (`2-Expert Critic Strategy` — Live From Monday `{V3_EXPERT_MONDAY_START_DATE}`) — Side-by-Side Comparison Across ALL Tables"
-        )
-        st.caption(
-            f"**Why Section 3 Shows Both Strategy A & Strategy B Together**: "
-            f"Every table below (**3A Day-by-Day Summary**, **3B 9-Strategy Scorecard**, **3C Trade-by-Trade Execution Log**, and **3D Blocked Trap & Ratchet Audit**) places **Strategy A (`1st Stable Version`)** and **Strategy B (`2-Expert Critic Strategy`)** side-by-side so you can directly compare **how many trades were done under both (`37` in A vs `34` in B total; `12` in A vs `11` in B on Monday `{V3_EXPERT_MONDAY_START_DATE}`)**, **Win Rate (`78.4%` vs `97.1%`)**, **Peak Capital (`₹1.31L` vs `₹1.19L/day`)**, **Platform Charges + 20% Tax**, and **Annualized Post-Tax XIRR (`+209.53%` vs `+594.97%`)**."
-        )
-
-        a_tot_tr = int(v3_summary_meta.get("strat_a_total_trades", 37))
-        b_tot_tr = int(v3_summary_meta.get("shadow_validated_trades", 34))
-        a_mon_tr = int(v3_summary_meta.get("monday_live_trades_a_count", 12))
-        b_mon_tr = int(v3_summary_meta.get("monday_live_trades_count", 11))
-        a_mon_pt = float(v3_summary_meta.get("monday_live_post_tax_pnl_a_inr", 855.59))
-        b_mon_pt = float(v3_summary_meta.get("monday_live_post_tax_pnl_inr", 1187.42))
-
-        st.success(
-            f"🟢 **MONDAY (`{V3_EXPERT_MONDAY_START_DATE}`) LIVE AUTO-TRADE SESSION ACTIVE IN BOTH ENGINES**: "
-            f"**Strategy A (`1st Stable`)** executed **`{a_mon_tr}` trades** (`3` CNC + `9` Op 1m -> **`₹+{a_mon_pt:,.2f}`** Post-Tax) | "
-            f"**Strategy B (`2-Expert Critic`)** executed **`{b_mon_tr}` trades** (`3` CNC + `8` Op 1m -> **`₹+{b_mon_pt:,.2f}`** Post-Tax, **`+₹{b_mon_pt - a_mon_pt:,.2f}` Monday Alpha**)."
-        )
-
-        ab1, ab2, ab3, ab4, ab5 = st.columns(5)
-        ab1.metric(
-            "📊 Trades Done (Strategy A vs B)",
-            f"A: {a_tot_tr} (12.3/d) | B: {b_tot_tr} (11.3/d)",
-            f"Mon {V3_EXPERT_MONDAY_START_DATE}: A={a_mon_tr} (3 CNC+9 Op) vs B={b_mon_tr} (3 CNC+8 Op)",
-        )
-        ab2.metric(
-            f"🟢 Monday ({V3_EXPERT_MONDAY_START_DATE}) Post-Tax",
-            f"A: ₹+{a_mon_pt:,.2f} vs B: ₹+{b_mon_pt:,.2f}",
-            f"+₹{b_mon_pt - a_mon_pt:,.2f} (+{((b_mon_pt - a_mon_pt) / max(1.0, a_mon_pt) * 100.0):.1f}%) Monday Alpha in B",
-        )
-        ab3.metric(
-            "🎯 Net Win Rate (Strategy A vs B)",
-            f"A: {float(v3_summary_meta.get('strat_a_net_wr_pct', 78.4)):.1f}% vs B: {float(v3_summary_meta.get('shadow_net_wr_pct', 97.1)):.1f}%",
-            f"A: 29W/8L vs B: 33W/1L (+{float(v3_alpha_meta.get('net_wr_improvement_pct', 18.7)):.1f}% WR Improvement)",
-        )
-        ab4.metric(
-            "💵 3-Day Post-Tax Profit (A vs B)",
-            f"A: ₹+{float(v3_summary_meta.get('strat_a_post_tax_pnl_inr', 1765.61)):,.2f} | B: ₹+{float(v3_summary_meta.get('shadow_post_tax_pnl_inr', 2757.39)):,.2f}",
-            f"+₹{float(v3_alpha_meta.get('post_tax_profit_alpha_inr', 991.78)):,.2f} (+{float(v3_alpha_meta.get('post_tax_profit_alpha_pct', 56.2)):.1f}%) Post-Tax Alpha",
-        )
-        ab5.metric(
-            "🚀 Annualized Post-Tax XIRR (A vs B)",
-            f"A: +{float(v3_summary_meta.get('strat_a_annualized_xirr_pct', 209.53)):.1f}% | B: +{float(v3_summary_meta.get('shadow_annualized_xirr_pct', 594.97)):.1f}%",
-            f"+{float(v3_alpha_meta.get('annualized_xirr_alpha_pct', 385.44)):.2f}% XIRR Alpha | ₹{abs(float(v3_alpha_meta.get('peak_capital_saved_per_day_inr', -11953.57))):,.0f}/d Less Cap",
-        )
-
-        st.markdown(
-            f"##### 🗓️ 3A. Day-by-Day Side-by-Side Comparison: `Strategy A (1st Stable)` vs `Strategy B (2-Expert Critic)` — Trades Done (`CNC | Op`), Win Rate, Peak Capital, Charges, `20%` Tax & XIRR (`First 3 Columns Frozen`)"
-        )
-        if not v3_daily_df.empty:
-            render_frozen_3col_dataframe(v3_daily_df, height=215)
-
-        st.markdown(
-            f"##### 📊 3B. All 9 Strategies (`L1–L6` CNC & `OP_S1–OP_S3` 1m Operator) Side-by-Side Scorecard: `Strategy A` vs `Strategy B` — Total & Monday Trades Done, Win Rate, Charges+Tax & Post-Tax Alpha (`First 3 Columns Frozen`)"
-        )
-        if not v3_scorecard_df.empty:
-            render_frozen_3col_dataframe(v3_scorecard_df, height=415)
-
-        st.markdown(
-            f"##### ⏰ 3C. Trade-by-Trade Side-by-Side Execution Comparison Log: `Strategy A (1st Stable)` vs `Strategy B (2-Expert Critic)` — Every Trade Event, Entry->Exit Time, Price & Post-Tax Alpha (`First 3 Columns Frozen`)"
-        )
-        if not v3_ab_trades_df.empty:
-            ab_f1, ab_f2, ab_f3 = st.columns([1.5, 1.5, 1.6])
-            ab_dates = sorted(v3_ab_trades_df["Entry_Date"].astype(str).unique().tolist(), reverse=True)
-            ab_date_opts = [
-                "All 3 Sessions (" + ", ".join(ab_dates) + f" — {a_tot_tr} A Trades vs {b_tot_tr} B Trades)",
-                f"🟢 Monday {V3_EXPERT_MONDAY_START_DATE} Live Session Only ({a_mon_tr} A Trades vs {b_mon_tr} B Trades)",
-            ] + [d for d in ab_dates if d != V3_EXPERT_MONDAY_START_DATE]
-            sel_ab_date = ab_f1.selectbox(
-                "📅 Filter Side-by-Side Trades by Session Date",
-                options=ab_date_opts,
-                index=0,
-                key="ab_side_by_side_date_filter",
-            )
-            sel_ab_desk = ab_f2.selectbox(
-                "🎯 Filter Side-by-Side Trades by Strategy / Desk",
-                options=[
-                    "All Strategies (Top-3 CNC L1–L6 + Operator 1m OP_S1–OP_S3)",
-                    "Top-3 Daily CNC Sniper Only (L1–L6 | 3.0 Trades/Day in Both A & B)",
-                    "1-Minute Operator Auto-Trades Only (OP_S1–OP_S3 | 9.3/d in A vs 8.3/d in B)",
-                ],
-                index=0,
-                key="ab_side_by_side_desk_filter",
-            )
-            sel_ab_diff = ab_f3.selectbox(
-                "🔍 Filter by Strategy A vs B Comparison Status",
-                options=[
-                    f"All Trade Events ({len(v3_ab_trades_df)} Combined A/B Events)",
-                    "⚡ Only Divergent Trades (7 Blocked Traps, 3 Parabolic Ratchets & 4 Unlocked Springs)",
-                    "🛡️ Only Blocked Falling-Knife & Counter-Trend Traps (7 Losing A Trades -> ₹0 in B)",
-                    "🟣 Only Parabolic Ratchet & Support-Spring Upgrades (B Outperformed A)",
-                ],
-                index=0,
-                key="ab_side_by_side_diff_filter",
-            )
-
-            shown_ab_df = v3_ab_trades_df.copy()
-            if sel_ab_date.startswith("🟢 Monday"):
-                shown_ab_df = shown_ab_df[shown_ab_df["Entry_Date"].astype(str) == V3_EXPERT_MONDAY_START_DATE].copy()
-            elif not sel_ab_date.startswith("All 3 Sessions"):
-                shown_ab_df = shown_ab_df[shown_ab_df["Entry_Date"].astype(str) == sel_ab_date.strip()].copy()
-
-            if sel_ab_desk.startswith("Top-3 Daily CNC"):
-                shown_ab_df = shown_ab_df[
-                    shown_ab_df["StratA_Strategy_ID"].astype(str).str.startswith("L")
-                    | shown_ab_df["StratB_Strategy_ID"].astype(str).str.startswith("L")
-                ].copy()
-            elif sel_ab_desk.startswith("1-Minute Operator"):
-                shown_ab_df = shown_ab_df[
-                    shown_ab_df["StratA_Strategy_ID"].astype(str).str.startswith("OP_")
-                    | shown_ab_df["StratB_Strategy_ID"].astype(str).str.startswith("OP_")
-                ].copy()
-
-            if sel_ab_diff.startswith("⚡ Only Divergent"):
-                shown_ab_df = shown_ab_df[~shown_ab_df["Execution_Status_A_vs_B"].astype(str).str.startswith("✅ BOTH")].copy()
-            elif sel_ab_diff.startswith("🛡️ Only Blocked"):
-                shown_ab_df = shown_ab_df[shown_ab_df["Execution_Status_A_vs_B"].astype(str).str.startswith("🛡️")].copy()
-            elif sel_ab_diff.startswith("🟣 Only Parabolic"):
-                shown_ab_df = shown_ab_df[
-                    shown_ab_df["Execution_Status_A_vs_B"].astype(str).str.startswith("🟣")
-                    | shown_ab_df["Execution_Status_A_vs_B"].astype(str).str.startswith("🚀")
-                ].copy()
-
-            render_frozen_3col_dataframe(shown_ab_df, height=390)
-
-        st.markdown(
-            f"##### 🛡️ 3D. Strategy A Losing/Giver Traps vs Strategy B 2-Expert Interception & Ratchet Audit (`7` Traps Blocked + `3` Winners Ratcheted Saving `₹+722.99` Post-Tax | `First 3 Columns Frozen`)"
-        )
-        if not v3_traps_df.empty:
-            render_frozen_3col_dataframe(v3_traps_df, height=280)
-
-        with st.expander(
-            f"📂 Inspect Standalone Strategy B Raw Execution Ledgers (`Monday Live Ledger: {len(v3_live_df)} Trades` | `All 3-Day Validated Ledger: {len(v3_shadow_df)} Trades`)",
-            expanded=False,
-        ):
-            v3_raw_mode = st.radio(
-                "Select Standalone Strategy B Ledger:",
-                options=[
-                    f"🟢 Monday Live Forward Auto-Trade Ledger (`>= {V3_EXPERT_MONDAY_START_DATE}` — {len(v3_live_df)} Live Trades)",
-                    f"🧪 Complete 3-Day Strategy B Validated Ledger (`2026-10-27`, `2026-10-28` & `{V3_EXPERT_MONDAY_START_DATE}` — {len(v3_shadow_df)} Trades)",
-                ],
-                index=0,
-                horizontal=True,
-                key="v3_standalone_raw_radio",
-            )
-            raw_b_df = v3_live_df if v3_raw_mode.startswith("🟢") else v3_shadow_df
-            if not raw_b_df.empty:
-                avail_v3_cols = [c for c in fresh_display_cols if c in raw_b_df.columns]
-                render_frozen_3col_dataframe(raw_b_df[avail_v3_cols], height=310)
 
 
 def render_manual_order_builder_and_scanner_tab():
@@ -1672,8 +796,8 @@ def render_manual_order_builder_and_scanner_tab():
                 ex_c1, ex_c2 = st.columns([1.5, 1.5])
                 eod_315_rule = ex_c1.checkbox(
                     "⏰ Auto-Exit at 3:15 PM IST Candle Close (Intraday Rule)",
-                    value=True,
-                    key="eod_315pm_auto_exit_toggle",
+                    value=bool(st.session_state.get("eod_315pm_auto_exit_toggle", True)),
+                    key="tab3_eod_315pm_auto_exit_toggle",
                     help="When checked, if neither SL/Trail nor Target is hit between Purchase_Time+5m and 3:15 PM, the trade automatically exits on the 3:15 PM candle close.",
                 )
                 replay_sync_price = ex_c2.checkbox(
@@ -1801,35 +925,72 @@ def render_manual_order_builder_and_scanner_tab():
         op_signals_all = load_csv("live_operator_1m_signals.csv")
         op_trades_all = load_csv("operator_auto_trades.csv")
         bel_oct16_df = load_csv("bel_oct16_operator_validation.csv")
-        v3_sc_tab2 = load_csv("v3_expert_strategy_scorecard.csv")
-        v3_ab_tab2 = load_csv("v3_expert_ab_trade_by_trade_log.csv")
 
-        # Separate Operator Auto-Trade Performance KPIs
+        # Real-time Operator 1m KPIs strictly from closed rows in operator_auto_trades.csv
+        op_closed_df = (
+            op_trades_all[
+                ~op_trades_all["Status"].astype(str).str.upper().str.contains("ACTIVE|OPEN|PENDING|MONITORING", na=False)
+            ].copy()
+            if (not op_trades_all.empty and "Status" in op_trades_all.columns)
+            else pd.DataFrame()
+        )
+        op_open_cnt = max(0, len(op_trades_all) - len(op_closed_df))
+        op_buy_sub = (
+            op_closed_df[op_closed_df["Signal_Side"].astype(str).str.upper().str.contains("BUY", na=False)]
+            if (not op_closed_df.empty and "Signal_Side" in op_closed_df.columns)
+            else pd.DataFrame()
+        )
+        op_sell_sub = (
+            op_closed_df[op_closed_df["Signal_Side"].astype(str).str.upper().str.contains("SELL|SHORT", na=False)]
+            if (not op_closed_df.empty and "Signal_Side" in op_closed_df.columns)
+            else pd.DataFrame()
+        )
+
+        def _op_sub_stats(df_sub: pd.DataFrame):
+            if df_sub is None or df_sub.empty:
+                return 0, 0, 0, 0.0, 0.0
+            pnl_s = pd.to_numeric(df_sub.get("PnL_INR", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+            net_s = (
+                pd.to_numeric(df_sub["Net_PnL_After_Charges_INR"], errors="coerce").fillna(pnl_s)
+                if "Net_PnL_After_Charges_INR" in df_sub.columns
+                else pnl_s
+            )
+            wins = int((net_s > 0).sum())
+            losses = len(df_sub) - wins
+            wr = round(wins / max(len(df_sub), 1) * 100.0, 1)
+            net_sum = float(net_s.sum())
+            pt = round(net_sum * 0.80 if net_sum > 0 else net_sum, 2)
+            return len(df_sub), wins, losses, wr, pt
+
+        n_op_c, w_op_c, l_op_c, wr_op_c, pt_op_c = _op_sub_stats(op_closed_df)
+        n_ob, w_ob, l_ob, wr_ob, pt_ob = _op_sub_stats(op_buy_sub)
+        n_os, w_os, l_os, wr_os, pt_os = _op_sub_stats(op_sell_sub)
+
         ok1, ok2, ok3, ok4, ok5 = st.columns(5)
         ok1.metric(
-            "Operator 1m Net Post-Tax (A vs B)",
-            "A: ₹+716.52 vs B: ₹+1,610.12",
-            "+₹893.60 (+124.7%) Operator Post-Tax Alpha in Strategy B",
+            "Operator 1m Closed Post-Tax (Real)",
+            f"₹{pt_op_c:+,.2f}",
+            f"{n_op_c} Closed ({w_op_c}W/{l_op_c}L) | {op_open_cnt} Open",
         )
         ok2.metric(
-            "Operator 1m Trades Done (A vs B)",
-            "A: 28 (20W/8L) | B: 25 (24W/1L)",
-            "Net WR: Strategy A 71.4% -> Strategy B 96.0%",
+            "Operator Closed Success Rate",
+            f"{wr_op_c:.1f}% WR",
+            f"Evaluated strictly on closed trades (3 bps slippage)",
         )
         ok3.metric(
-            "🟢 AUTO-BUY (OP_S1 + OP_S2) Post-Tax",
-            "A: ₹+381.95 vs B: ₹+1,100.07",
-            "A: 18 Trades (12W/6L) | B: 17 Trades (16W/1L)",
+            "🟢 BUY (CNC/MIS) OP_S1+S2",
+            f"₹{pt_ob:+,.2f}",
+            f"{n_ob} Closed ({w_ob}W/{l_ob}L | {wr_ob:.1f}% WR)",
         )
         ok4.metric(
-            "🔴 AUTO-SELL (OP_S3) Post-Tax",
-            "A: ₹+334.57 vs B: ₹+510.05",
-            "A: 10 Trades (8W/2L) | B: 8 Trades (8W/0L — 100% WR)",
+            "🔴 SHORT SELL (MIS Only) OP_S3",
+            f"₹{pt_os:+,.2f}",
+            f"{n_os} Closed ({w_os}W/{l_os}L | {wr_os:.1f}% WR)",
         )
         ok5.metric(
-            "📌 BEL Oct 16 (12:02 PM) P&L",
-            f"₹{float(op_perf.get('bel_oct16_verified_pnl_inr', 0)):+,.2f}",
-            "4/4 Validated Signals (1.53M Fut / 76.1K Cash)",
+            "📡 Detected 1m Shocks Today/Cache",
+            f"{len(op_signals_all)} Shocks",
+            "Prime Window 09:40–11:15 IST | >= ₹1.5 Cr",
         )
 
         # Interactive Controls for 1-Minute Operator Scan & Auto-Trade Replay
@@ -1843,10 +1004,14 @@ def render_manual_order_builder_and_scanner_tab():
             ):
                 with st.spinner("Running 2-Stage NIFTY 250 1-Minute Operator Volume-Shock Scan & T+2m Auto-Trade Replay..."):
                     fresh_sig = scan_operator_1m_footprints()
-                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(fresh_sig)
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(
+                        fresh_sig,
+                        enable_mis_short=st.session_state.get("enable_mis_short_toggle", True),
+                        current_regime=regime_rep.get("regime_badge") if isinstance(regime_rep, dict) else None,
+                    )
                     st.session_state["last_op_scan_msg"] = (
-                        f"✅ Scanned NIFTY 250 1m Operator Footprints | **{len(fresh_trd)} Confirmed Auto-Trades (`BUY` & `SELL`)** | "
-                        f"Separate Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`** (`{float(fresh_perf.get('win_rate_pct', 0)):.1f}% WR`)"
+                        f"✅ Scanned NIFTY 250 1m Operator Footprints | **{len(fresh_trd)} Confirmed Auto-Trades (`BUY CNC/MIS` & `SHORT SELL MIS`)** | "
+                        f"Closed Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`** (`{float(fresh_perf.get('win_rate_pct', 0)):.1f}% Closed WR`)"
                     )
                 st.rerun()
         with op_c2:
@@ -1855,21 +1020,24 @@ def render_manual_order_builder_and_scanner_tab():
                 use_container_width=True,
                 key="btn_re_eval_operator_1m",
             ):
-                with st.spinner("Re-evaluating 1-minute candles (SL, Stage-1/2/3 Trail, Target & 3:15 PM Auto-Close)..."):
-                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(op_signals_all)
+                with st.spinner("Re-evaluating 1-minute candles (SL, Cost+ Ratchet, Target & 3:15 PM Auto-Close)..."):
+                    fresh_trd, fresh_perf = auto_execute_and_evaluate_operator_trades(
+                        op_signals_all,
+                        enable_mis_short=st.session_state.get("enable_mis_short_toggle", True),
+                        current_regime=regime_rep.get("regime_badge") if isinstance(regime_rep, dict) else None,
+                    )
                     st.session_state["last_op_scan_msg"] = (
                         f"⏱️ Updated 1m Operator Auto-Trades at `{fresh_perf.get('last_5m_refresh_ist', '')}` | "
-                        f"Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`**"
+                        f"Closed Net P&L: **`₹{float(fresh_perf.get('total_net_pnl_inr', 0)):+,.2f}`**"
                     )
                 st.rerun()
         with op_c3:
             op_view_filter = st.selectbox(
                 "🎯 Filter Operator Auto-Trade & 1m Footprint View",
                 options=[
-                    "All Confirmed Auto-Trades (BUY + SELL Separate Ledger)",
-                    "🟢 AUTO-BUY Only (Operator Low Absorption & VWAP Markup)",
-                    "🔴 AUTO-SELL Only (Operator Supply Dump / Short)",
-                    "📌 BEL Oct 16 Validation Only (09:58 BUY, 11:08 SELL, 11:23 BUY, 12:02 PM 1.53M Vol SELL)",
+                    "All Confirmed Auto-Trades (BUY CNC/MIS + SHORT SELL MIS)",
+                    "🟢 BUY Only (OP_S1 Low Absorption & OP_S2 VWAP Markup — CNC/MIS)",
+                    "🔴 SHORT SELL Only (OP_S3 Supply Dump — MIS Only)",
                     "All Detected 1m Volume Shocks (Including Trap-Filtered Spikes)",
                 ],
                 index=0,
@@ -1879,29 +1047,12 @@ def render_manual_order_builder_and_scanner_tab():
         if "last_op_scan_msg" in st.session_state:
             st.success(st.session_state["last_op_scan_msg"])
 
-        st.markdown(
-            "##### 📊 Card 3A. Strategy A (`1st Stable`) vs Strategy B (`2-Expert Critic`) Side-by-Side Scorecard (`All 9 Strategies: OP_S1–OP_S3 + L1–L6` | `First 3 Columns Frozen`)"
-        )
-        st.caption(
-            "Compares paper trade count (`Total` & `Monday 2026-11-02`), Win/Loss ratio, Charges+Tax, and Net Post-Tax ₹ P&L side-by-side for **Strategy A vs Strategy B** across all 9 strategies."
-        )
-        if not v3_sc_tab2.empty:
-            render_frozen_3col_dataframe(v3_sc_tab2, height=380)
-
-        st.markdown(
-            "##### 📒 Card 3B. Side-by-Side Trade-by-Trade Execution Log (`Strategy A` vs `Strategy B` Across All 9 Strategies | `First 3 Columns Frozen`)"
-        )
-        if not v3_ab_tab2.empty:
-            render_frozen_3col_dataframe(v3_ab_tab2, height=380)
-
         # Apply filter to op_trades_all
         if not op_trades_all.empty:
-            if op_view_filter.startswith("🟢 AUTO-BUY"):
+            if op_view_filter.startswith("🟢"):
                 filtered_op_df = op_trades_all[op_trades_all["Signal_Side"] == "BUY"].copy()
-            elif op_view_filter.startswith("🔴 AUTO-SELL"):
+            elif op_view_filter.startswith("🔴"):
                 filtered_op_df = op_trades_all[op_trades_all["Signal_Side"] == "SELL"].copy()
-            elif op_view_filter.startswith("📌 BEL Oct 16"):
-                filtered_op_df = bel_oct16_df[bel_oct16_df["Signal_Side"].isin(["BUY", "SELL"])].copy() if not bel_oct16_df.empty else op_trades_all.copy()
             elif op_view_filter.startswith("All Detected"):
                 filtered_op_df = op_signals_all.copy() if not op_signals_all.empty else op_trades_all.copy()
             else:
@@ -2071,80 +1222,96 @@ def _enrich_signals_for_live_tab(df_in: pd.DataFrame, engine_mode: str = "B") ->
             ),
             axis=1,
         )
-        if "Paper_Trade_Success_Rate" not in df.columns:
-            df["Paper_Trade_Success_Rate"] = ""
-        df["Paper_Trade_Success_Rate"] = df.apply(
-            lambda r: (
-                str(r.get("Paper_Trade_Success_Rate", "")).strip()
-                if str(r.get("Paper_Trade_Success_Rate", "")).strip() not in ("", "nan", "None")
-                else perf_map_live.get(str(r.get(sid_col, "")).strip(), {}).get(
-                    "b_badge" if engine_mode == "B" else "ab_combined_badge",
-                    "🟢 97.8% Paper WR",
-                )
-            ),
-            axis=1,
+
+        # Pull real closed-trade telemetry from adaptive perf_map (same source as Tab 2 Scorecard)
+        badge_key = "StratB_Success_Str" if engine_mode == "B" else ("StratA_Success_Str" if engine_mode == "A" else "Combined_AB_Success_Str")
+        wr_key = "StratB_WR_Pct" if engine_mode != "A" else "StratA_WR_Pct"
+        wlb_key = "StratB_WLB_Pct" if engine_mode != "A" else "StratA_WLB_Pct"
+        xirr_key = "StratB_XIRR_Pct" if engine_mode != "A" else "StratA_XIRR_Pct"
+        pt_key = "StratB_Post_Tax_INR" if engine_mode != "A" else "StratA_Post_Tax_INR"
+
+        df["Paper_Trade_Success_Rate"] = df[sid_col].apply(
+            lambda s: str(perf_map_live.get(str(s).strip(), {}).get(badge_key, "⚪ Unproven (0 Closed)") or "⚪ Unproven (0 Closed)")
         )
-        wr_key = "b_wr" if engine_mode != "A" else "a_wr"
-        pt_key = "b_post_tax" if engine_mode != "A" else "a_post_tax"
-        if "Strategy_Paper_WR_Pct" not in df.columns:
-            df["Strategy_Paper_WR_Pct"] = df[sid_col].apply(
-                lambda s: float(perf_map_live.get(str(s).strip(), {}).get(wr_key, 85.0))
+        df["Strategy_Paper_WR_Pct"] = df[sid_col].apply(
+            lambda s: float(perf_map_live.get(str(s).strip(), {}).get(wr_key, 0.0) or 0.0)
+        )
+        df["StratB_WLB_Pct"] = df[sid_col].apply(
+            lambda s: float(perf_map_live.get(str(s).strip(), {}).get(wlb_key, 0.0) or 0.0)
+        )
+        df["StratB_XIRR_Pct"] = df[sid_col].apply(
+            lambda s: float(perf_map_live.get(str(s).strip(), {}).get(xirr_key, 0.0) or 0.0)
+        )
+        df["Adaptive_Rank_Score"] = df[sid_col].apply(
+            lambda s: float(perf_map_live.get(str(s).strip(), {}).get("Adaptive_Rank_Score", 0.0) or 0.0)
+        )
+        df["Strategy_Paper_PostTax_INR"] = df[sid_col].apply(
+            lambda s: float(perf_map_live.get(str(s).strip(), {}).get(pt_key, 0.0) or 0.0)
+        )
+        if "Product_Mode" not in df.columns:
+            df["Product_Mode"] = df[sid_col].apply(
+                lambda s: str(perf_map_live.get(str(s).strip(), {}).get("Product_Mode", "CNC" if str(s).strip().startswith("L") else "MIS"))
             )
-        if "Strategy_Paper_PostTax_INR" not in df.columns:
-            df["Strategy_Paper_PostTax_INR"] = df[sid_col].apply(
-                lambda s: float(perf_map_live.get(str(s).strip(), {}).get(pt_key, 0.0))
+
+        # Always compute real-time Confidence from closed-trade WLB + XIRR/expectancy + setup readiness
+        conf_scores = []
+        conf_badges = []
+        for _, r in df.iterrows():
+            sid_v = str(r.get(sid_col, "")).strip()
+            vol_v = float(pd.to_numeric(r.get("Vol_Spike_Mult_20m", r.get("Vol_Ratio_20D", 1.5)), errors="coerce") or 1.5)
+            c_sc, c_bd = _compute_confidence_badge(
+                strat_id=sid_v,
+                perf_map=perf_map_live,
+                readiness_or_conf=float(pd.to_numeric(r.get("Raw_Readiness_Score", 70.0), errors="coerce") or 70.0),
+                vol_mult=vol_v,
+                gap_pct=float(pd.to_numeric(r.get("Raw_Gap_Pct", 0.0), errors="coerce") or 0.0),
+                is_blocked_in_b=False,
+                prefer_engine="B" if engine_mode != "A" else "A",
             )
-        if "Confidence_Level" not in df.columns or (df["Confidence_Level"].astype(str).str.strip() == "").any():
-            conf_scores = []
-            conf_badges = []
-            for _, r in df.iterrows():
-                sid_v = str(r.get(sid_col, "")).strip()
-                ex_badge = str(r.get("Confidence_Level", "")).strip()
-                ex_score = float(r.get("Confidence_Score_Pct", 0.0) or 0.0)
-                if ex_badge not in ("", "nan", "None") and ex_score > 0:
-                    conf_scores.append(ex_score)
-                    conf_badges.append(ex_badge)
-                else:
-                    c_sc, c_bd = _compute_confidence_badge(
-                        strat_id=sid_v,
-                        perf_map=perf_map_live,
-                        readiness_or_conf=float(r.get("Raw_Readiness_Score", 90.0) or 90.0),
-                        vol_mult=2.5,
-                        gap_pct=float(r.get("Raw_Gap_Pct", 0.0) or 0.0),
-                        is_blocked_in_b=False,
-                        prefer_engine="B",
-                    )
-                    conf_scores.append(c_sc)
-                    conf_badges.append(c_bd)
-            df["Confidence_Score_Pct"] = conf_scores
-            df["Confidence_Level"] = conf_badges
+            conf_scores.append(c_sc)
+            conf_badges.append(c_bd)
+        df["Confidence_Score_Pct"] = conf_scores
+        df["Confidence_Level"] = conf_badges
 
     df = _add_signal_direction(df)
 
-    sort_cols = [c for c in ["Strategy_Paper_WR_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct"] if c in df.columns]
+    # Sort strictly highest success probability (Adaptive Rank / WLB) + max XIRR on top
+    sort_cols = [
+        c
+        for c in ["Adaptive_Rank_Score", "StratB_WLB_Pct", "StratB_XIRR_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct"]
+        if c in df.columns
+    ]
+    asc_flags = [False] * len(sort_cols)
+    if "Raw_Gap_Pct" in df.columns:
+        sort_cols.append("Raw_Gap_Pct")
+        asc_flags.append(True)
     if sort_cols:
-        df = df.sort_values(by=sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+        df = df.sort_values(by=sort_cols, ascending=asc_flags).reset_index(drop=True)
     return df
 
 
 @st.fragment(run_every="5m")
 def render_live_signals_tab():
     """
-    Tab 1: Live Actionable Signals — Strategy B Only (Top 10 by Confidence ≥85%).
-    Shows: (A) Top 10 BUY/SELL signals, (B) Active Exit Alerts & Open Positions, (C) Lock Candidate & Full Setups.
+    Tab 1: Adaptive Top-10 Live Entry & Exit Signals (Strategy B Quality Engine).
+    Sorted strictly by highest closed-trade success probability (Adaptive Rank / WLB) + max XIRR on top.
     """
+    eod_exit_enabled = st.session_state.get("eod_315pm_auto_exit_toggle", True)
+    mis_short_enabled = st.session_state.get("enable_mis_short_toggle", True)
+
     try:
-        auto_rollover_daily_top3_cnc(
-            eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True)
-        )
+        auto_rollover_daily_top3_cnc(eod_315pm_auto_exit=eod_exit_enabled)
     except Exception:
         pass
 
     auto_eval_df = evaluate_chronological_exits(
         trades_csv_path=SNIPER_TELEMETRY_CSV,
         force_full_replay=False,
-        eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+        eod_315pm_auto_exit=eod_exit_enabled,
     )
+
+    regime_rep = load_json("live_regime_report.json")
+    current_regime_badge = regime_rep.get("regime_badge") if isinstance(regime_rep, dict) else None
 
     now_ist_dt = pd.Timestamp.now(tz="Asia/Kolkata")
     today_ist_str = now_ist_dt.strftime("%Y-%m-%d")
@@ -2153,13 +1320,18 @@ def render_live_signals_tab():
         and ((now_ist_dt.hour == 9 and now_ist_dt.minute >= 15) or (10 <= now_ist_dt.hour <= 14) or (now_ist_dt.hour == 15 and now_ist_dt.minute <= 30))
     )
     existing_op_trades = load_csv("operator_auto_trades.csv")
+    date_col_op = (
+        "Session_Date"
+        if (not existing_op_trades.empty and "Session_Date" in existing_op_trades.columns)
+        else ("Entry_Date" if (not existing_op_trades.empty and "Entry_Date" in existing_op_trades.columns) else None)
+    )
     needs_post_market_catchup = (
         now_ist_dt.weekday() < 5
         and now_ist_dt.hour >= 10
         and (
             existing_op_trades.empty
-            or "Entry_Date" not in existing_op_trades.columns
-            or today_ist_str not in existing_op_trades["Entry_Date"].astype(str).values
+            or date_col_op is None
+            or today_ist_str not in existing_op_trades[date_col_op].astype(str).str[:10].values
         )
     )
     if is_live_market_hours or needs_post_market_catchup:
@@ -2170,30 +1342,35 @@ def render_live_signals_tab():
     else:
         cached_op_signals = load_csv("live_operator_1m_signals.csv")
 
-    op_trades_df, op_perf_summary = auto_execute_and_evaluate_operator_trades(
-        cached_op_signals if not cached_op_signals.empty else None
+    op_trades_df, _ = auto_execute_and_evaluate_operator_trades(
+        cached_op_signals if not cached_op_signals.empty else None,
+        enable_mis_short=mis_short_enabled,
+        current_regime=current_regime_badge,
     )
-    strat_scorecard_df, all_paper_trades_df = build_all_strategies_paper_ledger_and_scorecard(
-        op_trades_df=op_trades_df if not op_trades_df.empty else None
+    build_all_strategies_paper_ledger_and_scorecard(
+        op_trades_df=op_trades_df if not op_trades_df.empty else None,
+        current_regime=current_regime_badge,
     )
 
     try:
-        v3_engine_out = run_v3_two_expert_monday_auto_engine(
+        run_v3_two_expert_monday_auto_engine(
             watchlist_df=load_csv("live_watchlist_radar.csv"),
             sniper_df=load_csv("live_sniper_signals.csv"),
             op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
             force_rebuild_shadow=needs_post_market_catchup,
             force_refresh=needs_post_market_catchup,
+            enable_mis_short=mis_short_enabled,
+            current_regime=current_regime_badge,
         )
     except Exception:
-        v3_engine_out = {}
+        pass
 
     now_ist_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
     st.markdown(
-        f"⏱️ **Live Signal Engine: `ACTIVE (Every 5 Minutes)`** | "
+        f"⏱️ **Live Signal Engine: `ACTIVE (5m Auto-Refresh)`** | "
         f"Last Check: **`{now_ist_str}`** | "
-        f"**Strategy B (2-Expert Critic) — Top 10 Signals by Confidence ≥85%** | "
-        f"*Paper Trade Performance & Logs in Tab 2*"
+        f"**MIS Short Selling: `{'ON (OP_S3 MIS)' if mis_short_enabled else 'OFF (CNC Long-Only)'}`** | "
+        f"*Strictly Closed-Trade Telemetry (`>= {APP_CREATED_DATE}`)*"
     )
 
     ctrl1, ctrl2, ctrl3 = st.columns([1.8, 1.8, 1.4])
@@ -2204,12 +1381,19 @@ def render_live_signals_tab():
                 evaluate_chronological_exits(
                     trades_csv_path=SNIPER_TELEMETRY_CSV,
                     force_full_replay=True,
-                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                    eod_315pm_auto_exit=eod_exit_enabled,
                 )
+                rep_fresh = load_json("live_regime_report.json")
+                reg_fresh = rep_fresh.get("regime_badge") if isinstance(rep_fresh, dict) else current_regime_badge
                 new_op_sig = scan_operator_1m_footprints()
-                new_op_tr, _ = auto_execute_and_evaluate_operator_trades(new_op_sig)
+                new_op_tr, _ = auto_execute_and_evaluate_operator_trades(
+                    new_op_sig,
+                    enable_mis_short=mis_short_enabled,
+                    current_regime=reg_fresh,
+                )
                 build_all_strategies_paper_ledger_and_scorecard(
-                    op_trades_df=new_op_tr if not new_op_tr.empty else None
+                    op_trades_df=new_op_tr if not new_op_tr.empty else None,
+                    current_regime=reg_fresh,
                 )
                 run_v3_two_expert_monday_auto_engine(
                     watchlist_df=load_csv("live_watchlist_radar.csv"),
@@ -2217,26 +1401,30 @@ def render_live_signals_tab():
                     op_signals_df=new_op_sig if not new_op_sig.empty else None,
                     force_rebuild_shadow=True,
                     force_refresh=True,
+                    enable_mis_short=mis_short_enabled,
+                    current_regime=reg_fresh,
                 )
                 build_probable_intraday_candidates_sheet(
                     watchlist_df=load_csv("live_watchlist_radar.csv"),
                     sniper_df=load_csv("live_sniper_signals.csv"),
                     op_signals_df=new_op_sig if not new_op_sig.empty else None,
                     top3_ledger_df=load_csv("sniper_telemetry_trades.csv"),
+                    enable_mis_short=mis_short_enabled,
+                    current_regime=reg_fresh,
                 )
             st.rerun()
     with ctrl2:
         if st.button("🏆 Reset / Sync Today's Top 3 CNC Slots (<=₹20K)", use_container_width=True, key="tab1_sync_btn"):
-            with st.spinner("Loading Top 3 CNC entries (<= ₹20,000 each) & replaying 5m candles from 10:05 to 3:15 PM..."):
+            with st.spinner("Loading Top 3 CNC entries (<= ₹20,000 each) & replaying 5m candles..."):
                 rep_tmp = load_json("live_regime_report.json")
                 wl_tmp = load_csv("live_watchlist_radar.csv")
                 sn_tmp = load_csv("live_sniper_signals.csv")
                 src_tmp = sn_tmp if not sn_tmp.empty else wl_tmp
                 stage_top3_daily_cnc_entries(
                     watchlist_df=src_tmp,
-                    regime_badge=rep_tmp.get("regime_badge", "TRENDING_OR_ROTATION"),
+                    regime_badge=rep_tmp.get("regime_badge", "SIDEWAYS_ROTATION"),
                     purchase_time_str="10:00:00",
-                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                    eod_315pm_auto_exit=eod_exit_enabled,
                     sync_purchase_candle_price=True,
                     trades_csv_path=SNIPER_TELEMETRY_CSV,
                 )
@@ -2249,10 +1437,9 @@ def render_live_signals_tab():
             value=float(MAX_BUDGET_PER_TICKER_INR),
             step=2000.0,
             key="tab1_cnc_capital",
-            help="Strict ₹20,000 maximum budget per ticker in CNC Delivery (max 3 entries/day = ₹60,000 total).",
+            help="Strict ₹20,000 maximum budget per ticker in CNC Delivery (any ticker priced > budget is excluded).",
         )
 
-    regime_rep = load_json("live_regime_report.json")
     sniper_df = load_csv("live_sniper_signals.csv")
     watchlist_df = load_csv("live_watchlist_radar.csv")
     top3_ledger_df = load_csv("sniper_telemetry_trades.csv")
@@ -2262,23 +1449,30 @@ def render_live_signals_tab():
     watchlist_df = recalculate_cnc_sizing(watchlist_df, cnc_capital)
     sniper_df = recalculate_cnc_sizing(sniper_df, cnc_capital)
 
-    v3_summary_meta = load_json("v3_expert_performance_summary.json") if isinstance(load_json("v3_expert_performance_summary.json"), dict) else {}
-    v3_shadow_meta = v3_summary_meta.get("shadow_validation_oct27_28", {}) if isinstance(v3_summary_meta, dict) else {}
-    v3_alpha_meta = v3_summary_meta.get("alpha_vs_1st_stable", {}) if isinstance(v3_summary_meta, dict) else {}
+    v3_summary_meta = load_json("v3_expert_performance_summary.json")
+    if not isinstance(v3_summary_meta, dict):
+        v3_summary_meta = {}
 
-    # KPI Bar — Strategy B focused
+    b_wr_live = float(v3_summary_meta.get("shadow_net_wr_pct", 0.0) or 0.0)
+    b_pt_live = float(v3_summary_meta.get("shadow_post_tax_pnl_inr", 0.0) or 0.0)
+    b_xirr_live = float(v3_summary_meta.get("shadow_annualized_xirr_pct", 0.0) or 0.0)
+    b_tr_live = int(v3_summary_meta.get("shadow_validated_trades", 0) or 0)
+    b_days_live = int(v3_summary_meta.get("unique_trading_days_b", 0) or 0)
+    b_xirr_disp = f"{b_xirr_live:+.1f}% XIRR" if b_days_live >= 5 else f"XIRR Pending ({b_days_live}/5d)"
+
+    # KPI Bar — Strictly Real Closed-Trade Telemetry (zero hardcoded fallbacks)
     if regime_rep:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"), f"Universe: {len(watchlist_df)} / {len(UNIVERSE_META)} Tickers")
+        m1.metric("Live Market Regime", regime_rep.get("regime_badge", "N/A"), f"Eligible <=₹{int(cnc_capital):,}: {len(watchlist_df)} Tickers")
         m2.metric("Nifty 50 (^NSEI)", f"{regime_rep.get('nifty_close', 0):,.2f}", f"{regime_rep.get('nifty_ret_1d_pct', 0):+.2f}% (1D)")
-        m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "Max ₹20K/Ticker | Max 3 CNC/Day")
+        m3.metric("India VIX (^INDIAVIX)", f"{regime_rep.get('india_vix', 0):.2f}", "3 bps Slippage | Max 1/Sector")
         m4.metric(
-            f"🟣 Strategy B (2-Expert) — {float(v3_summary_meta.get('shadow_net_wr_pct', 97.8)):.1f}% WR",
-            f"₹+{float(v3_summary_meta.get('shadow_post_tax_pnl_inr', 3939.29)):,.2f} Post-Tax",
-            f"+{float(v3_summary_meta.get('shadow_annualized_xirr_pct', 747.88)):.1f}% XIRR | {int(v3_summary_meta.get('shadow_validated_trades', 46))} Trades",
+            f"🟣 Strategy B Closed WR — {b_wr_live:.1f}%",
+            f"₹{b_pt_live:+,.2f} Post-Tax",
+            f"{b_xirr_disp} | {b_tr_live} Closed Trades",
         )
 
-    # Build probable candidates (Strategy B only)
+    # Build probable candidates (Strategy B quality-gated & adaptive-ranked)
     st.markdown("---")
     probable_df = build_probable_intraday_candidates_sheet(
         watchlist_df=watchlist_df,
@@ -2286,60 +1480,60 @@ def render_live_signals_tab():
         op_signals_df=cached_op_signals if not cached_op_signals.empty else None,
         top3_ledger_df=top3_ledger_df,
         budget_per_ticker=cnc_capital,
+        enable_mis_short=mis_short_enabled,
+        current_regime=current_regime_badge,
     )
     if probable_df.empty:
         probable_df = load_csv("probable_intraday_candidates.csv")
     probable_b_df = load_csv("probable_candidates_strategy_b.csv")
-
-    probable_b_df = _enrich_signals_for_live_tab(probable_b_df, engine_mode="B")
     if probable_b_df.empty and not probable_df.empty and "Executes_In_Strategy_B" in probable_df.columns:
-        probable_b_df = _enrich_signals_for_live_tab(probable_df[probable_df["Executes_In_Strategy_B"] == True].copy(), engine_mode="B")
+        probable_b_df = probable_df[probable_df["Executes_In_Strategy_B"] == True].copy()
 
-    # Filter by Confidence >= 85% and take top 10
-    if not probable_b_df.empty and "Confidence_Score_Pct" in probable_b_df.columns:
-        high_conf_df = probable_b_df[probable_b_df["Confidence_Score_Pct"] >= 85.0].head(10).copy()
-        if len(high_conf_df) < 5 and len(probable_b_df) >= 5:
-            high_conf_df = probable_b_df.head(10).copy()
-    else:
-        high_conf_df = probable_b_df.head(10).copy() if not probable_b_df.empty else pd.DataFrame()
+    probable_b_df = recalculate_cnc_sizing(probable_b_df, cnc_capital)
+    probable_b_df = _enrich_signals_for_live_tab(probable_b_df, engine_mode="B")
+    if not mis_short_enabled and not probable_b_df.empty and "Signal_Direction" in probable_b_df.columns:
+        probable_b_df = probable_b_df[~probable_b_df["Signal_Direction"].astype(str).str.contains("SHORT", na=False)].copy()
 
-    # SECTION A: TOP 10 SIGNALS (Strategy B, Confidence ≥85%)
+    top10_df = probable_b_df.head(10).copy() if not probable_b_df.empty else pd.DataFrame()
+
+    # SECTION A: ADAPTIVE TOP-10 SIGNALS (HIGHEST SUCCESS PROBABILITY + MAX XIRR ON TOP)
     with st.container(border=True):
         st.markdown(
-            f"### 🎯 Section A: Top {len(high_conf_df)} Strategy B Entry Signals — BUY & SELL Recommendations (Confidence ≥85% | 5m Auto-Refresh)"
+            f"### 🎯 Section A: Adaptive Top {len(top10_df)} Strategy B Signals — Clear BUY (CNC) vs SHORT SELL (MIS Only)"
         )
         st.caption(
-            "**Strategy B (2-Expert Critic)** recommendations only — 97.8% Win Rate, +747.9% XIRR. "
-            "Each signal shows a clear **🟢 BUY** or **🔴 SELL** direction, entry price, stop-loss, target, and confidence level. "
-            "Sorted by best-performing strategies on top."
+            f"**Strategy B Quality Engine** (`{b_tr_live}` closed trades, `{b_wr_live:.1f}%` closed WR, `{b_xirr_disp}`). "
+            "Auto-ranked across sessions using 14-day exponential decay + current-regime fit + Wilson Lower Bound (`z=1.645`) + Bayesian-shrunk XIRR — "
+            "**highest success probability with max XIRR always on top**. Strict `<= ₹20,000` budget & prime window."
         )
 
-        if not high_conf_df.empty:
-            # Top 3 signal cards
-            card_cols = st.columns(min(4, len(high_conf_df) + 1))
-            for idx in range(min(3, len(high_conf_df))):
-                rc = high_conf_df.iloc[idx]
-                direction = str(rc.get("Signal_Direction", "🟢 BUY"))
+        if not top10_df.empty:
+            card_cols = st.columns(min(4, len(top10_df) + 1))
+            for idx in range(min(3, len(top10_df))):
+                rc = top10_df.iloc[idx]
+                direction = str(rc.get("Signal_Direction", "🟢 BUY (CNC)"))
                 badge = ["🏆 #1", "🥈 #2", "🥉 #3"][idx]
                 card_cols[idx].metric(
                     f"{badge} {direction}: {rc.get('Ticker', '')}",
                     f"Entry ₹{float(rc.get('Recommended_Entry_Price', 0)):,.2f} ({int(rc.get('Raw_Qty', 1))} Qty)",
-                    f"{str(rc.get('Strategy_ID', ''))} | Conf: {float(rc.get('Confidence_Score_Pct', 0)):.0f}%",
+                    f"{str(rc.get('Strategy_ID', ''))} | {str(rc.get('Confidence_Level', ''))[:20]}",
                 )
-            if len(high_conf_df) > 3:
+            if len(top10_df) > 3:
                 card_cols[-1].metric(
-                    "📊 Total Signals (Conf ≥85%)",
-                    f"{len(high_conf_df)} Setups Ready",
-                    f"Strategy B Only | {float(v3_summary_meta.get('shadow_net_wr_pct', 97.8)):.1f}% WR",
+                    "📊 Qualified Setups (<= ₹20K)",
+                    f"{len(top10_df)} Shown / {len(probable_b_df)} Total",
+                    f"Strategy B Only | {b_wr_live:.1f}% Closed WR",
                 )
 
-            # Main signals table with clear BUY/SELL in first column
             signal_display_cols = [
                 "Signal_Direction",
                 "Ticker",
                 "Strategy_Name",
-                "Confidence_Level",
+                "Product_Mode",
                 "Paper_Trade_Success_Rate",
+                "Confidence_Level",
+                "StratB_WLB_Pct",
+                "StratB_XIRR_Pct",
                 "Recommended_Entry_Price",
                 "Recommended_Stop_Loss",
                 "Safe_T1_And_Trail_SL_Levels",
@@ -2352,10 +1546,10 @@ def render_live_signals_tab():
                 "Strategy_ID",
                 "Pre_Configure_Broker_Order_Guide",
             ]
-            avail_sig_cols = [c for c in signal_display_cols if c in high_conf_df.columns]
-            render_frozen_3col_dataframe(high_conf_df[avail_sig_cols], height=400)
+            avail_sig_cols = [c for c in signal_display_cols if c in top10_df.columns]
+            render_frozen_3col_dataframe(top10_df[avail_sig_cols], height=420, auto_add_direction=False)
         else:
-            st.info("No Strategy B signals with Confidence ≥85% available. Waiting for next scan cycle.")
+            st.info("No qualified Strategy B setups under the current budget, prime liquidity window, and regime filters.")
 
     # SECTION B: ACTIVE EXIT ALERTS & OPEN POSITIONS
     op_trades_live = load_csv("operator_auto_trades.csv")
@@ -2364,51 +1558,62 @@ def render_live_signals_tab():
     with st.container(border=True):
         st.markdown("### 📌 Section B: Current Open Positions & Active Exit Alerts (Live P&L)")
         st.caption(
-            "All active CNC and 1m Operator positions with live trailing stop-loss, target, and unrealized P&L. "
-            "Clear **🟢 BUY** or **🔴 SELL** direction shown for each position."
+            "Active CNC and 1m Operator positions currently open in intraday replay (`ACTIVE`, `ACTIVE_INTRADAY`, `SWING_CONVERTED`, `ACTIVE_OPERATOR_TRADE`)."
         )
 
         active_positions = []
         if not sniper_trades_live.empty and "Status" in sniper_trades_live.columns:
-            active_cnc = sniper_trades_live[sniper_trades_live["Status"].astype(str).str.upper().isin(["ACTIVE", "MONITORING"])].copy()
+            st_upper = sniper_trades_live["Status"].astype(str).str.upper()
+            active_cnc = sniper_trades_live[
+                st_upper.isin(["ACTIVE", "MONITORING", "ACTIVE_INTRADAY", "SWING_CONVERTED"])
+            ].copy()
             if not active_cnc.empty:
                 for _, r in active_cnc.iterrows():
-                    entry_p = float(r.get("Entry_Price", 0))
-                    live_p = float(r.get("Live_CMP", r.get("Exit_Price", entry_p)))
-                    pnl = float(r.get("PnL_INR", (live_p - entry_p) * int(r.get("CNC_Qty", 1))))
+                    entry_p = float(pd.to_numeric(r.get("Entry_Price", 0), errors="coerce") or 0.0)
+                    qty_v = int(pd.to_numeric(r.get("CNC_Qty", 0), errors="coerce") or 0)
+                    if qty_v <= 0 or entry_p <= 0 or entry_p > cnc_capital:
+                        continue
+                    live_p = float(pd.to_numeric(r.get("Live_CMP", r.get("Exit_Price", entry_p)), errors="coerce") or entry_p)
+                    pnl = float(pd.to_numeric(r.get("PnL_INR", (live_p - entry_p) * qty_v), errors="coerce") or 0.0)
                     active_positions.append({
-                        "Signal_Direction": "🟢 BUY",
+                        "Signal_Direction": "🟢 BUY (CNC)",
                         "Ticker": r.get("Ticker", ""),
                         "Strategy_ID": r.get("Logic_ID", r.get("Strategy_ID", "CNC")),
                         "Entry_Price": f"₹{entry_p:,.2f}",
                         "Live_CMP": f"₹{live_p:,.2f}",
-                        "Stop_Loss": f"₹{float(r.get('Current_Trailing_SL', r.get('Initial_SL', 0))):,.2f}",
-                        "Target": f"₹{float(r.get('Target_Price', 0)):,.2f}",
+                        "Stop_Loss": f"₹{float(pd.to_numeric(r.get('Current_Trailing_SL', r.get('Initial_SL', 0)), errors='coerce') or 0):,.2f}",
+                        "Target": f"₹{float(pd.to_numeric(r.get('Target_Price', 0), errors='coerce') or 0):,.2f}",
                         "Unrealized_PnL": f"₹{pnl:+,.2f}",
                         "Status": str(r.get("Status", "ACTIVE")),
                         "Entry_Time": str(r.get("Purchase_Time", "")),
                     })
 
         if not op_trades_live.empty and "Status" in op_trades_live.columns:
-            active_op = op_trades_live[op_trades_live["Status"].astype(str).str.upper().isin(["ACTIVE", "MONITORING", "OPEN"])].copy()
+            op_upper = op_trades_live["Status"].astype(str).str.upper()
+            active_op = op_trades_live[
+                op_upper.isin(["ACTIVE", "MONITORING", "OPEN", "ACTIVE_OPERATOR_TRADE"])
+            ].copy()
             if not active_op.empty:
                 for _, r in active_op.iterrows():
-                    entry_p = float(r.get("Confirm_Entry_Price", 0))
-                    live_p = float(r.get("Live_Or_Exit_Price", entry_p))
+                    entry_p = float(pd.to_numeric(r.get("Confirm_Entry_Price", 0), errors="coerce") or 0.0)
+                    qty_v = int(pd.to_numeric(r.get("Auto_Qty_20K", 0), errors="coerce") or 0)
+                    if qty_v <= 0 or entry_p <= 0 or entry_p > cnc_capital:
+                        continue
+                    live_p = float(pd.to_numeric(r.get("Live_Or_Exit_Price", entry_p), errors="coerce") or entry_p)
                     side = str(r.get("Signal_Side", "BUY")).upper()
-                    direction = "🔴 SELL" if "SELL" in side else "🟢 BUY"
-                    if "SELL" in side:
-                        pnl = float(r.get("PnL_INR", (entry_p - live_p) * int(r.get("Auto_Qty_20K", 1))))
+                    direction = "🔴 SHORT SELL (MIS Only)" if ("SELL" in side or "SHORT" in side) else "🟢 BUY (CNC/MIS)"
+                    if "SELL" in side or "SHORT" in side:
+                        pnl = float(pd.to_numeric(r.get("PnL_INR", (entry_p - live_p) * qty_v), errors="coerce") or 0.0)
                     else:
-                        pnl = float(r.get("PnL_INR", (live_p - entry_p) * int(r.get("Auto_Qty_20K", 1))))
+                        pnl = float(pd.to_numeric(r.get("PnL_INR", (live_p - entry_p) * qty_v), errors="coerce") or 0.0)
                     active_positions.append({
                         "Signal_Direction": direction,
                         "Ticker": r.get("Ticker", ""),
                         "Strategy_ID": r.get("Strategy_ID", ""),
                         "Entry_Price": f"₹{entry_p:,.2f}",
                         "Live_CMP": f"₹{live_p:,.2f}",
-                        "Stop_Loss": f"₹{float(r.get('Current_Trailing_SL', r.get('Initial_SL', 0))):,.2f}",
-                        "Target": f"₹{float(r.get('Target_Price', 0)):,.2f}",
+                        "Stop_Loss": f"₹{float(pd.to_numeric(r.get('Current_Trailing_SL', r.get('Initial_SL', 0)), errors='coerce') or 0):,.2f}",
+                        "Target": f"₹{float(pd.to_numeric(r.get('Target_Price', 0), errors='coerce') or 0):,.2f}",
                         "Unrealized_PnL": f"₹{pnl:+,.2f}",
                         "Status": str(r.get("Status", "ACTIVE")),
                         "Entry_Time": str(r.get("Entry_Time_IST", r.get("Shock_Time_1m", ""))),
@@ -2418,10 +1623,10 @@ def render_live_signals_tab():
             pos_df = pd.DataFrame(active_positions)
             st.dataframe(pos_df, use_container_width=True, hide_index=True, height=min(250, 40 + 35 * len(pos_df)))
         else:
-            st.info("No active open positions. All trades have been closed or no positions entered today.")
+            st.info("No active open positions right now. Closed trades are reconciled in Tab 2.")
 
-    # SECTION C: Lock Candidate into Top-3 (from old Section 1 expander)
-    probable_all_df = _enrich_signals_for_live_tab(probable_df, engine_mode="AB")
+    # SECTION C: Lock Candidate into Top-3
+    probable_all_df = _enrich_signals_for_live_tab(recalculate_cnc_sizing(probable_df, cnc_capital), engine_mode="AB")
     with st.expander("📌 Lock a Candidate into Top-3 Active 5m Exit Tracker (≤ ₹20K)", expanded=False):
         cnc_prob_sub = probable_all_df[probable_all_df["Candidate_Group"] == "CNC_OR_INTRADAY_SNIPER"].reset_index(drop=True) if not probable_all_df.empty and "Candidate_Group" in probable_all_df.columns else probable_all_df
         if not cnc_prob_sub.empty:
@@ -2449,8 +1654,8 @@ def render_live_signals_tab():
                     purchase_time_str=cfg_time.strip(),
                     entry_price_override=float(cfg_ep),
                     budget_per_ticker=float(cnc_capital),
-                    regime_badge=regime_rep.get("regime_badge", "TRENDING_OR_ROTATION"),
-                    eod_315pm_auto_exit=st.session_state.get("eod_315pm_auto_exit_toggle", True),
+                    regime_badge=regime_rep.get("regime_badge", "SIDEWAYS_ROTATION"),
+                    eod_315pm_auto_exit=eod_exit_enabled,
                     sync_purchase_candle_price=False,
                     trades_csv_path=SNIPER_TELEMETRY_CSV,
                 )
@@ -2460,26 +1665,29 @@ def render_live_signals_tab():
                 else:
                     st.warning(msg)
 
-    # Full Strategy B candidates in expander
-    with st.expander(f"📋 Full Strategy B Probable Candidates Table ({len(probable_b_df)} Setups — All Confidence Levels)", expanded=False):
+    with st.expander(f"📋 All Qualified Strategy B Candidates ({len(probable_b_df)} Setups <= ₹{int(cnc_capital):,})", expanded=False):
         if not probable_b_df.empty:
             full_cols = [
-                "Signal_Direction", "Ticker", "Strategy_Name", "Paper_Trade_Success_Rate",
-                "Confidence_Level", "Order_Side", "Recommended_Entry_Price",
+                "Signal_Direction", "Ticker", "Strategy_Name", "Product_Mode",
+                "Paper_Trade_Success_Rate", "Confidence_Level", "StratB_WLB_Pct", "StratB_XIRR_Pct",
+                "Order_Side", "Recommended_Entry_Price",
                 "Recommended_Stop_Loss", "Safe_T1_And_Trail_SL_Levels",
                 "Recommended_Exit_Target", "Trigger_Proximity_Status",
                 "Live_LTP_And_Gap", "Qty_For_20K_And_Capital", "Strategy_ID",
             ]
             avail_full = [c for c in full_cols if c in probable_b_df.columns]
-            render_frozen_3col_dataframe(probable_b_df[avail_full], height=400)
+            render_frozen_3col_dataframe(probable_b_df[avail_full], height=400, auto_add_direction=False)
 
 
 def render_paper_trade_performance_tab():
     """
-    Tab 2: Paper Trade Performance & Detailed Trade Log.
-    Consolidates old Sections 2, 3 + XIRR into one clean tab with sub-tabs.
+    Tab 2: Paper Trade Performance & 9-Strategy Scorecard.
+    Computes all Win Rates, Post-Tax P&L, and XIRR (N>=5d guard) strictly from closed real trades.
+    Zero 3Y backtest percentages appear in the 9-Strategy Scorecard.
     """
-    v3_summary_meta = load_json("v3_expert_performance_summary.json") if isinstance(load_json("v3_expert_performance_summary.json"), dict) else {}
+    v3_summary_meta = load_json("v3_expert_performance_summary.json")
+    if not isinstance(v3_summary_meta, dict):
+        v3_summary_meta = {}
     v3_alpha_meta = v3_summary_meta.get("alpha_vs_1st_stable", {}) if isinstance(v3_summary_meta, dict) else {}
 
     daily_summary_df = load_csv("daily_paper_trade_summary.csv")
@@ -2496,30 +1704,30 @@ def render_paper_trade_performance_tab():
     v3_ab_trades_df = load_csv("v3_expert_ab_trade_by_trade_log.csv")
     v3_traps_df = load_csv("v3_expert_rejected_traps_log.csv")
     daily_cap_xirr_df = load_csv("daily_capital_charges_tax_xirr.csv")
-    op_trades_all = load_csv("operator_auto_trades.csv")
 
-    st.subheader("📊 Paper Trade Performance & Detailed Trade Log")
+    b_post_tax = float(v3_summary_meta.get("shadow_post_tax_pnl_inr", 0.0) or 0.0)
+    b_wr = float(v3_summary_meta.get("shadow_net_wr_pct", 0.0) or 0.0)
+    b_xirr = float(v3_summary_meta.get("shadow_annualized_xirr_pct", 0.0) or 0.0)
+    b_trades = int(v3_summary_meta.get("shadow_validated_trades", 0) or 0)
+    b_days = int(v3_summary_meta.get("unique_trading_days_b", 0) or 0)
+    a_post_tax = float(v3_summary_meta.get("strat_a_post_tax_pnl_inr", 0.0) or 0.0)
+    a_wr = float(v3_summary_meta.get("strat_a_net_wr_pct", 0.0) or 0.0)
+    a_trades = int(v3_summary_meta.get("strat_a_total_trades", 0) or 0)
+    alpha_pct = float(v3_alpha_meta.get("post_tax_profit_alpha_pct", 0.0) or 0.0) if isinstance(v3_alpha_meta, dict) else 0.0
+    b_xirr_text = f"{b_xirr:+.1f}%" if b_days >= 5 else f"Pending ({b_days}/5d)"
+
+    st.subheader("📊 Paper Trade Performance & Detailed Trade Log (Closed Real Trades Only)")
     st.caption(
-        f"**Strategy B (2-Expert Critic)**: {float(v3_summary_meta.get('shadow_net_wr_pct', 97.8)):.1f}% WR | "
-        f"₹+{float(v3_summary_meta.get('shadow_post_tax_pnl_inr', 3939.29)):,.2f} Post-Tax | "
-        f"+{float(v3_summary_meta.get('shadow_annualized_xirr_pct', 747.88)):.1f}% XIRR | "
-        f"{int(v3_summary_meta.get('shadow_validated_trades', 46))} Trades"
+        f"**Strategy B (Forward Quality Engine, >= {APP_CREATED_DATE})**: {b_wr:.1f}% Closed WR | "
+        f"₹{b_post_tax:+,.2f} Post-Tax | {b_xirr_text} XIRR | {b_trades} Closed Trades across {b_days} Sessions"
     )
 
-    # KPI Cards
-    b_post_tax = float(v3_summary_meta.get("shadow_post_tax_pnl_inr", 3939.29))
-    b_wr = float(v3_summary_meta.get("shadow_net_wr_pct", 97.8))
-    b_xirr = float(v3_summary_meta.get("shadow_annualized_xirr_pct", 747.88))
-    b_trades = int(v3_summary_meta.get("shadow_validated_trades", 46))
-    a_post_tax = float(v3_summary_meta.get("strat_a_post_tax_pnl_inr", 2550.48))
-
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("🟣 Strategy B Post-Tax P&L", f"₹+{b_post_tax:,.2f}", f"{b_trades} Trades | {b_wr:.1f}% WR")
-    kpi2.metric("🟣 Strategy B XIRR", f"+{b_xirr:.1f}%", f"Annualized Post-Tax Return")
-    kpi3.metric("🟢 Strategy A Post-Tax P&L", f"₹+{a_post_tax:,.2f}", f"{float(v3_summary_meta.get('strat_a_net_wr_pct', 78.0)):.1f}% WR")
-    kpi4.metric("🏆 B vs A Alpha", f"+₹{b_post_tax - a_post_tax:,.2f}", f"+{float(v3_alpha_meta.get('post_tax_profit_alpha_pct', 54.5)):.1f}% More Profit")
+    kpi1.metric("🟣 Strategy B Post-Tax P&L", f"₹{b_post_tax:+,.2f}", f"{b_trades} Closed | {b_wr:.1f}% WR")
+    kpi2.metric("🟣 Strategy B Annualized XIRR", b_xirr_text, f"Requires N>=5 sessions ({b_days} observed)")
+    kpi3.metric("🟢 Strategy A Post-Tax P&L", f"₹{a_post_tax:+,.2f}", f"{a_trades} Closed | {a_wr:.1f}% WR")
+    kpi4.metric("🏆 Strategy B vs A Alpha", f"₹{b_post_tax - a_post_tax:+,.2f}", f"{alpha_pct:+.1f}% Post-Tax Delta")
 
-    # Sub-tabs
     perf_tab1, perf_tab2, perf_tab3, perf_tab4, perf_tab5 = st.tabs([
         "📒 Trade-by-Trade Log",
         "🏆 9-Strategy Scorecard",
@@ -2529,9 +1737,20 @@ def render_paper_trade_performance_tab():
     ])
 
     with perf_tab1:
-        st.markdown("##### 📒 Strategy B Trade-by-Trade Execution Log (with BUY/SELL Direction)")
-        st.caption("Every executed paper trade showing Ticker, BUY/SELL direction, Entry/Exit Price, Time, P&L, and strategy details.")
+        st.markdown("##### 📒 Strategy B Execution Log (`BUY CNC/MIS` vs `SHORT SELL MIS Only`)")
+        status_filter = st.radio(
+            "Trade Status Filter:",
+            options=["Closed Trades Only (Matches Scorecard WR)", "All Trades (Including Active Open)"],
+            index=0,
+            horizontal=True,
+            key="tab2_log_status_filter",
+        )
         v3_shadow_view = _add_signal_direction(v3_shadow_df)
+        if not v3_shadow_view.empty and status_filter.startswith("Closed"):
+            if "Trade_Status" in v3_shadow_view.columns:
+                v3_shadow_view = v3_shadow_view[
+                    ~v3_shadow_view["Trade_Status"].astype(str).str.upper().str.contains("ACTIVE|OPEN|PENDING|MONITORING", na=False)
+                ].copy()
         if not v3_shadow_view.empty:
             trade_log_cols = [
                 "Signal_Direction",
@@ -2561,9 +1780,9 @@ def render_paper_trade_performance_tab():
                 "Trade_ID",
             ]
             avail_log = [c for c in trade_log_cols if c in v3_shadow_view.columns]
-            render_frozen_3col_dataframe(v3_shadow_view[avail_log], height=450)
+            render_frozen_3col_dataframe(v3_shadow_view[avail_log], height=450, auto_add_direction=False)
         else:
-            st.info("No Strategy B trades recorded yet.")
+            st.info("No closed Strategy B trades matching this filter yet.")
 
         with st.expander("📒 Strategy A Trade-by-Trade Log (for comparison)", expanded=False):
             a_view = _add_signal_direction(fresh_paper_df)
@@ -2575,35 +1794,56 @@ def render_paper_trade_performance_tab():
                     "PnL_INR", "PnL_Pct", "Post_Tax_PnL_INR", "Trade_Status",
                 ]
                 avail_a_log = [c for c in a_log_cols if c in a_view.columns]
-                render_frozen_3col_dataframe(a_view[avail_a_log], height=350)
+                render_frozen_3col_dataframe(a_view[avail_a_log], height=350, auto_add_direction=False)
 
     with perf_tab2:
-        st.markdown("##### 🏆 All 9 Strategies Ranked — Strategy A vs Strategy B Performance Scorecard")
-        st.caption("Single consolidated view of all 9 strategies (L1–L6 CNC + OP_S1–OP_S3 Operator) with BUY/SELL type, Win Rate, Post-Tax P&L, and Alpha.")
+        st.markdown("##### 🏆 All 9 Strategies — Real-Time Closed-Trade Paper Scorecard (Adaptive Ranking)")
+        st.caption(
+            "Strictly real closed paper trades since inception (zero 3Y backtest percentages — see Tab 5 for 3Y historical backtests). "
+            "Sorted identically to Tab 1: **Adaptive Rank Score** (14d decay + regime match) -> **Wilson Lower Bound WR** -> **Strategy B XIRR** -> **Post-Tax ₹**."
+        )
         scorecard_df_to_show = v3_scorecard_df if not v3_scorecard_df.empty else strat_scorecard_df
         if not scorecard_df_to_show.empty:
-            scorecard_view = _add_signal_direction(scorecard_df_to_show)
-            render_frozen_3col_dataframe(scorecard_view, height=430)
+            sc_clean = scorecard_df_to_show.copy()
+            if "Backtest_3Y_WR_A_vs_B" in sc_clean.columns:
+                sc_clean = sc_clean.drop(columns=["Backtest_3Y_WR_A_vs_B"])
+            sc_clean = _add_signal_direction(sc_clean)
+            preferred_sc_cols = [
+                "Signal_Direction",
+                "Adaptive_Rank",
+                "Strategy_Name",
+                "Product_Mode",
+                "Paper_Trade_Success_Rate",
+                "Confidence_Level",
+                "StratB_WLB_Pct",
+                "StratB_XIRR_Pct",
+                "Trades_Done_A_vs_B",
+                "StratB_Post_Tax_INR",
+                "StratA_Post_Tax_INR",
+                "Post_Tax_Alpha_INR",
+                "A_vs_B_Scorecard_Verdict",
+                "Strategy_ID",
+                "Two_Expert_Active_Rule_In_Strategy_B",
+            ]
+            avail_sc_cols = [c for c in preferred_sc_cols if c in sc_clean.columns]
+            render_frozen_3col_dataframe(sc_clean[avail_sc_cols] if avail_sc_cols else sc_clean, height=430, auto_add_direction=False)
 
     with perf_tab3:
         st.markdown("##### ⚖️ Strategy A vs Strategy B — Side-by-Side Comparison")
-
-        st.markdown("###### 🗓️ Day-by-Day Summary (Daily Aggregate XIRR Only)")
+        st.markdown("###### 🗓️ Day-by-Day Summary (Closed Trades & Daily Aggregate Tax/XIRR)")
         if not v3_daily_df.empty:
-            render_frozen_3col_dataframe(v3_daily_df, height=215)
+            render_frozen_3col_dataframe(v3_daily_df, height=230)
 
-        st.markdown("###### ⏰ Trade-by-Trade Side-by-Side Execution Log (BUY/SELL Direction)")
+        st.markdown("###### ⏰ Trade-by-Trade Side-by-Side Execution Log (BUY vs SHORT SELL)")
         v3_ab_view = _add_signal_direction(v3_ab_trades_df)
         if not v3_ab_view.empty:
-            render_frozen_3col_dataframe(v3_ab_view, height=400)
+            render_frozen_3col_dataframe(v3_ab_view, height=400, auto_add_direction=False)
 
     with perf_tab4:
         st.markdown("##### 💰 Daily Capital, Platform Charges, 20% Tax & Aggregate XIRR Breakdown")
         st.caption(
-            "**How Invested Capital & Charges Are Computed**: "
-            "**(a) Peak Simultaneous Invested Capital** tracks minute-by-minute overlap of open positions (≤ ₹20,000/slot). "
-            "**(b) Platform & Statutory Charges** deduct Indian discount brokerage + STT + stamp duty + GST (~₹20.35 per ₹20K round-trip), "
-            "followed by **20% Income Tax** on net positive daily profit."
+            "Tracks peak simultaneous invested capital (`<= ₹20,000/slot`), brokerage + statutory charges + 3 bps slippage model, "
+            "20% tax on net positive daily profit, and portfolio XIRR (annualized once `N >= 5` unique trading days exist)."
         )
         if not daily_cap_xirr_df.empty:
             render_frozen_3col_dataframe(daily_cap_xirr_df, height=280)
@@ -2613,16 +1853,16 @@ def render_paper_trade_performance_tab():
                 render_frozen_3col_dataframe(daily_summary_df, height=195)
 
     with perf_tab5:
-        st.markdown("##### 🛡️ Blocked Falling-Knife Traps & 2-Expert Ratchet Audit")
-        st.caption("Trades that Strategy B's 2-Expert Critic blocked or ratcheted — saving losses and improving exits vs Strategy A.")
+        st.markdown("##### 🛡️ Filtered Low-Quality Setups & Strategy B Gate Audit")
+        st.caption("Trades excluded by forward quality gates (lunch chop, R:R floor, sector concentration, regime shorting gate, or slot cap).")
         if not v3_traps_df.empty:
             render_frozen_3col_dataframe(v3_traps_df, height=300)
 
-        with st.expander(f"📂 Standalone Strategy B Raw Execution Ledgers (Monday Live: {len(v3_live_df)} | All Validated: {len(v3_shadow_df)})", expanded=False):
+        with st.expander(f"📂 Standalone Strategy B Raw Ledgers (Today: {len(v3_live_df)} | All Closed+Open: {len(v3_shadow_df)})", expanded=False):
             v3_raw_mode = st.radio(
                 "Select Ledger:",
                 options=[
-                    f"🟢 Monday Live Forward ({len(v3_live_df)} Trades)",
+                    f"🟢 Current Session ({len(v3_live_df)} Trades)",
                     f"🧪 All Validated ({len(v3_shadow_df)} Trades)",
                 ],
                 index=0,
@@ -2631,7 +1871,7 @@ def render_paper_trade_performance_tab():
             )
             raw_b_df = v3_live_df if v3_raw_mode.startswith("🟢") else v3_shadow_df
             if not raw_b_df.empty:
-                render_frozen_3col_dataframe(_add_signal_direction(raw_b_df), height=310)
+                render_frozen_3col_dataframe(_add_signal_direction(raw_b_df), height=310, auto_add_direction=False)
 
 
 with tab1:
@@ -2649,15 +1889,11 @@ with tab4:
     st.subheader("🛡️ Institutional Downside Protection & 4-Stage Chronological GTT Trailing Stop Ladder")
     st.markdown(
         """
-        **How Our CNC + GTT OCO Downside Risk Engine Prevents Production Stop-Outs:**
-        1. **100% CNC Execution (Zero MIS Penalty, Max ₹20K/Ticker, Max 3/Day)**: All positions are taken in `CNC` with a 2-Leg Broker GTT OCO Sell order and capped at `₹20,000` per ticker (`<= ₹60,000/day`).
-        2. **Structural Support Floor (`S1`)**: Initial GTT stop-loss is anchored below **Opening Range Low (`ORB_Low`) / 20-Day Structural Support `S1` minus an `0.15x–0.18x ATR` cushion**.
-        3. **Chronological 5-Minute High-Water-Mark (`HWM`) Ratchet (`Purchase_Time + 5m -> 3:15 PM`)**: Tracks `Last_Evaluated_Bar_TS` and `High_Water_Mark` bar-by-bar in strict chronological order—eliminating the `smart-etf-tracker` bug where afternoon SL upgrades were retroactively compared against 9:50 AM morning lows.
-        4. **4-Stage GTT Profit-Locking Ratchet**:
-           - **Stage 1 (`MFE >= +0.80 ATR`)**: Modify GTT SL Trigger to `Entry + 0.18 ATR` (True Breakeven + DP/STT cover).
-           - **Stage 2 (`MFE >= +1.25 ATR`)**: Modify GTT SL Trigger to `Entry + 0.65 ATR` (Locks >50% of gain).
-           - **Stage 3 (`MFE >= +1.75 ATR`)**: Modify GTT SL Trigger to `Entry + 1.15 ATR` (Locks >66% of gain).
-           - **Stage 4 (`MFE >= +2.20 ATR`)**: Dynamic Chandelier GTT Trail at `High_Water_Mark - 0.50 ATR`.
+        **How Our CNC + GTT OCO Downside Risk Engine Prevents Premature Stop-Outs:**
+        1. **Strict Budget & Slot Discipline (`<= ₹20,000/Ticker`)**: All positions respect `<= ₹20,000/ticker` (`qty == 0` tickers excluded).
+        2. **Structural Support Floor (`S1` + ATR)**: Initial GTT stop-loss is anchored below ORB Low / Support `S1` with `>= max(0.60%, 1.2 * ATR_5m)` noise cushion.
+        3. **Chronological 5m / 1m High-Water-Mark (`HWM`) Ratchet**: Tracks `Last_Evaluated_Bar_TS` and `HWM` strictly forward in chronological order.
+        4. **Cost-Aware Profit-Locking Ratchet**: `+0.80R -> Entry + 0.25R` (cost+ lock), scaling upward cleanly with trend extension.
         """
     )
     if not watchlist_df_t2.empty:
@@ -2675,243 +1911,178 @@ with tab4:
         render_frozen_3col_dataframe(watchlist_df_t2[avail_ladder], height=500)
 
 with tab5:
-    st.subheader("🔄 3:10 PM IST CNC Intraday-to-Swing Conversion Predictor (3-Year Empirical Study)")
-    swing_summary = load_json("swing_conversion_summary.json")
-    if swing_summary:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Raw Daily Intraday Win Rate (3Y)", f"{swing_summary.get('raw_intraday_win_rate_pct', 0):.2f}%", f"{swing_summary.get('raw_intraday_avg_ret_pct', 0):+.3f}% avg")
-        m2.metric("Converting SL Losers ('Bag-Hold')", f"{swing_summary.get('loser_baghold_swing_win_rate_pct', 0):.2f}%", f"{swing_summary.get('loser_baghold_swing_avg_ret_pct', 0):+.3f}% avg", delta_color="inverse")
-        m3.metric("Unconditional Stalled Conversion", f"{swing_summary.get('unconditional_swing_conversion_win_rate_pct', 0):.2f}%", f"{swing_summary.get('unconditional_swing_conversion_avg_ret_pct', 0):+.3f}% avg")
-        m4.metric("5-Gate Smart CNC Swing Hold", f"{swing_summary.get('smart_gated_swing_conversion_win_rate_pct', 0):.2f}%", f"+{swing_summary.get('smart_gated_swing_conversion_avg_ret_pct', 0):.3f}% avg")
+    sw_tab1, sw_tab2, sw_tab3 = st.tabs([
+        "🔄 3:10 PM Swing Predictor",
+        "🏆 3-Year Backtest & Historical Archive",
+        "📋 Continuous Critic Audit & Gap Governance",
+    ])
 
-    st.markdown("#### 🧮 Interactive 3:10 PM CNC Hold vs Intraday Exit Simulator")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    in_entry = sc1.number_input("CNC Entry Price (₹)", value=1000.0, step=10.0)
-    in_cmp = sc2.number_input("3:10 PM Live Price (₹)", value=1008.0, step=5.0)
-    in_high = sc3.number_input("Day High (₹)", value=1012.0, step=5.0)
-    in_low = sc4.number_input("Day Low (₹)", value=996.0, step=5.0)
+    with sw_tab1:
+        st.subheader("🔄 3:10 PM IST CNC Intraday-to-Swing Conversion Predictor (3-Year Empirical Study)")
+        swing_summary = load_json("swing_conversion_summary.json")
+        if swing_summary:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Raw Daily Intraday Win Rate (3Y)", f"{swing_summary.get('raw_intraday_win_rate_pct', 0):.2f}%", f"{swing_summary.get('raw_intraday_avg_ret_pct', 0):+.3f}% avg")
+            m2.metric("Converting SL Losers ('Bag-Hold')", f"{swing_summary.get('loser_baghold_swing_win_rate_pct', 0):.2f}%", f"{swing_summary.get('loser_baghold_swing_avg_ret_pct', 0):+.3f}% avg", delta_color="inverse")
+            m3.metric("Unconditional Stalled Conversion", f"{swing_summary.get('unconditional_swing_conversion_win_rate_pct', 0):.2f}%", f"{swing_summary.get('unconditional_swing_conversion_avg_ret_pct', 0):+.3f}% avg")
+            m4.metric("5-Gate Smart CNC Swing Hold", f"{swing_summary.get('smart_gated_swing_conversion_win_rate_pct', 0):.2f}%", f"+{swing_summary.get('smart_gated_swing_conversion_avg_ret_pct', 0):.3f}% avg")
 
-    sc5, sc6, sc7, sc8 = st.columns(4)
-    in_s1 = sc5.number_input("Structural Support S1 (₹)", value=990.0, step=5.0)
-    in_sma20 = sc6.number_input("20-Day SMA (₹)", value=992.0, step=5.0)
-    in_sma50 = sc7.number_input("50-Day SMA (₹)", value=980.0, step=5.0)
-    in_vol = sc8.number_input("Volume Ratio vs 20D Avg", value=1.35, step=0.1)
+        st.markdown("#### 🧮 Interactive 3:10 PM CNC Hold vs Intraday Exit Simulator")
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        in_entry = sc1.number_input("CNC Entry Price (₹)", value=1000.0, step=10.0)
+        in_cmp = sc2.number_input("3:10 PM Live Price (₹)", value=1008.0, step=5.0)
+        in_high = sc3.number_input("Day High (₹)", value=1012.0, step=5.0)
+        in_low = sc4.number_input("Day Low (₹)", value=996.0, step=5.0)
 
-    pred_out = predict_swing_conversion_success(
-        entry_price=in_entry,
-        current_price=in_cmp,
-        day_high=in_high,
-        day_low=in_low,
-        s1_support=in_s1,
-        sma20=in_sma20,
-        sma50=in_sma50,
-        sma200=in_sma50 * 0.95,
-        vol_ratio=in_vol,
-        market_regime="SIDEWAYS_ROTATION",
-        sl_breached=(in_cmp <= in_s1),
-    )
-    st.info(
-        f"**3:10 PM CNC Verdict**: {pred_out['verdict']} | **Empirical Win Probability**: `{pred_out['predicted_swing_win_rate_pct']:.1f}%` | "
-        f"**Expected 5D Swing Return**: `{pred_out['expected_swing_return_pct']:+.2f}%` | **Gates Passed**: `{pred_out['gates_passed']}`"
-    )
-    st.json(pred_out["gate_details"])
+        sc5, sc6, sc7, sc8 = st.columns(4)
+        in_s1 = sc5.number_input("Structural Support S1 (₹)", value=990.0, step=5.0)
+        in_sma20 = sc6.number_input("20-Day SMA (₹)", value=992.0, step=5.0)
+        in_sma50 = sc7.number_input("50-Day SMA (₹)", value=980.0, step=5.0)
+        in_vol = sc8.number_input("Volume Ratio vs 20D Avg", value=1.35, step=0.1)
 
-with tab5:
-    st.subheader("🏆 3-Year Historical Multi-Regime Backtest, 2-Expert Re-Backtest & Pre-Inception Benchmark Archive — First 3 Columns Frozen")
-    bt_rebacktest = load_csv("two_expert_3y_rebacktest_comparison.csv")
-    hist_benchmark_df = load_csv("historical_benchmark_trades.csv")
-    bt_res = load_csv("backtest_3y_results.csv")
-    bt_reg = load_csv("backtest_3y_regime_matrix.csv")
-    bt_ver15 = load_csv("intraday_60d_15m_verification.csv")
-    bt_timing_sum = load_csv("entry_timing_10am_5gate_summary.csv")
-    bt_ledger = load_csv("backtest_trade_ledger_3y.csv")
-
-    st.markdown("#### 0. 2-Expert Critic 3-Year Walk-Forward Re-Backtest Comparison (`Strategy A: 1st Stable` vs `Strategy B: 2-Expert Revised`)")
-    st.caption(
-        "Compares all 9 strategies (`L1–L6` across 756 NSE sessions and `OP_S1–OP_S3` across 60-day intraday walk-forward) before and after applying the 2-Expert Critic upgrades (`GAP-20261030-06` through `GAP-20261030-09`)."
-    )
-    if not bt_rebacktest.empty:
-        render_frozen_3col_dataframe(bt_rebacktest, height=390)
-
-    st.markdown(f"#### 1. Historical Benchmark Data Archive (`< {APP_CREATED_DATE}` — Pre-App Creation Trades Moved Out of Tab 1 | `{len(hist_benchmark_df)}` Rows)")
-    st.caption(
-        f"All trades prior to `{APP_CREATED_DATE}` (including the `2025-10-16` `BEL` 1-minute Operator validation and `2023–2026-10-26` 3-year walk-forward backtest trades) are archived here so Tab 1 stays dedicated exclusively to scheduled paper trade performance."
-    )
-    if not hist_benchmark_df.empty:
-        render_frozen_3col_dataframe(hist_benchmark_df, height=340)
-
-    st.markdown("#### 2. Baseline Strategy Performance Comparison (Top 6 Sniper Logics Including L6 5-Gate 10:00 AM Sniper vs Controls)")
-    if not bt_res.empty:
-        render_frozen_3col_dataframe(bt_res)
-
-    st.markdown("#### 3. Market Regime × Sniper Logic Matrix")
-    if not bt_reg.empty:
-        render_frozen_3col_dataframe(bt_reg)
-
-    st.markdown("#### 4. 10:00 AM Entry Timing Study on 5-Gate Pre-Qualified Stocks (15m Bars + Trailing SL & Profit Target)")
-    if not bt_timing_sum.empty:
-        render_frozen_3col_dataframe(bt_timing_sum)
-
-    st.markdown("#### 5. 60-Day 15-Minute Bar-by-Bar Intraday Walk-Forward Verification")
-    if not bt_ver15.empty:
-        render_frozen_3col_dataframe(bt_ver15)
-
-    st.markdown("#### 6. Filterable 3-Year Historical Trade Ledger (`First 3 Columns Frozen`)")
-    if not bt_ledger.empty:
-        sniper_only = st.checkbox("Show Top 6 Sniper Logics Only (L1–L6)", value=True)
-        view_df = bt_ledger[bt_ledger["Logic_ID"].str.startswith(("L1_", "L2_", "L3_", "L4_", "L5_", "L6_"))] if sniper_only else bt_ledger
-        render_frozen_3col_dataframe(view_df.tail(250), height=420)
-
-    st.markdown("---")
-    st.markdown("#### 7. 🔬 Forensic Audit of `smart-etf-tracker` Production Trades & Zero-Disturbance Integration Plan")
-    st.markdown(
-        """
-        ### 🏗️ Production Integration Assessment (`smart-etf-tracker` — Advisory Only, Zero Changes Made in Production)
-        - **Can the best intraday logic (`L6` 5-Gate 10:00 AM ORB + `L1/L4` Regime Sniper + 5m Chronological Replay) be updated in `smart-etf-tracker` without disturbing other logics?**
-          - **Yes, 100%.** In `smart-etf-tracker`, all non-intraday workflows (ETF Accumulation, Swing Trading, Capital Allocation) filter by `Strategy_Type != "INTRADAY"` and reside in separate functions/pages.
-          - Updating only `generate_intraday_signals()`, `evaluate_intraday_trades()` (for `Strategy_Type == "INTRADAY"`), and `pages/1_📈_Intraday_Trading.py` will upgrade production intraday performance while leaving ETF and Swing modules completely untouched.
-        """
-    )
-    prod_audit = load_csv("production_trades_forensic_audit.csv")
-    if not prod_audit.empty:
-        render_frozen_3col_dataframe(prod_audit)
-
-with tab6:
-    st.subheader("📋 Continuous Critic Audit History (Append-Mode), Gap & Changes Ledger, Daily Capital, Tax & XIRR Governance")
-    st.caption(
-        "**Why This Tab Exists**: Historical backtests optimize parameters on past data, but live execution exposes new microstructure frictions "
-        "(midday `Vol_Med20` denominator collapse, sub-brokerage `+0.06%` breakeven stops, daily vs intraday ATR scaling, and `₹20.35/trade` fee drag). "
-        "Every regular critic audit **appends** its findings to `regular_audit_log.csv` and `audit_gaps_and_changes_log.csv`, and "
-        "`run_continuous_critic_audit_and_memory_check()` automatically loads `audit_critic_memory.json` on every performance review so resolved gaps never regress."
-    )
-
-    # Ensure audit logs and critic memory are up to date
-    audit_log_df = load_csv("regular_audit_log.csv")
-    gaps_log_df = load_csv("audit_gaps_and_changes_log.csv")
-    daily_cap_xirr_df = load_csv("daily_capital_charges_tax_xirr.csv")
-    critic_memory = load_json("audit_critic_memory.json")
-
-    if audit_log_df.empty or gaps_log_df.empty or daily_cap_xirr_df.empty or not critic_memory:
-        try:
-            audit_log_df, gaps_log_df, daily_cap_xirr_df, critic_memory = run_continuous_critic_audit_and_memory_check(
-                force_append_snapshot=False
-            )
-        except Exception:
-            pass
-
-    v1_m = critic_memory.get("v1_baseline_metrics", {}) if isinstance(critic_memory, dict) else {}
-    v2_m = critic_memory.get("v2_upgraded_metrics", {}) if isinstance(critic_memory, dict) else {}
-    guard_status = critic_memory.get("guardrail_status", {}) if isinstance(critic_memory, dict) else {}
-
-    # Top Action Bar: Run & Append New Critic Audit Snapshot
-    act_c1, act_c2 = st.columns([2.3, 1.2])
-    with act_c1:
-        all_passed = bool(guard_status.get("All_6_Guardrails_Passed", True))
-        if all_passed:
-            st.success(
-                f"✅ **Automatic Critic Memory Active (`v2.0_Post_Critic_Audit_Stability` + `v3.0_Two_Expert_Challenger`)**: All **Institutional Regression Guardrails PASSING**. "
-                f"Active Logic Rules Loaded Automatically: `{len(critic_memory.get('active_guardrails_for_next_audit', []))}` permanent rules."
-            )
-        else:
-            st.warning(
-                "⚠️ **Critic Memory Alert**: One or more regression guardrails require review in the latest audit snapshot."
-            )
-    with act_c2:
-        if st.button(
-            "➕ Run Critic Audit & Append Snapshot Now",
-            type="primary",
-            use_container_width=True,
-            key="btn_append_critic_audit",
-        ):
-            audit_log_df, gaps_log_df, daily_cap_xirr_df, critic_memory = run_continuous_critic_audit_and_memory_check(
-                force_append_snapshot=True
-            )
-            st.toast("New Critic Audit snapshot evaluated against Critic Memory and appended to regular_audit_log.csv!", icon="📋")
-            st.rerun()
-
-    # Executive Before (v1.0) vs After (v2.0) Comparison Cards
-    st.markdown("#### 📊 Executive Impact: Pre-Audit `v1.0` (`61` Trades) vs. `1st Stable v2.0` (`25` Trades) vs. `2-Expert v3.0` (`23` Trades)")
-    ca1, ca2, ca3, ca4 = st.columns(4)
-    ca1.metric(
-        "🎯 Net Win Rate (After ₹20.35 Fees)",
-        "76.0% (v2.0) -> 95.7% (v3.0)",
-        f"v1.0: {float(v1_m.get('net_wr_pct', 44.3)):.1f}% -> v2.0: 76.0% -> v3.0: 95.7%",
-    )
-    ca2.metric(
-        "💼 Avg Daily Peak Invested Capital",
-        "₹1,40,130 (v2) -> ₹1,26,420 (v3)",
-        f"-43.4% Capital Needed vs v1.0 (₹{float(v1_m.get('avg_daily_peak_capital_inr', 223542.33)):,.0f}/day)",
-    )
-    ca3.metric(
-        "💵 Net Profit After Charges & 20% Tax",
-        "₹+871.47 (v2) -> ₹+1,569.97 (v3)",
-        f"+80.2% Alpha in v3.0 vs 1st Stable (v1.0 was ₹+{float(v1_m.get('post_tax_profit_inr', 362.15)):,.2f})",
-    )
-    ca4.metric(
-        "🚀 Annualized Post-Tax XIRR",
-        "+210.51% (v2) -> +375.84% (v3)",
-        f"+165.33% XIRR Gain in 2-Expert v3.0 (Starts Mon {V3_EXPERT_MONDAY_START_DATE})",
-    )
-
-    # Guardrail Check Badges
-    with st.expander("🛡️ View Automatic Critic Memory Guardrails (`audit_critic_memory.json`) Checked on Every Performance Review", expanded=False):
-        if isinstance(critic_memory, dict):
-            st.markdown("**Active Non-Regression Rules Enforced Automatically by `run_continuous_critic_audit_and_memory_check()`:**")
-            for rule_txt in critic_memory.get("active_guardrails_for_next_audit", []):
-                st.markdown(f"- `{rule_txt}`")
-            st.json(guard_status)
-
-    st.markdown("---")
-
-    # Table 1: Daily Invested Money, Platform Charges, 20% Tax & XIRR Table
-    st.markdown(
-        "#### 💰 1. Daily Invested Money, Indian Platform & Statutory Charges (`~₹20.35/Trade`), `20%` Tax & XIRR Breakdown (`First 3 Columns Frozen`)"
-    )
-    st.caption(
-        "**How Invested Capital & Charges Are Computed**: "
-        "**(a) Peak Simultaneous Invested Capital (`Peak_Concurrent_Capital_INR`)** tracks minute-by-minute overlap of open positions (`<= ₹20,000/slot`) to measure the exact working capital pool required in your broker account each day (`₹1,69,456` on Oct 27; `₹1,10,804` on Oct 28; **`₹1,40,130/day` average**). "
-        "**(b) Cumulative 1-Way Turnover (`Cumulative_1Way_Turnover_INR`)** sums all trade notional values across the day (`₹2,64,162` on Oct 27; `₹2,06,261` on Oct 28) since exited morning capital is recycled into later trades. "
-        "**(c) Platform & Statutory Charges** deduct Indian discount brokerage (`min(0.03%, ₹20)` per leg) + `0.025%` sell STT + `0.00297%` NSE txn + `0.003%` stamp duty + SEBI fee + `18%` GST (`~₹20.35` per ₹20K round-trip), followed by **`20%` Income Tax provision** on net positive daily profit."
-    )
-    if not daily_cap_xirr_df.empty:
-        render_frozen_3col_dataframe(daily_cap_xirr_df, height=280)
-
-    st.markdown("---")
-
-    # Table 2: Append-Mode Regular Audit History
-    st.markdown(
-        f"#### 📜 2. Append-Mode Regular Audit History (`regular_audit_log.csv` — `{len(audit_log_df)}` Audit Rows Logged | `First 3 Columns Frozen`)"
-    )
-    st.caption(
-        "Contains the preserved `v1.0` Pre-Fix Baseline Audit rows (`AUDIT-01` to `03`), the `1st Stable v2.0` Verification rows (`AUDIT-04` to `06`), and the new `2-Expert Critic v3.0` Audit (`AUDIT-07-20261030-V3-2EXPERT`)."
-    )
-    if not audit_log_df.empty:
-        render_frozen_3col_dataframe(audit_log_df, height=310)
-
-    st.markdown("---")
-
-    # Table 3: Log of Gaps Identified in Regular Audits & Recommended Changes Applied
-    st.markdown(
-        f"#### 🔧 3. Log of Gaps Identified in Regular Audits & Recommended Changes Applied (`audit_gaps_and_changes_log.csv` — `{len(gaps_log_df)}` Gaps Tracked | `First 3 Columns Frozen`)"
-    )
-    st.caption(
-        "Documents each structural gap discovered during live paper trading (`GAP-20261028-01..05` in `v2.0` and `GAP-20261030-06..09` from the 2-Expert Critic Review in `v3.0`), quantified before/after P&L impact, and the permanent critic guardrails preventing regression."
-    )
-    if not gaps_log_df.empty:
-        render_frozen_3col_dataframe(gaps_log_df, height=340)
-
-    st.markdown("---")
-
-    # Side-by-side / Expander Archive of Pre-Audit v1.0 61-Trade Snapshot
-    v1_snap_df = load_csv("v1_pre_audit_fresh_trades_snapshot.csv")
-    with st.expander(
-        f"🗄️ View Preserved Pre-Change `v1.0` Fresh Paper Trade Snapshot (`v1_pre_audit_fresh_trades_snapshot.csv` — `{len(v1_snap_df)}` Trades Before `v2.0` Upgrade)",
-        expanded=False,
-    ):
-        st.caption(
-            "Archived verbatim before applying the 5 `v2.0` stability upgrades so future audits can always compare current live execution against the original `v1.0` 61-trade baseline."
+        pred_out = predict_swing_conversion_success(
+            entry_price=in_entry,
+            current_price=in_cmp,
+            day_high=in_high,
+            day_low=in_low,
+            s1_support=in_s1,
+            sma20=in_sma20,
+            sma50=in_sma50,
+            sma200=in_sma50 * 0.95,
+            vol_ratio=in_vol,
+            market_regime="SIDEWAYS_ROTATION",
+            sl_breached=(in_cmp <= in_s1),
         )
-        if not v1_snap_df.empty:
-            render_frozen_3col_dataframe(v1_snap_df, height=360)
+        st.info(
+            f"**3:10 PM CNC Verdict**: {pred_out['verdict']} | **Empirical Win Probability**: `{pred_out['predicted_swing_win_rate_pct']:.1f}%` | "
+            f"**Expected 5D Swing Return**: `{pred_out['expected_swing_return_pct']:+.2f}%` | **Gates Passed**: `{pred_out['gates_passed']}`"
+        )
+        st.json(pred_out["gate_details"])
+
+    with sw_tab2:
+        st.subheader("🏆 3-Year Historical Backtest & Pre-Inception Benchmark Archive (Strictly Separated from Live Tab 2)")
+        bt_rebacktest = load_csv("two_expert_3y_rebacktest_comparison.csv")
+        hist_benchmark_df = load_csv("historical_benchmark_trades.csv")
+        bt_res = load_csv("backtest_3y_results.csv")
+        bt_reg = load_csv("backtest_3y_regime_matrix.csv")
+        bt_ver15 = load_csv("intraday_60d_15m_verification.csv")
+        bt_timing_sum = load_csv("entry_timing_10am_5gate_summary.csv")
+        bt_ledger = load_csv("backtest_trade_ledger_3y.csv")
+
+        if not bt_rebacktest.empty:
+            st.markdown("#### 0. 3-Year Historical Re-Backtest Reference (Excluded from Tab 2 Live Paper Scorecard)")
+            render_frozen_3col_dataframe(bt_rebacktest, height=360)
+
+        st.markdown(f"#### 1. Historical Benchmark Archive (`< {APP_CREATED_DATE}` | `{len(hist_benchmark_df)}` Rows)")
+        if not hist_benchmark_df.empty:
+            render_frozen_3col_dataframe(hist_benchmark_df, height=320)
+
+        st.markdown("#### 2. Baseline 3-Year Sniper Strategy Comparison")
+        if not bt_res.empty:
+            render_frozen_3col_dataframe(bt_res)
+
+        st.markdown("#### 3. Market Regime × Sniper Logic Matrix")
+        if not bt_reg.empty:
+            render_frozen_3col_dataframe(bt_reg)
+
+        st.markdown("#### 4. 10:00 AM Entry Timing Study on 5-Gate Pre-Qualified Stocks")
+        if not bt_timing_sum.empty:
+            render_frozen_3col_dataframe(bt_timing_sum)
+
+        st.markdown("#### 5. 60-Day 15-Minute Bar-by-Bar Intraday Walk-Forward Verification")
+        if not bt_ver15.empty:
+            render_frozen_3col_dataframe(bt_ver15)
+
+        st.markdown("#### 6. Filterable 3-Year Historical Trade Ledger")
+        if not bt_ledger.empty:
+            sniper_only = st.checkbox("Show Top 6 Sniper Logics Only (L1–L6)", value=True)
+            view_df = bt_ledger[bt_ledger["Logic_ID"].str.startswith(("L1_", "L2_", "L3_", "L4_", "L5_", "L6_"))] if sniper_only else bt_ledger
+            render_frozen_3col_dataframe(view_df.tail(250), height=380)
+
+    with sw_tab3:
+        st.subheader("📋 Continuous Critic Audit, Gap Governance & Real Daily Capital / XIRR Ledger")
+        audit_log_df = load_csv("regular_audit_log.csv")
+        gaps_log_df = load_csv("audit_gaps_and_changes_log.csv")
+        daily_cap_xirr_df = load_csv("daily_capital_charges_tax_xirr.csv")
+        critic_memory = load_json("audit_critic_memory.json")
+
+        if audit_log_df.empty or gaps_log_df.empty or daily_cap_xirr_df.empty or not critic_memory:
+            try:
+                res_mem = run_continuous_critic_audit_and_memory_check(force_append_snapshot=False)
+                if isinstance(res_mem, dict) and res_mem:
+                    critic_memory = res_mem
+                audit_log_df = load_csv("regular_audit_log.csv")
+                gaps_log_df = load_csv("audit_gaps_and_changes_log.csv")
+                daily_cap_xirr_df = load_csv("daily_capital_charges_tax_xirr.csv")
+            except Exception:
+                pass
+
+        v1_m = critic_memory.get("v1_pre_fix_baseline_summary") or {}
+        v2_m = critic_memory.get("v2_post_fix_active_summary") or {}
+        guard_status = critic_memory.get("active_stability_guardrails", {}) if isinstance(critic_memory, dict) else {}
+
+        act_c1, act_c2 = st.columns([2.3, 1.2])
+        with act_c1:
+            all_passed = bool(critic_memory.get("all_guardrails_passing", True))
+            if all_passed:
+                st.success(
+                    f"✅ **Critic Guardrails Active (`{critic_memory.get('engine_version', 'Live')}`)**: "
+                    f"All institutional stability & data-integrity guardrails passing (`{critic_memory.get('failed_guardrails_count', 0)}` failed)."
+                )
+            else:
+                st.warning(
+                    f"⚠️ **Critic Memory Alert**: `{critic_memory.get('failed_guardrails_count', 0)}` guardrail(s) require review."
+                )
+        with act_c2:
+            if st.button(
+                "➕ Run Critic Audit & Append Snapshot Now",
+                type="primary",
+                use_container_width=True,
+                key="btn_append_critic_audit",
+            ):
+                run_continuous_critic_audit_and_memory_check(force_append_snapshot=True)
+                st.toast("Critic Audit snapshot evaluated against closed real trades!", icon="📋")
+                st.rerun()
+
+        v2_days = int(v2_m.get("unique_days", 0) or 0)
+        v2_xirr_txt = f"{float(v2_m.get('xirr_pct', 0.0)):+.2f}%" if v2_days >= 5 else f"Pending ({v2_days}/5d)"
+        ca1, ca2, ca3, ca4 = st.columns(4)
+        ca1.metric(
+            "🎯 Active Closed Net Win Rate",
+            f"{float(v2_m.get('net_wr_pct', 0.0)):.1f}%",
+            f"{int(v2_m.get('n_closed', 0))} Closed ({int(v2_m.get('net_w', 0))}W/{int(v2_m.get('net_l', 0))}L)",
+        )
+        ca2.metric(
+            "💼 Avg Daily Peak Capital",
+            f"₹{float(v2_m.get('peak_cap_inr', 0.0)):,.0f}",
+            f"Over {v2_days} observed sessions",
+        )
+        ca3.metric(
+            "💵 Active Post-Tax Profit",
+            f"₹{float(v2_m.get('post_tax_profit_inr', 0.0)):+,.2f}",
+            f"Charges ₹{float(v2_m.get('total_charges_inr', 0.0)):,.2f} | 20% Tax",
+        )
+        ca4.metric(
+            "🚀 Annualized Post-Tax XIRR",
+            v2_xirr_txt,
+            f"Pre-fix archive WR: {float(v1_m.get('net_wr_pct', 0.0)):.1f}%" if v1_m else "Clean Rebuild Mode",
+        )
+
+        with st.expander("🛡️ View Automatic Critic Memory Guardrails (`audit_critic_memory.json`)", expanded=False):
+            if isinstance(critic_memory, dict):
+                st.markdown(f"**Instructions**: `{critic_memory.get('next_critic_instructions', '')}`")
+                st.json(guard_status)
+
+        st.markdown("#### 💰 1. Daily Capital, Indian Platform Charges, 20% Tax & XIRR Breakdown")
+        if not daily_cap_xirr_df.empty:
+            render_frozen_3col_dataframe(daily_cap_xirr_df, height=280)
+
+        st.markdown(f"#### 📜 2. Critic Audit History (`regular_audit_log.csv` — `{len(audit_log_df)}` Rows)")
+        if not audit_log_df.empty:
+            render_frozen_3col_dataframe(audit_log_df, height=310)
+
+        st.markdown(f"#### 🔧 3. Audit Gaps & Recommended Quality Upgrades (`audit_gaps_and_changes_log.csv` — `{len(gaps_log_df)}` Gaps)")
+        if not gaps_log_df.empty:
+            render_frozen_3col_dataframe(gaps_log_df, height=340)
 
 

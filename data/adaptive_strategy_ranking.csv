@@ -1,0 +1,10 @@
+Adaptive_Rank,Strategy_ID,Strategy_Name,Closed_Trades,Closed_Wins,Closed_Losses,Closed_WL,Raw_Closed_WR_Pct,Effective_Sample_N,Wilson_Lower_Bound_Pct,Post_Tax_PnL_INR,Peak_Capital_INR,ROI_On_Peak_Pct,Raw_XIRR_Pct,Shrunk_XIRR_Pct,Unique_Trade_Days,Cold_Start_Flag,Adaptive_Rank_Score,Regime_Context
+1,L6_5GATE_10AM_SNIPER,🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper,8,6,2,6W/2L,75.0,2.56,40.7,629.34,39821.49,1.58,44.9,19.9,5,False,45.7,🟡 Sideways / Sectoral Rotation
+2,L5_GLOBAL_MACRO_SNIPER,🌍 L5: Overnight Global Macro Gap & Hold,7,5,2,5W/2L,71.4,0.96,13.9,583.99,38079.4,1.53,73.8,30.4,6,False,29.2,🟡 Sideways / Sectoral Rotation
+3,L3_CATALYST_VWAP_SNIPER,🎯 L3: Institutional Catalyst / Vol-Shock Day-2 VWAP,5,4,1,4W/1L,80.0,0.73,11.7,504.66,39358.63,1.28,0.0,0.0,4,False,26.9,🟡 Sideways / Sectoral Rotation
+4,L2_SUPPORT_SPRING_SNIPER,🎯 L2: Structural Support S1 + 50DMA Spring,1,1,0,1W/0L,100.0,0.95,26.0,38.72,18322.92,0.21,0.0,0.0,1,True,24.84,🟡 Sideways / Sectoral Rotation
+5,OP_S1_Operator_Low_Absorption_BUY,🟢 OP_S1: 1m Operator Spring + VWAP Reclaim BUY,6,4,2,4W/2L,66.7,0.93,7.3,326.9,19924.17,1.64,27.1,10.2,6,False,23.14,🟡 Sideways / Sectoral Rotation
+6,OP_S2_Operator_VWAP_Markup_BUY,🟢 OP_S2: 1m Operator High-Vol VWAP Markup BUY,7,2,5,2W/5L,28.6,1.28,2.4,-651.78,38174.58,-1.71,-51.0,-21.0,5,False,4.31,🟡 Sideways / Sectoral Rotation
+7,OP_S3_Operator_Supply_Dump_SELL,🔴 OP_S3: 1m Operator Supply Dump Breakdown SELL,0,0,0,0W/0L,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,True,0.0,🟡 Sideways / Sectoral Rotation
+8,L1_SECTOR_ORB_SNIPER,🎯 L1: Sectoral Shift + NR7 Compression ORB,0,0,0,0W/0L,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,True,0.0,🟡 Sideways / Sectoral Rotation
+9,L4_DEFENSIVE_RS_SNIPER,🛡️ L4: Bear / High-VIX Relative Strength Fortress,0,0,0,0W/0L,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,True,0.0,🟡 Sideways / Sectoral Rotation

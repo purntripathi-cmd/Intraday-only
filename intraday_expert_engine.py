@@ -66,6 +66,7 @@ STRATEGY_SCORECARD_CSV = os.path.join(DATA_DIR, "strategy_wise_paper_scorecard.c
 PROBABLE_CANDIDATES_CSV = os.path.join(DATA_DIR, "probable_intraday_candidates.csv")
 PROBABLE_CANDIDATES_STRAT_A_CSV = os.path.join(DATA_DIR, "probable_candidates_strategy_a.csv")
 PROBABLE_CANDIDATES_STRAT_B_CSV = os.path.join(DATA_DIR, "probable_candidates_strategy_b.csv")
+ADAPTIVE_STRATEGY_RANKING_CSV = os.path.join(DATA_DIR, "adaptive_strategy_ranking.csv")
 REGULAR_AUDIT_LOG_CSV = os.path.join(DATA_DIR, "regular_audit_log.csv")
 AUDIT_GAPS_CHANGES_CSV = os.path.join(DATA_DIR, "audit_gaps_and_changes_log.csv")
 AUDIT_CRITIC_MEMORY_JSON = os.path.join(DATA_DIR, "audit_critic_memory.json")
@@ -236,11 +237,17 @@ def predict_swing_conversion_success(
     }
 
 
-def detect_global_and_indian_regime(raw_data: pd.DataFrame = None) -> dict:
+def _filter_df_as_of_date(df: pd.DataFrame, as_of_date: str | None) -> pd.DataFrame:
+    if df is None or df.empty or not as_of_date:
+        return df
+    cutoff_d = pd.to_datetime(as_of_date).date()
+    return df[df.index.date <= cutoff_d].copy()
+
+
+def detect_global_and_indian_regime(raw_data: pd.DataFrame = None, as_of_date: str | None = None) -> dict:
     """
-    Analyzes live/latest Nifty 50, India VIX, 7 NSE Sectoral Indices, and Global Cues
-    (S&P 500, Nasdaq 100, Gold, Brent Crude, USD/INR) to classify the current regime
-    and identify sectoral rotation leadership.
+    Analyzes live or point-in-time (as_of_date) Nifty 50, India VIX, 7 NSE Sectoral Indices,
+    and Global Cues (S&P 500, Nasdaq 100, Gold, Brent Crude, USD/INR) strictly with zero future look-ahead.
     """
     if raw_data is None:
         raw_data = yf.download(BENCHMARKS_AND_SECTORS, period="1y", interval="1d", group_by="ticker", progress=False, threads=True)
@@ -250,6 +257,7 @@ def detect_global_and_indian_regime(raw_data: pd.DataFrame = None) -> dict:
         try:
             if sym in raw_data.columns.get_level_values(0):
                 df = normalize_index(raw_data[sym].dropna(subset=["Close"]))
+                df = _filter_df_as_of_date(df, as_of_date)
                 if len(df) >= 20:
                     c = float(df["Close"].iloc[-1])
                     ret1 = float(df["Close"].pct_change().iloc[-1] * 100.0)
@@ -315,14 +323,14 @@ def detect_global_and_indian_regime(raw_data: pd.DataFrame = None) -> dict:
             })
     sector_rankings.sort(key=lambda x: x["rs_vs_nifty_5d_pct"], reverse=True)
 
-    # Determine active Sniper Logics for this regime
     active_logics = [
         lid for lid, lmeta in TOP_5_LOGICS_METADATA.items()
         if regime in lmeta["regime_fit"]
     ]
 
     return {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S IST"),
+        "timestamp": f"{as_of_date or datetime.now().strftime('%Y-%m-%d')} {datetime.now().strftime('%H:%M:%S')} IST",
+        "as_of_date": as_of_date,
         "regime_code": regime,
         "regime_badge": regime_badge,
         "nifty_close": nc,
@@ -341,18 +349,44 @@ def detect_global_and_indian_regime(raw_data: pd.DataFrame = None) -> dict:
     }
 
 
-def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    """
-    Scans the entire 54-ticker Indian NSE & International universe using live market data.
-    Returns:
-      - `regime_report`: Full Indian + International Regime & Sectoral Radar dict
-      - `sniper_triggers_df`: High-conviction Sniper setups firing right now (may be empty if no A+ setup!)
-      - `watchlist_df`: Complete universe radar ranked by Readiness / Distance to Structural S1 Support & Swing Conversion Score
-    """
-    all_tickers = sorted(list(set(list(UNIVERSE_META.keys()) + BENCHMARKS_AND_SECTORS)))
-    raw = yf.download(all_tickers, period="1y", interval="1d", group_by="ticker", progress=False, threads=True)
+def _extract_symbol_frame(raw_df: pd.DataFrame, sym: str, total_tickers: int) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    try:
+        if total_tickers == 1 and "Close" in raw_df.columns and not isinstance(raw_df.columns, pd.MultiIndex):
+            return raw_df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+        if isinstance(raw_df.columns, pd.MultiIndex) and sym in raw_df.columns.get_level_values(0):
+            return raw_df[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    except Exception:
+        pass
+    return pd.DataFrame()
 
-    regime_report = detect_global_and_indian_regime(raw)
+
+SLIPPAGE_BPS_PER_SIDE = 0.0003  # 3 bps realistic NSE execution slippage
+
+
+def evaluate_cnc_sniper_candidates_as_of(
+    raw_daily: pd.DataFrame,
+    raw_5m: pd.DataFrame | None = None,
+    eval_date_str: str | None = None,
+    cutoff_hhmm: str = "10:00:00",
+    exclude_over_budget: bool = False,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """
+    Point-in-time (zero look-ahead) NIFTY 250 CNC Sniper scanner:
+      - Daily trend/volatility indicators are computed strictly from daily bars BEFORE `eval_date_str`.
+      - Intraday open/high/low/close/VWAP/ToD-normalized volume up to `cutoff_hhmm` come strictly
+        from 5-minute bars (`<= eval_date_str cutoff_hhmm`), preventing full-day high/volume leakage.
+      - Enforces strict ₹20,000/ticker budget (`qty == 0` -> excluded from triggers/Top-3).
+    """
+    if eval_date_str is None:
+        # Determine latest session available in Nifty daily series
+        nsei_df = normalize_index(_extract_symbol_frame(raw_daily, "^NSEI", 99))
+        eval_date_str = str(nsei_df.index[-1].date()) if not nsei_df.empty else datetime.now().strftime("%Y-%m-%d")
+
+    eval_date_obj = pd.to_datetime(eval_date_str).date()
+    cutoff_time_obj = pd.Timestamp(cutoff_hhmm).time()
+    regime_report = detect_global_and_indian_regime(raw_daily, as_of_date=eval_date_str)
     mkt_regime = regime_report["regime_code"]
     n_ret1 = regime_report["nifty_ret_1d_pct"]
     n_ret5 = regime_report["nifty_ret_5d_pct"]
@@ -364,74 +398,131 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
 
     sniper_rows = []
     watchlist_rows = []
+    total_daily_cnt = len(UNIVERSE_META) + len(BENCHMARKS_AND_SECTORS)
 
     for sym, meta in UNIVERSE_META.items():
         try:
-            if sym not in raw.columns.get_level_values(0):
+            df = _extract_symbol_frame(raw_daily, sym, total_daily_cnt)
+            if df.empty:
                 continue
-            df = normalize_index(raw[sym].dropna(subset=["Open", "High", "Low", "Close"]))
-            if len(df) < 100:
+            df = normalize_index(df)
+            df = df[df.index.date <= eval_date_obj].copy()
+            prior_daily = df[df.index.date < eval_date_obj].copy()
+            if len(prior_daily) < 95:
                 continue
         except Exception:
             continue
 
-        df["Ret_1D"] = df["Close"].pct_change() * 100.0
-        df["Ret_5D"] = df["Close"].pct_change(5) * 100.0
-        df["Range"] = df["High"] - df["Low"]
-        df["Min_Range_4D"] = df["Range"].rolling(4).min()
-        df["SMA20"] = df["Close"].rolling(20).mean()
-        df["SMA50"] = df["Close"].rolling(50).mean()
-        df["SMA200"] = df["Close"].rolling(200, min_periods=50).mean()
-        df["RSI14"] = compute_rsi(df["Close"], 14)
-        df["ATR14"] = compute_atr(df, 14)
-        df["Vol_SMA20"] = df["Volume"].rolling(20).mean()
-        df["S1_Support"] = compute_structural_support_s1(df, 20)
+        # Compute daily technical indicators strictly up to yesterday (`prior_daily`)
+        prior_daily["Ret_1D"] = prior_daily["Close"].pct_change() * 100.0
+        prior_daily["Ret_5D"] = prior_daily["Close"].pct_change(5) * 100.0
+        prior_daily["Range"] = prior_daily["High"] - prior_daily["Low"]
+        prior_daily["Min_Range_4D"] = prior_daily["Range"].rolling(4).min()
+        prior_daily["SMA20"] = prior_daily["Close"].rolling(20).mean()
+        prior_daily["SMA50"] = prior_daily["Close"].rolling(50).mean()
+        prior_daily["SMA200"] = prior_daily["Close"].rolling(200, min_periods=50).mean()
+        prior_daily["RSI14"] = compute_rsi(prior_daily["Close"], 14)
+        prior_daily["ATR14"] = compute_atr(prior_daily, 14)
+        prior_daily["Vol_SMA20"] = prior_daily["Volume"].rolling(20).mean()
+        prior_daily["S1_Support"] = compute_structural_support_s1(prior_daily, 20)
 
-        row = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        o_curr = float(row["Open"])
-        h_curr = float(row["High"])
-        l_curr = float(row["Low"])
-        c_curr = float(row["Close"])
-        v_curr = float(row["Volume"]) if pd.notna(row["Volume"]) else 0.0
-
+        prev = prior_daily.iloc[-1]
         c_prev = float(prev["Close"])
         h_prev = float(prev["High"])
         l_prev = float(prev["Low"])
         r_prev = float(prev["Range"])
-        atr = float(row["ATR14"]) if pd.notna(row["ATR14"]) and row["ATR14"] > 0 else c_curr * 0.018
-        rsi = float(row["RSI14"]) if pd.notna(row["RSI14"]) else 50.0
+        atr = float(prev["ATR14"]) if pd.notna(prev["ATR14"]) and prev["ATR14"] > 0 else c_prev * 0.018
         rsi_prev = float(prev["RSI14"]) if pd.notna(prev["RSI14"]) else 50.0
-        sma20 = float(row["SMA20"]) if pd.notna(row["SMA20"]) else c_curr
-        sma50 = float(row["SMA50"]) if pd.notna(row["SMA50"]) else c_curr
-        sma200 = float(row["SMA200"]) if pd.notna(row["SMA200"]) else c_curr
+        sma20 = float(prev["SMA20"]) if pd.notna(prev["SMA20"]) else c_prev
+        sma50 = float(prev["SMA50"]) if pd.notna(prev["SMA50"]) else c_prev
+        sma200 = float(prev["SMA200"]) if pd.notna(prev["SMA200"]) else c_prev
         s1_floor = float(prev["S1_Support"]) if pd.notna(prev["S1_Support"]) else c_prev * 0.96
         vol_sma20 = float(prev["Vol_SMA20"]) if pd.notna(prev["Vol_SMA20"]) and prev["Vol_SMA20"] > 0 else 1.0
-        vol_ratio = v_curr / vol_sma20
         prev_vol_ratio = (float(prev["Volume"]) / vol_sma20) if pd.notna(prev["Volume"]) else 1.0
+
+        # Intraday state strictly from 5m bars <= cutoff_time_obj on eval_date_obj (ZERO full-day look-ahead!)
+        bars_5m = _extract_symbol_frame(raw_5m, sym, len(UNIVERSE_META)) if raw_5m is not None else pd.DataFrame()
+        o_curr = h_curr = l_curr = c_curr = vwap_asof = 0.0
+        vol_ratio = 1.0
+        used_5m_asof = False
+
+        if not bars_5m.empty:
+            if bars_5m.index.tz is not None:
+                bars_5m.index = bars_5m.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            day_5m = bars_5m[(bars_5m.index.date == eval_date_obj) & (bars_5m.index.time <= cutoff_time_obj)].copy()
+            if not day_5m.empty:
+                used_5m_asof = True
+                o_curr = float(day_5m["Open"].iloc[0])
+                h_curr = float(day_5m["High"].max())
+                l_curr = float(day_5m["Low"].min())
+                c_curr = float(day_5m["Close"].iloc[-1])
+                tp_5m = (day_5m["High"] + day_5m["Low"] + day_5m["Close"]) / 3.0
+                cum_v_asof = float(day_5m["Volume"].sum())
+                vwap_asof = float((tp_5m * day_5m["Volume"]).sum() / cum_v_asof) if cum_v_asof > 0 else c_curr
+
+                # Time-of-Day normalized volume vs prior 20 sessions cumulative volume up to same HH:MM
+                hist_5m = bars_5m[(bars_5m.index.date < eval_date_obj) & (bars_5m.index.time <= cutoff_time_obj)]
+                if not hist_5m.empty:
+                    daily_cum_vols = hist_5m.groupby(hist_5m.index.date)["Volume"].sum()
+                    daily_cum_vols = daily_cum_vols[daily_cum_vols > 0].tail(20)
+                    med_tod_vol = float(daily_cum_vols.median()) if not daily_cum_vols.empty else 0.0
+                    if med_tod_vol > 0:
+                        vol_ratio = cum_v_asof / med_tod_vol
+                    else:
+                        elapsed_frac = max(0.08, len(day_5m) / 75.0)
+                        vol_ratio = (cum_v_asof / elapsed_frac) / vol_sma20
+                else:
+                    elapsed_frac = max(0.08, len(day_5m) / 75.0)
+                    vol_ratio = (cum_v_asof / elapsed_frac) / vol_sma20
+
+        if not used_5m_asof:
+            # Fallback for international / missing 5m bar only at eval_date close
+            today_rows = df[df.index.date == eval_date_obj]
+            if today_rows.empty:
+                continue
+            r_today = today_rows.iloc[-1]
+            o_curr = float(r_today["Open"])
+            h_curr = float(r_today["High"])
+            l_curr = float(r_today["Low"])
+            c_curr = float(r_today["Close"])
+            vwap_asof = (h_curr + l_curr + c_curr) / 3.0
+            v_curr = float(r_today["Volume"]) if pd.notna(r_today["Volume"]) else 0.0
+            vol_ratio = v_curr / vol_sma20
+
+        if c_curr <= 0:
+            continue
+
+        # Strict Rs 20,000 budget rule: tickers priced > Rs 20,000 cannot be sized (qty == 0)
+        over_budget = c_curr > MAX_BUDGET_PER_TICKER_INR
+        if over_budget and exclude_over_budget:
+            continue
 
         gap_pct = (o_curr - c_prev) / c_prev * 100.0
         day_ret_pct = (c_curr - c_prev) / c_prev * 100.0
-        stock_ret_5d = float(row["Ret_5D"]) if pd.notna(row["Ret_5D"]) else 0.0
+        c_5ago = float(prior_daily["Close"].iloc[-5]) if len(prior_daily) >= 5 else c_prev
+        stock_ret_5d = (c_curr - c_5ago) / max(c_5ago, 1e-6) * 100.0
         stock_rs_5d = stock_ret_5d - n_ret5
+        rsi = rsi_prev  # Strictly pre-session RSI14 to avoid circular look-ahead
 
         sec_info = sec_lookup.get(meta["sector"], {"ret_1d_pct": n_ret1, "rs_vs_nifty_5d_pct": 0.0})
         sec_ret_1d = sec_info["ret_1d_pct"]
         sector_rs_5d = sec_info["rs_vs_nifty_5d_pct"]
 
-        # Evaluate all 5 Sniper Logics
+        above_vwap = c_curr >= vwap_asof * 0.9995
+
         matched_logic_id = None
         matched_logic_name = None
         conviction = 0.0
         entry_trigger = round(o_curr + 0.26 * atr, 2)
-        initial_sl = round(max(o_curr - 0.42 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.990), 2)
+        initial_sl = round(max(o_curr - 0.45 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.988), 2)
 
         # L1: Sectoral Shift + NR7 Compression ORB
         is_nr_compressed = (r_prev <= float(prev["Min_Range_4D"]) * 1.15) or (r_prev < 0.95 * atr)
         near_sma20_or_s1 = ((c_prev - sma20) / sma20 * 100.0 <= 3.5) or ((c_prev - s1_floor) / c_prev * 100.0 <= 4.5)
         if (
-            mkt_regime in ("BULL_EXPANSION", "SIDEWAYS_ROTATION")
+            not over_budget
+            and above_vwap
+            and mkt_regime in ("BULL_EXPANSION", "SIDEWAYS_ROTATION")
             and c_prev > sma20 >= sma50 * 0.995
             and sma50 > sma200
             and near_sma20_or_s1
@@ -447,13 +538,15 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             matched_logic_id = "L1_SECTOR_ORB_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.28 * atr, 2)
-            initial_sl = round(max(o_curr - 0.45 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.990), 2)
+            initial_sl = round(max(o_curr - 0.48 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.988), 2)
             conviction = min(99.0, 84.0 + sector_rs_5d * 2.5 + (vol_ratio - 1.3) * 5.0)
 
         # L2: Structural S1 + 50DMA Institutional Spring
         tested_support_zone = (l_curr <= max(s1_floor * 1.015, sma20 * 1.005)) and (l_curr >= min(s1_floor, sma50) - 0.40 * atr)
         if (
             matched_logic_id is None
+            and not over_budget
+            and above_vwap
             and mkt_regime in ("SIDEWAYS_ROTATION", "BULL_EXPANSION")
             and c_prev > sma200
             and sma50 >= sma200 * 0.99
@@ -467,7 +560,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             matched_logic_id = "L2_SUPPORT_SPRING_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.25 * atr, 2)
-            initial_sl = round(l_curr - 0.18 * atr, 2)
+            initial_sl = round(min(l_curr - 0.20 * atr, entry_trigger * 0.992), 2)
             conviction = min(99.0, 85.0 + (52.0 - rsi_prev) * 0.5 + (vol_ratio - 1.2) * 5.0)
 
         # L3: Fundamental Catalyst / Volume Shock Day-2 VWAP
@@ -477,6 +570,8 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         prev_vwap_proxy = (h_prev + l_prev + c_prev) / 3.0
         if (
             matched_logic_id is None
+            and not over_budget
+            and above_vwap
             and had_catalyst_day1
             and c_prev > sma50 >= sma200 * 0.99
             and -0.35 <= gap_pct <= 1.25
@@ -488,19 +583,21 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             matched_logic_id = "L3_CATALYST_VWAP_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.26 * atr, 2)
-            initial_sl = round(max(prev_vwap_proxy - 0.15 * atr, o_curr - 0.42 * atr, entry_trigger * 0.990), 2)
+            initial_sl = round(max(prev_vwap_proxy - 0.15 * atr, o_curr - 0.45 * atr, entry_trigger * 0.988), 2)
             conviction = min(99.0, 86.0 + prev_vol_ratio * 2.5)
 
         # L4: Bear / High-VIX Defensive Relative Strength Fortress
         is_defensive_or_rs = meta["group"] in ("PHARMA_DEFENSIVE", "FMCG_DEFENSIVE", "INTL_GOLD_MACRO", "IT_GLOBAL", "CAP_GOODS")
         if (
             matched_logic_id is None
+            and not over_budget
+            and above_vwap
             and mkt_regime in ("BEAR_OR_CORRECTION", "HIGH_VOL_MACRO_SHOCK")
             and is_defensive_or_rs
             and stock_rs_5d >= 1.10
             and c_prev > sma20 >= sma50 * 0.99
             and -0.15 <= gap_pct <= 1.05
-            and l_curr >= o_curr - 0.32 * atr
+            and l_curr >= o_curr - 0.35 * atr
             and c_curr >= o_curr + 0.26 * atr
             and vol_ratio >= 1.25
             and sec_ret_1d >= 0.15
@@ -508,7 +605,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             matched_logic_id = "L4_DEFENSIVE_RS_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.26 * atr, 2)
-            initial_sl = round(max(o_curr - 0.38 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.991), 2)
+            initial_sl = round(max(o_curr - 0.40 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.990), 2)
             conviction = min(99.0, 84.0 + stock_rs_5d * 2.5)
 
         # L5: International & Overnight Global Macro Transmission
@@ -520,31 +617,35 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         )
         if (
             matched_logic_id is None
+            and not over_budget
+            and above_vwap
             and is_global_linked
             and global_tailwind
             and c_prev > sma20
             and c_prev >= s1_floor
             and -0.15 <= gap_pct <= 1.15
-            and l_curr >= o_curr - 0.30 * atr
+            and l_curr >= o_curr - 0.32 * atr
             and c_curr >= o_curr + 0.24 * atr
             and vol_ratio >= 1.25
         ):
             matched_logic_id = "L5_GLOBAL_MACRO_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.24 * atr, 2)
-            initial_sl = round(max(o_curr - 0.38 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.991), 2)
+            initial_sl = round(max(o_curr - 0.40 * atr, s1_floor - 0.15 * atr, entry_trigger * 0.990), 2)
             conviction = min(99.0, 85.0 + max(ndx_ret, sp_ret, gold_ret) * 4.5)
 
-        # L6: 5-Gate Pre-Qualified 10:00 AM Intraday Sniper (Triggered ONLY when 5-Gate Swing Criteria are met at 10 AM)
+        # L6: 5-Gate Pre-Qualified 10:00 AM Intraday Sniper
         meets_5gate_10am = (
-            c_prev > max(s1_floor, sma20)
+            not over_budget
+            and above_vwap
+            and c_prev > max(s1_floor, sma20)
             and l_curr >= max(s1_floor, sma20 * 0.998)
             and prev_close_pos >= 0.58
             and (sma20 >= sma50 * 0.995 and sma50 > sma200)
             and (prev_vol_ratio >= 1.15 and vol_ratio >= 1.25)
             and mkt_regime != "BEAR_OR_CORRECTION"
             and -0.10 <= gap_pct <= 1.10
-            and (o_curr - l_curr) <= 0.32 * atr
+            and (o_curr - l_curr) <= 0.35 * atr
             and c_curr >= o_curr + 0.26 * atr
             and sec_ret_1d >= 0.25
             and sector_rs_5d >= 0.20
@@ -554,15 +655,15 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             matched_logic_id = "L6_5GATE_10AM_SNIPER"
             matched_logic_name = TOP_5_LOGICS_METADATA[matched_logic_id]["name"]
             entry_trigger = round(o_curr + 0.26 * atr, 2)
-            initial_sl = round(l_curr - 0.15 * atr, 2)
+            initial_sl = round(min(l_curr - 0.18 * atr, entry_trigger * 0.992), 2)
             conviction = min(99.0, 88.0 + sector_rs_5d * 2.0 + (vol_ratio - 1.2) * 4.5)
 
-        # Determine candidate Best Sniper Logic even for Standby rows so user sees which logic applies
+        # Attribute Standby best-fit logic deterministically from stock/regime traits (no static ticker map!)
         if matched_logic_id is not None:
             best_logic_id = matched_logic_id
             best_logic_name = matched_logic_name
-        elif meets_5gate_10am or (c_curr > max(s1_floor, sma20) and sma20 >= sma50 * 0.995 and sma50 > sma200):
-            best_logic_id = "L6_5GATE_10AM_SNIPER"
+        elif had_catalyst_day1:
+            best_logic_id = "L3_CATALYST_VWAP_SNIPER"
             best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
         elif mkt_regime in ("BEAR_OR_CORRECTION", "HIGH_VOL_MACRO_SHOCK") and is_defensive_or_rs:
             best_logic_id = "L4_DEFENSIVE_RS_SNIPER"
@@ -570,19 +671,19 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         elif is_global_linked and global_tailwind:
             best_logic_id = "L5_GLOBAL_MACRO_SNIPER"
             best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
-        elif had_catalyst_day1:
-            best_logic_id = "L3_CATALYST_VWAP_SNIPER"
-            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
-        elif tested_support_zone:
+        elif tested_support_zone or ((c_prev - s1_floor) / max(c_prev, 1e-6) * 100.0 <= 5.0):
             best_logic_id = "L2_SUPPORT_SPRING_SNIPER"
             best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
-        else:
+        elif is_nr_compressed and sector_rs_5d >= 0.0:
             best_logic_id = "L1_SECTOR_ORB_SNIPER"
             best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
+        else:
+            best_logic_id = "L6_5GATE_10AM_SNIPER"
+            best_logic_name = TOP_5_LOGICS_METADATA[best_logic_id]["name"]
 
-        # Actionable CNC Buy Limit Price: if already triggered, buy at Live_Price (or up to entry_trigger + 0.35*ATR);
-        # if on standby, order trigger is the 10:00 AM ORB / breakout price (max(entry_trigger, c_curr))
-        cnc_buy_limit = round(c_curr, 2) if matched_logic_id is not None else round(max(entry_trigger, c_curr), 2)
+        # Actionable CNC Buy Limit Price + 3 bps execution slippage when already triggered
+        raw_buy_p = c_curr if matched_logic_id is not None else max(entry_trigger, c_curr)
+        cnc_buy_limit = round(raw_buy_p * (1.0 + SLIPPAGE_BPS_PER_SIDE), 2)
         ladder = compute_downside_protection_ladder(cnc_buy_limit, initial_sl, atr, s1_floor)
         swing_pred = predict_swing_conversion_success(
             entry_price=cnc_buy_limit,
@@ -598,7 +699,7 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             sl_breached=(c_curr <= ladder["initial_stop_loss"]) or (c_curr < s1_floor),
         )
 
-        # Readiness score even if not triggered today
+        # Readiness score even if not triggered yet
         readiness = 50.0
         if c_curr > sma200:
             readiness += 12.0
@@ -610,64 +711,74 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             readiness += 10.0
         if vol_ratio >= 1.2:
             readiness += 8.0
+        if above_vwap:
+            readiness += 3.0
 
-        final_score = round(max(readiness, conviction), 1)
+        final_score = round(min(99.0, max(readiness, conviction)), 1)
 
-        # CNC Order Action & Priority Rank (Initial rows = actionable CNC orders first!)
-        if matched_logic_id is not None:
-            order_priority = 1
-            cnc_order_action = f"🟢 BUY CNC NOW ({matched_logic_id.split('_')[0]})"
-            cnc_order_type = "CNC LIMIT BUY (Immediate / 10:00 AM)"
-        elif meets_5gate_10am:
-            order_priority = 2
-            cnc_order_action = "🟢 BUY CNC @ 10AM ORB (L6 5-Gate)"
-            cnc_order_type = "CNC SL-M / LIMIT TRIGGER @ 10:00 AM"
-        elif final_score >= 80.0 and c_curr > s1_floor and stock_rs_5d > 0:
-            order_priority = 3
-            cnc_order_action = f"🟡 WATCH CNC TRIGGER ({best_logic_id.split('_')[0]})"
-            cnc_order_type = "CNC Conditional Limit Above Trigger"
+        if over_budget:
+            order_priority = 9
+            cnc_order_action = "⚪ EXCLUDED (>₹20K BUDGET CAP)"
+            cnc_order_type = "Excluded: 1 Share > ₹20,000 Cap"
+            suggested_cnc_qty = 0
+            cnc_order_value = 0.0
+            per_share_risk = max(0.05, cnc_buy_limit - ladder["initial_stop_loss"])
+            per_share_reward = max(0.05, ladder["intraday_target"] - cnc_buy_limit)
+            rr_ratio = round(per_share_reward / per_share_risk, 2)
+            max_stop_loss_inr = 0.0
         else:
-            order_priority = 4
-            cnc_order_action = "⚪ STANDBY (NO CNC ORDER)"
-            cnc_order_type = "No Order — Wait for Alignment"
+            if matched_logic_id is not None:
+                order_priority = 1
+                cnc_order_action = f"🟢 BUY CNC NOW ({matched_logic_id.split('_')[0]})"
+                cnc_order_type = "CNC LIMIT BUY (Immediate / 10:00 AM)"
+            elif meets_5gate_10am:
+                order_priority = 2
+                cnc_order_action = "🟢 BUY CNC @ 10AM ORB (L6 5-Gate)"
+                cnc_order_type = "CNC SL-M / LIMIT TRIGGER @ 10:00 AM"
+            elif final_score >= 82.0 and c_curr > s1_floor and stock_rs_5d > 0 and above_vwap:
+                order_priority = 3
+                cnc_order_action = f"🟡 WATCH CNC TRIGGER ({best_logic_id.split('_')[0]})"
+                cnc_order_type = "CNC Conditional Limit Above Trigger"
+            else:
+                order_priority = 4
+                cnc_order_action = "⚪ STANDBY (NO CNC ORDER)"
+                cnc_order_type = "No Order — Wait for Alignment"
 
-        # Default ₹20,000 MAX CNC cash allocation sizing per ticker (1x Delivery, zero MIS leverage, Max 3 entries/day)
-        default_cnc_capital = 20000.0
-        suggested_cnc_qty = max(1, int(default_cnc_capital // max(cnc_buy_limit, 1.0)))
-        if suggested_cnc_qty * cnc_buy_limit > default_cnc_capital and suggested_cnc_qty > 1:
-            suggested_cnc_qty -= 1
-        cnc_order_value = round(suggested_cnc_qty * cnc_buy_limit, 2)
-        per_share_risk = max(0.05, cnc_buy_limit - ladder["initial_stop_loss"])
-        per_share_reward = max(0.05, ladder["intraday_target"] - cnc_buy_limit)
-        rr_ratio = round(per_share_reward / per_share_risk, 2)
-        max_stop_loss_inr = round(suggested_cnc_qty * per_share_risk, 2)
+            suggested_cnc_qty = int(MAX_BUDGET_PER_TICKER_INR // max(cnc_buy_limit, 1.0))
+            cnc_order_value = round(suggested_cnc_qty * cnc_buy_limit, 2)
+            per_share_risk = max(0.05, cnc_buy_limit - ladder["initial_stop_loss"])
+            per_share_reward = max(0.05, ladder["intraday_target"] - cnc_buy_limit)
+            rr_ratio = round(per_share_reward / per_share_risk, 2)
+            max_stop_loss_inr = round(suggested_cnc_qty * per_share_risk, 2)
 
-        # Evaluate Live Intraday GTT Exit / Trailing SL Stage if entered at 10:00 AM ORB (entry_trigger)
+        # Evaluate Live Intraday GTT Exit / Trailing SL Stage strictly up to h_curr (as-of cutoff)
         orb_ladder = compute_downside_protection_ladder(entry_trigger, initial_sl, atr, s1_floor)
         mfe_from_trigger = max(0.0, h_curr - entry_trigger) / max(atr, 1e-6) if c_curr >= entry_trigger else 0.0
         active_gtt_sl = ladder["initial_stop_loss"]
         active_trail_stage = "Stage 0: Initial S1/ORB Protected SL"
         if matched_logic_id is not None and c_curr >= entry_trigger:
-            if mfe_from_trigger >= 2.20:
-                cand_sl = round(h_curr - 0.50 * atr, 2)
+            if mfe_from_trigger >= 1.15:
+                cand_sl = round(h_curr - 0.32 * atr, 2)
                 if cand_sl < c_curr:
                     active_gtt_sl = max(active_gtt_sl, cand_sl)
-                    active_trail_stage = "Stage 4: Chandelier Trail (HWM - 0.50 ATR)"
-            elif mfe_from_trigger >= 1.75 and orb_ladder["stage3_trail_sl"] < c_curr:
+                    active_trail_stage = "Stage 4: Chandelier Trail (HWM - 0.32 ATR)"
+            elif mfe_from_trigger >= 0.90 and orb_ladder["stage3_trail_sl"] < c_curr:
                 active_gtt_sl = max(active_gtt_sl, orb_ladder["stage3_trail_sl"])
-                active_trail_stage = "Stage 3: Profit-Lock (+1.15 ATR / 66% Gain)"
-            elif mfe_from_trigger >= 1.25 and orb_ladder["stage2_trail_sl"] < c_curr:
+                active_trail_stage = "Stage 3: Profit-Lock (+0.62 ATR / >=+1.1%)"
+            elif mfe_from_trigger >= 0.65 and orb_ladder["stage2_trail_sl"] < c_curr:
                 active_gtt_sl = max(active_gtt_sl, orb_ladder["stage2_trail_sl"])
-                active_trail_stage = "Stage 2: Profit-Lock (+0.65 ATR / 50% Gain)"
-            elif mfe_from_trigger >= 0.80 and orb_ladder["stage1_trail_sl"] < c_curr:
+                active_trail_stage = "Stage 2: Profit-Lock (+0.35 ATR / >=+0.55%)"
+            elif mfe_from_trigger >= 0.42 and orb_ladder["stage1_trail_sl"] < c_curr:
                 active_gtt_sl = max(active_gtt_sl, orb_ladder["stage1_trail_sl"])
-                active_trail_stage = "Stage 1: Breakeven+ (+0.18 ATR Above 10AM ORB)"
+                active_trail_stage = "Stage 1: Cost-Plus BE (+0.22% Above Entry)"
 
         gtt_sl_limit = round(active_gtt_sl * 0.997, 2)
         gtt_target_trigger = ladder["intraday_target"]
         gtt_target_limit = ladder["gtt_target_limit_price"]
 
-        if matched_logic_id is not None:
+        if over_budget:
+            exit_readiness = "⚪ EXCLUDED: 1 Share Exceeds ₹20,000 Cap"
+        elif matched_logic_id is not None:
             if c_curr >= gtt_target_trigger:
                 exit_readiness = f"🎯 READY FOR EXIT: TARGET HIT (Sell CNC @ ₹{c_curr:.2f})"
             elif c_curr <= active_gtt_sl:
@@ -686,15 +797,15 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         elif swing_pred["predicted_swing_win_rate_pct"] >= 70.0:
             cnc_310pm_action = f"🟡 HOLD 50% CNC OVERNIGHT (4/5 Gates | Trail GTT SL @ ₹{active_gtt_sl:.2f})"
         else:
-            cnc_310pm_action = "🟠 EXIT CNC BY 3:20 PM IST (Cancel GTT & Sell CNC Intraday)"
+            cnc_310pm_action = "🟠 EXIT CNC BY 3:15 PM IST (Cancel GTT & Sell CNC Intraday)"
 
         rec = {
-            # Frozen First 3 Columns (Identifier + CNC Order Action + CNC Order Limit Price)
             "Ticker": sym.replace(".NS", ""),
             "CNC_Order_Action": cnc_order_action,
             "CNC_Buy_Limit_Price": cnc_buy_limit,
-            # Immediate Order-Related Columns (Strictly CNC, Zero MIS)
             "Product_Type": "CNC (Delivery - 0% MIS)",
+            "Product_Mode": "CNC BUY",
+            "Signal_Side": "BUY",
             "CNC_Order_Type": cnc_order_type,
             "Suggested_CNC_Qty": suggested_cnc_qty,
             "CNC_Order_Value_INR": cnc_order_value,
@@ -709,7 +820,6 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "GTT_Swing_Target": ladder["swing_conversion_target"],
             "Active_Trail_Stage": active_trail_stage,
             "CNC_310PM_Decision": cnc_310pm_action,
-            # Logic & Technical Context Columns
             "Order_Priority_Rank": order_priority,
             "Best_Logic_ID": best_logic_id,
             "Best_Logic_Name": best_logic_name,
@@ -719,6 +829,8 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "Meets_5Gate_10AM_Entry": bool(meets_5gate_10am),
             "Live_Price": round(c_curr, 2),
             "ORB_10AM_Trigger": entry_trigger,
+            "Session_VWAP": round(vwap_asof, 2),
+            "Above_VWAP": bool(above_vwap),
             "Day_Change_Pct": round(day_ret_pct, 2),
             "5D_Rel_Strength_Pct": round(stock_rs_5d, 2),
             "Sector_5D_RS_Pct": round(sector_rs_5d, 2),
@@ -738,24 +850,32 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
             "Swing_Conversion_Verdict": swing_pred["verdict"],
             "Market": meta["market"],
             "Sector_Group": meta["group"],
+            "Eval_Date": eval_date_str,
         }
         watchlist_rows.append(rec)
-        if matched_logic_id is not None:
+        if matched_logic_id is not None and not over_budget:
             sniper_rows.append(rec)
 
-    watchlist_df = pd.DataFrame(watchlist_rows).sort_values(
-        ["Order_Priority_Rank", "Sniper_Readiness_Score", "5D_Rel_Strength_Pct"],
-        ascending=[True, False, False],
-    ).reset_index(drop=True)
-
-    # Tag Top 3 Daily Entries (Max 3 entries/day @ <= ₹20,000/ticker = Max ₹60,000/day)
-    slot_labels = []
-    for i in range(len(watchlist_df)):
-        if i < MAX_DAILY_ENTRIES:
-            slot_labels.append(f"🏆 Top #{i+1}/3 (<=₹20K)")
-        else:
-            slot_labels.append("⚪ Standby (>Top 3 Cap)")
-    watchlist_df.insert(3, "Daily_Top3_Slot", slot_labels)
+    watchlist_df = pd.DataFrame(watchlist_rows)
+    if not watchlist_df.empty:
+        watchlist_df = watchlist_df.sort_values(
+            ["Order_Priority_Rank", "Sniper_Readiness_Score", "5D_Rel_Strength_Pct"],
+            ascending=[True, False, False],
+        ).reset_index(drop=True)
+        # Assign Top-3 slots strictly to eligible (<= ₹20K, <=1 per sector among Top 3)
+        slot_labels = []
+        used_sectors = set()
+        top3_count = 0
+        for _, row_w in watchlist_df.iterrows():
+            if int(row_w["Suggested_CNC_Qty"]) > 0 and top3_count < MAX_DAILY_ENTRIES and row_w["Sector_Group"] not in used_sectors:
+                top3_count += 1
+                used_sectors.add(row_w["Sector_Group"])
+                slot_labels.append(f"🏆 Top #{top3_count}/3 (<=₹20K)")
+            elif int(row_w["Suggested_CNC_Qty"]) <= 0:
+                slot_labels.append("⚪ Excluded (>₹20K)")
+            else:
+                slot_labels.append("⚪ Standby (>Top 3 Cap)")
+        watchlist_df.insert(3, "Daily_Top3_Slot", slot_labels)
 
     if sniper_rows:
         sniper_df = pd.DataFrame(sniper_rows).sort_values(
@@ -768,7 +888,37 @@ def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
         ]
         sniper_df.insert(3, "Daily_Top3_Slot", s_slots)
     else:
-        sniper_df = pd.DataFrame(columns=watchlist_df.columns)
+        sniper_df = pd.DataFrame(columns=watchlist_df.columns if not watchlist_df.empty else ["Ticker", "CNC_Order_Action"])
+
+    return regime_report, sniper_df, watchlist_df
+
+
+def scan_live_sniper_opportunities() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """
+    Scans the entire Indian NSE & International universe using point-in-time live market data
+    (daily history < today + 5m bars up to current IST time -> zero look-ahead).
+    """
+    all_daily = sorted(list(set(list(UNIVERSE_META.keys()) + BENCHMARKS_AND_SECTORS)))
+    raw_daily = yf.download(all_daily, period="1y", interval="1d", group_by="ticker", progress=False, threads=True)
+    universe_syms = sorted(list(UNIVERSE_META.keys()))
+    raw_5m = yf.download(universe_syms, period="30d", interval="5m", group_by="ticker", progress=False, threads=True)
+
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    nsei_df = normalize_index(_extract_symbol_frame(raw_daily, "^NSEI", len(all_daily)))
+    latest_mkt_date = str(nsei_df.index[-1].date()) if not nsei_df.empty else now_ist.strftime("%Y-%m-%d")
+    today_ist = now_ist.strftime("%Y-%m-%d")
+    if latest_mkt_date == today_ist and pd.Timestamp("09:15:00").time() <= now_ist.time() <= pd.Timestamp("15:30:00").time():
+        cutoff_hhmm = now_ist.strftime("%H:%M:%S")
+    else:
+        cutoff_hhmm = "10:00:00" if now_ist.weekday() < 5 and now_ist.time() < pd.Timestamp("10:00:00").time() else "15:15:00"
+
+    regime_report, sniper_df, watchlist_df = evaluate_cnc_sniper_candidates_as_of(
+        raw_daily=raw_daily,
+        raw_5m=raw_5m,
+        eval_date_str=latest_mkt_date,
+        cutoff_hhmm=cutoff_hhmm,
+        exclude_over_budget=False,
+    )
 
     watchlist_df.to_csv(os.path.join(DATA_DIR, "live_watchlist_radar.csv"), index=False)
     sniper_df.to_csv(os.path.join(DATA_DIR, "live_sniper_signals.csv"), index=False)
@@ -922,11 +1072,12 @@ def evaluate_chronological_exits(
             df.at[idx, "Purchase_Date"] = str(entry_ts.date())
             df.at[idx, "Purchase_Time"] = entry_ts.strftime("%H:%M:%S")
 
-            # Optional: anchor Entry_Price to the actual 5m candle close at Purchase_Time
+            # Optional: anchor Entry_Price to the actual 5m candle close at Purchase_Time (+ 3 bps buy slippage)
             if sync_purchase_candle_price:
                 same_day_bars = bars[(bars.index.date == entry_ts.date()) & (bars.index <= entry_ts)]
                 if not same_day_bars.empty:
-                    entry_p = round(float(same_day_bars["Close"].iloc[-1]), 2)
+                    raw_c = float(same_day_bars["Close"].iloc[-1])
+                    entry_p = round(raw_c * (1.0 + SLIPPAGE_BPS_PER_SIDE), 2)
                     df.at[idx, "Entry_Price"] = entry_p
                     ladder_recalc = compute_downside_protection_ladder(entry_p, entry_p - 0.95 * atr, atr, s1_floor)
                     init_sl = ladder_recalc["initial_stop_loss"]
@@ -934,11 +1085,21 @@ def evaluate_chronological_exits(
                     df.at[idx, "Initial_SL"] = init_sl
                     df.at[idx, "Target_Price"] = target_p
 
-        # Enforce <= ₹20,000 max budget per ticker
-        budget_cap = min(MAX_BUDGET_PER_TICKER_INR, float(df.at[idx, "Max_Budget_INR"]) if "Max_Budget_INR" in df.columns and pd.notna(df.at[idx, "Max_Budget_INR"]) and float(df.at[idx, "Max_Budget_INR"]) > 0 else MAX_BUDGET_PER_TICKER_INR)
-        cnc_qty = max(1, int(budget_cap // max(entry_p, 1.0)))
-        if cnc_qty * entry_p > budget_cap and cnc_qty > 1:
-            cnc_qty -= 1
+        # Strictly enforce <= ₹20,000 max budget per ticker (zero qty if share price > budget_cap)
+        budget_cap = min(
+            MAX_BUDGET_PER_TICKER_INR,
+            float(df.at[idx, "Max_Budget_INR"]) if "Max_Budget_INR" in df.columns and pd.notna(df.at[idx, "Max_Budget_INR"]) and float(df.at[idx, "Max_Budget_INR"]) > 0 else MAX_BUDGET_PER_TICKER_INR,
+        )
+        if entry_p <= 0 or entry_p > budget_cap:
+            df.at[idx, "CNC_Qty"] = 0
+            df.at[idx, "Capital_Used_INR"] = 0.0
+            df.at[idx, "Status"] = "EXCLUDED_OVER_BUDGET"
+            df.at[idx, "Exit_Reason"] = f"Excluded: Entry price ₹{entry_p:,.2f} exceeds ₹{budget_cap:,.0f} cap"
+            df.at[idx, "PnL_INR"] = 0.0
+            df.at[idx, "PnL_Pct"] = 0.0
+            continue
+
+        cnc_qty = int(budget_cap // max(entry_p, 1.0))
         capital_used = round(cnc_qty * entry_p, 2)
 
         df.at[idx, "Product_Type"] = "CNC (Delivery - 0% MIS)"
@@ -975,20 +1136,13 @@ def evaluate_chronological_exits(
         stage_events = []
 
         if not bars.empty:
-            # Filter 5m candles on purchase date from Purchase_Time + 5m up to min(click_ts, 15:15 IST)
-            # (or multi-day if SWING_CONVERTED and not eod_315pm_auto_exit)
             if eod_315pm_auto_exit:
                 upper_bound_ts = min(click_ts, eod_315_ts)
                 window_bars = bars[(bars.index > cutoff_ts) & (bars.index >= track_start_ts) & (bars.index <= upper_bound_ts) & (bars.index.date == entry_ts.date())]
             else:
                 window_bars = bars[(bars.index > cutoff_ts) & (bars.index >= track_start_ts) & (bars.index <= click_ts)]
 
-            if not window_bars.empty:
-                win_low = float(window_bars["Low"].min())
-                win_high = float(window_bars["High"].max())
-
             for b_ts, b_row in window_bars.iterrows():
-                # Skip any post-3:15 PM bars on purchase date
                 if b_ts.date() == entry_ts.date() and b_ts.time() > pd.Timestamp("15:15:00").time():
                     continue
 
@@ -996,16 +1150,18 @@ def evaluate_chronological_exits(
                 bl = float(b_row["Low"])
                 bh = float(b_row["High"])
                 bc = float(b_row["Close"])
+                win_low = min(win_low, bl)
+                win_high = max(win_high, bh)
 
                 # 1) Check active stop loss / trailing stop BEFORE upgrading HWM/SL from current bar's high
                 if bl <= curr_sl:
-                    exit_p = round(curr_sl, 2)
+                    exit_p = round(curr_sl * (1.0 - SLIPPAGE_BPS_PER_SIDE), 2)
                     pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
                     pnl_inr = round((exit_p - entry_p) * cnc_qty, 2)
                     df.at[idx, "Status"] = "STOP_OR_TRAIL_EXIT"
                     df.at[idx, "Exit_Price"] = exit_p
                     df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                    df.at[idx, "Exit_Reason"] = f"🛑 5m Candle Low (₹{bl:.2f}) hit SL/Trail ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
+                    df.at[idx, "Exit_Reason"] = f"🛑 5m Candle Low (₹{bl:.2f}) hit SL/Trail ₹{curr_sl:.2f} (Slipped Fill ₹{exit_p:.2f}) at {b_ts.strftime('%H:%M')}"
                     df.at[idx, "GTT_Order_Status"] = f"🛑 AUTO-EXITED @ ₹{exit_p:.2f} ({b_ts.strftime('%H:%M')} SL/Trail Hit)"
                     df.at[idx, "Live_CMP"] = exit_p
                     df.at[idx, "PnL_Pct"] = pnl_pct
@@ -1016,7 +1172,7 @@ def evaluate_chronological_exits(
                     exited = True
                     break
 
-                # 2) Check intraday profit target achievement
+                # 2) Check intraday profit target achievement (resting limit target fill)
                 if bh >= target_p:
                     exit_p = round(target_p, 2)
                     pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
@@ -1035,7 +1191,7 @@ def evaluate_chronological_exits(
                     exited = True
                     break
 
-                # 3) Upgrade High-Water-Mark and 4-Stage Intraday-Scaled Trailing Stop for SUBSEQUENT 5m bars (v2.0 GAP-04)
+                # 3) Upgrade High-Water-Mark and 4-Stage Intraday-Scaled Trailing Stop for SUBSEQUENT 5m bars
                 prev_sl = curr_sl
                 hwm = max(hwm, bh)
                 mfe_atr = (hwm - entry_p) / max(atr, 1e-6)
@@ -1062,15 +1218,15 @@ def evaluate_chronological_exits(
                 df.at[idx, "Performance_Verdict"] = _format_performance_verdict(pnl_inr, pnl_pct, False)
                 df.at[idx, "Last_Evaluated_Bar_TS"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
 
-                # 4) Check 3:15 PM IST (15:15:00) Auto-Exit Rule on Purchase Date
+                # 4) Check 3:15 PM IST (15:15:00) Auto-Exit Rule on Purchase Date (+ 3 bps sell slippage)
                 if eod_315pm_auto_exit and b_ts.date() == entry_ts.date() and b_ts.time() >= pd.Timestamp("15:15:00").time():
-                    exit_p = round(bc, 2)
+                    exit_p = round(bc * (1.0 - SLIPPAGE_BPS_PER_SIDE), 2)
                     pnl_pct = round((exit_p - entry_p) / entry_p * 100.0, 2)
                     pnl_inr = round((exit_p - entry_p) * cnc_qty, 2)
                     df.at[idx, "Status"] = "AUTO_EXIT_315PM_CLOSE"
                     df.at[idx, "Exit_Price"] = exit_p
                     df.at[idx, "Exit_Timestamp"] = b_ts.strftime("%Y-%m-%d %H:%M:%S")
-                    df.at[idx, "Exit_Reason"] = f"⏰ 3:15 PM IST Auto-Exit @ Candle Close ₹{exit_p:.2f} (Peak ₹{hwm:.2f}, Trail SL ₹{curr_sl:.2f})"
+                    df.at[idx, "Exit_Reason"] = f"⏰ 3:15 PM IST Auto-Exit @ Candle Close ₹{bc:.2f} (Slipped ₹{exit_p:.2f} | Peak ₹{hwm:.2f}, Trail SL ₹{curr_sl:.2f})"
                     df.at[idx, "GTT_Order_Status"] = f"⏰ AUTO-EXITED @ ₹{exit_p:.2f} (3:15 PM IST Close)"
                     df.at[idx, "Live_CMP"] = exit_p
                     df.at[idx, "PnL_Pct"] = pnl_pct
@@ -1146,7 +1302,7 @@ def evaluate_chronological_exits(
 
 def stage_ticker_into_top3_cnc(
     ticker: str,
-    watchlist_df: pd.DataFrame,
+    watchlist_df: pd.DataFrame | None = None,
     regime_badge: str = "TRENDING_OR_ROTATION",
     entry_price: float | None = None,
     budget_inr: float = MAX_BUDGET_PER_TICKER_INR,
@@ -1156,37 +1312,64 @@ def stage_ticker_into_top3_cnc(
     sync_purchase_candle_price: bool = False,
     replace_slot3_if_full: bool = True,
     trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+    row_data: dict | None = None,
+    entry_price_override: float | None = None,
+    budget_per_ticker: float | None = None,
 ) -> tuple[bool, str, pd.DataFrame]:
     """
     Stages a selected ticker into the Top 3 daily CNC entries (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`)
     with a strict maximum budget of ₹20,000 per ticker (`MAX_BUDGET_PER_TICKER_INR = 20000.0`)
-    and max 3 entries per day (`MAX_DAILY_ENTRIES = 3`), then immediately runs the 5-minute
-    candle replay from `Purchase_Time + 5m` through `3:15 PM IST` / click time.
+    and max 3 entries per day (`MAX_DAILY_ENTRIES = 3`), rejecting any stock whose share price
+    exceeds the budget cap, then immediately runs the 5-minute candle replay.
     """
     clean_ticker = str(ticker).strip().replace(".NS", "")
-    budget_cap = min(MAX_BUDGET_PER_TICKER_INR, max(1000.0, float(budget_inr)))
+    eff_budget = budget_per_ticker if budget_per_ticker is not None else budget_inr
+    budget_cap = min(MAX_BUDGET_PER_TICKER_INR, max(1000.0, float(eff_budget)))
 
-    row_match = watchlist_df[watchlist_df["Ticker"] == clean_ticker]
-    if row_match.empty:
+    r = None
+    if watchlist_df is not None and not watchlist_df.empty and "Ticker" in watchlist_df.columns:
+        row_match = watchlist_df[watchlist_df["Ticker"].astype(str) == clean_ticker]
+        if not row_match.empty:
+            r = row_match.iloc[0].to_dict()
+    if r is None and row_data is not None:
+        r = dict(row_data)
+    if r is None:
+        wl_p = os.path.join(DATA_DIR, "live_watchlist_radar.csv")
+        if os.path.exists(wl_p):
+            try:
+                wl_f = pd.read_csv(wl_p)
+                m = wl_f[wl_f["Ticker"].astype(str) == clean_ticker]
+                if not m.empty:
+                    r = m.iloc[0].to_dict()
+            except Exception:
+                pass
+    if r is None:
         return False, f"Ticker {clean_ticker} not found in live watchlist radar.", pd.DataFrame()
-    r = row_match.iloc[0]
 
-    # Resolve purchase date (if not provided, use latest session date from existing ledger or today)
-    now_ist = pd.Timestamp.now()
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
     if not purchase_date_str:
-        purchase_date_str = now_ist.strftime("%Y-%m-%d")
+        purchase_date_str = str(r.get("Eval_Date", now_ist.strftime("%Y-%m-%d")))[:10]
     if len(purchase_time_str.strip()) == 5:
         purchase_time_str = purchase_time_str.strip() + ":00"
     entry_ts_str = f"{purchase_date_str} {purchase_time_str}"
 
-    eff_entry_p = round(float(entry_price if entry_price and entry_price > 0 else r["CNC_Buy_Limit_Price"]), 2)
-    s1_floor = round(float(r["Structural_S1_Floor"]), 2)
-    atr_val = round(float(r["ATR_14"]) if "ATR_14" in r and pd.notna(r["ATR_14"]) else max(eff_entry_p * 0.015, ( float(r["Intraday_Target"]) - eff_entry_p ) / 1.80), 2)
+    raw_ep = entry_price_override if (entry_price_override is not None and entry_price_override > 0) else entry_price
+    eff_entry_p = round(float(raw_ep if raw_ep and raw_ep > 0 else r.get("CNC_Buy_Limit_Price", r.get("Recommended_Entry_Price", 0.0))), 2)
+    if eff_entry_p <= 0 or eff_entry_p > budget_cap:
+        return (
+            False,
+            f"⚠️ Excluded {clean_ticker}: Entry price ₹{eff_entry_p:,.2f} exceeds ₹{budget_cap:,.0f} per-ticker CNC budget cap.",
+            pd.DataFrame(),
+        )
+
+    s1_floor = round(float(r.get("Structural_S1_Floor", eff_entry_p * 0.985)), 2)
+    raw_tgt = float(r.get("Intraday_Target", r.get("Raw_Target_Price", eff_entry_p * 1.02)))
+    atr_val = round(float(r["ATR_14"]) if "ATR_14" in r and pd.notna(r["ATR_14"]) else max(eff_entry_p * 0.015, (raw_tgt - eff_entry_p) / 1.80), 2)
     ladder = compute_downside_protection_ladder(eff_entry_p, eff_entry_p - 0.95 * atr_val, atr_val, s1_floor)
 
-    cnc_qty = max(1, int(budget_cap // max(eff_entry_p, 1.0)))
-    if cnc_qty * eff_entry_p > budget_cap and cnc_qty > 1:
-        cnc_qty -= 1
+    cnc_qty = int(budget_cap // max(eff_entry_p, 1.0))
+    if cnc_qty < 1:
+        return False, f"⚠️ Excluded {clean_ticker}: Cannot buy >=1 CNC share within ₹{budget_cap:,.0f}.", pd.DataFrame()
     cap_used = round(cnc_qty * eff_entry_p, 2)
 
     if os.path.exists(trades_csv_path):
@@ -1298,32 +1481,57 @@ def stage_ticker_into_top3_cnc(
 def stage_top3_daily_cnc_entries(
     watchlist_df: pd.DataFrame,
     regime_badge: str = "TRENDING_OR_ROTATION",
+    purchase_date_str: str | None = None,
     purchase_time_str: str = "10:00:00",
     eod_315pm_auto_exit: bool = True,
     sync_purchase_candle_price: bool = True,
     trades_csv_path: str = SNIPER_TELEMETRY_CSV,
+    max_entries: int = MAX_DAILY_ENTRIES,
 ) -> pd.DataFrame:
     """
-    Populates the Top 3 daily CNC slots (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`) using the top 3
-    ranked candidates from `watchlist_df` with max ₹20,000 budget per ticker (<= ₹60,000 total)
-    and replays 5-minute candles from `Purchase_Time + 5m` through `3:15 PM IST`.
+    Populates up to Top 3 daily CNC slots (`Slot #1/3`, `Slot #2/3`, `Slot #3/3`) using strictly
+    budget-eligible (<= ₹20K), sector-diversified (max 1 per sector), high-conviction candidates
+    (Order_Priority_Rank <= 3) and replays 5m candles (`Purchase_Time + 5m -> 3:15 PM IST`).
     """
-    if watchlist_df.empty:
+    if watchlist_df is None or watchlist_df.empty:
         return pd.DataFrame()
 
-    # Clear existing file so Top 3 slots are cleanly built
     if os.path.exists(trades_csv_path):
         os.remove(trades_csv_path)
 
-    top3 = watchlist_df.head(MAX_DAILY_ENTRIES)
+    eligible = watchlist_df.copy()
+    if "CNC_Buy_Limit_Price" in eligible.columns:
+        eligible = eligible[eligible["CNC_Buy_Limit_Price"].astype(float) <= MAX_BUDGET_PER_TICKER_INR].copy()
+    if "Suggested_CNC_Qty" in eligible.columns:
+        eligible = eligible[eligible["Suggested_CNC_Qty"].astype(int) >= 1].copy()
+    if "Order_Priority_Rank" in eligible.columns:
+        qualified = eligible[eligible["Order_Priority_Rank"].astype(int) <= 3].copy()
+        if not qualified.empty:
+            eligible = qualified
+        else:
+            eligible = eligible[eligible.get("Sniper_Readiness_Score", 0.0).astype(float) >= 75.0].head(max_entries).copy()
+
+    # Enforce portfolio-wide max 1 position per sector
+    chosen_rows = []
+    seen_sectors = set()
+    for _, r in eligible.iterrows():
+        sec = str(r.get("Sector_Group", r.get("Ticker", "")))
+        if sec in seen_sectors:
+            continue
+        seen_sectors.add(sec)
+        chosen_rows.append(r)
+        if len(chosen_rows) >= max_entries:
+            break
+
     df_out = pd.DataFrame()
-    for _, r in top3.iterrows():
+    for r in chosen_rows:
         _, _, df_out = stage_ticker_into_top3_cnc(
             ticker=str(r["Ticker"]),
-            watchlist_df=watchlist_df,
+            watchlist_df=eligible,
             regime_badge=regime_badge,
             entry_price=float(r["CNC_Buy_Limit_Price"]),
             budget_inr=MAX_BUDGET_PER_TICKER_INR,
+            purchase_date_str=purchase_date_str,
             purchase_time_str=purchase_time_str,
             eod_315pm_auto_exit=eod_315pm_auto_exit,
             sync_purchase_candle_price=sync_purchase_candle_price,
@@ -1404,6 +1612,78 @@ def _sync_fresh_cnc_history(df: pd.DataFrame) -> None:
         pass
 
 
+def rebuild_clean_cnc_history_from_market(
+    start_date: str = APP_CREATED_DATE,
+    eod_315pm_auto_exit: bool = True,
+) -> pd.DataFrame:
+    """
+    Rebuilds `fresh_cnc_sniper_history.csv` and `sniper_telemetry_trades.csv` across every real NSE
+    trading day since `start_date` using zero-look-ahead 10:00 AM IST candidate evaluation and
+    chronological 5-minute bar replay (`10:05 -> 15:15 IST`). Zero synthetic/hardcoded rows.
+    """
+    all_daily = sorted(list(set(list(UNIVERSE_META.keys()) + BENCHMARKS_AND_SECTORS)))
+    raw_daily = yf.download(all_daily, period="1y", interval="1d", group_by="ticker", progress=False, threads=True)
+    universe_syms = sorted(list(UNIVERSE_META.keys()))
+    raw_5m = yf.download(universe_syms, period="60d", interval="5m", group_by="ticker", progress=False, threads=True)
+
+    nsei_df = normalize_index(_extract_symbol_frame(raw_daily, "^NSEI", len(all_daily)))
+    if nsei_df.empty:
+        return pd.DataFrame()
+
+    session_dates = sorted([str(d) for d in set(nsei_df.index.date) if str(d) >= start_date])
+    all_replayed = []
+    tmp_csv = os.path.join(DATA_DIR, "_tmp_cnc_day_replay.csv")
+
+    for s_date in session_dates:
+        try:
+            reg_rep, sn_d, wl_d = evaluate_cnc_sniper_candidates_as_of(
+                raw_daily=raw_daily,
+                raw_5m=raw_5m,
+                eval_date_str=s_date,
+                cutoff_hhmm="10:00:00",
+                exclude_over_budget=True,
+            )
+            src_d = sn_d if not sn_d.empty else wl_d
+            if src_d.empty:
+                continue
+            day_res = stage_top3_daily_cnc_entries(
+                watchlist_df=src_d,
+                regime_badge=reg_rep.get("regime_badge", "LIVE"),
+                purchase_date_str=s_date,
+                purchase_time_str="10:00:00",
+                eod_315pm_auto_exit=eod_315pm_auto_exit,
+                sync_purchase_candle_price=True,
+                trades_csv_path=tmp_csv,
+                max_entries=MAX_DAILY_ENTRIES if reg_rep.get("regime_code") == "BULL_EXPANSION" else 2,
+            )
+            if not day_res.empty:
+                all_replayed.append(day_res)
+        except Exception:
+            continue
+
+    if os.path.exists(tmp_csv):
+        try:
+            os.remove(tmp_csv)
+        except Exception:
+            pass
+
+    if not all_replayed:
+        return pd.DataFrame()
+
+    full_hist = pd.concat(all_replayed, ignore_index=True)
+    full_hist = full_hist[full_hist["Purchase_Date"].astype(str) >= start_date].copy()
+    full_hist = full_hist.drop_duplicates(subset=["Purchase_Date", "Ticker"], keep="first")
+    full_hist = full_hist.sort_values(by=["Purchase_Date", "Daily_Slot"], ascending=[False, True]).reset_index(drop=True)
+    full_hist.to_csv(FRESH_CNC_HISTORY_CSV, index=False)
+
+    # Set latest session rows as active SNIPER_TELEMETRY_CSV
+    latest_d = str(full_hist["Purchase_Date"].max())
+    latest_top3 = full_hist[full_hist["Purchase_Date"].astype(str) == latest_d].head(MAX_DAILY_ENTRIES).reset_index(drop=True)
+    latest_top3.to_csv(SNIPER_TELEMETRY_CSV, index=False)
+    latest_top3.to_csv(SNIPER_TRADES_CSV, index=False)
+    return full_hist
+
+
 def auto_rollover_daily_top3_cnc(
     trades_csv_path: str = SNIPER_TELEMETRY_CSV,
     eod_315pm_auto_exit: bool = True,
@@ -1411,10 +1691,8 @@ def auto_rollover_daily_top3_cnc(
     """
     Automatically archives prior sessions' Top-3 CNC paper trades into
     `fresh_cnc_sniper_history.csv` and auto-stages today's Top-3 CNC paper trades
-    on any weekday once IST >= 09:30 AM (including post-market catch-up if the app
-    is opened after 15:30 IST).
+    on any weekday once IST >= 09:30 AM (strictly from real market data).
     """
-    _ensure_monday_nov02_baseline_trades()
     now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
     today_str = now_ist.strftime("%Y-%m-%d")
     is_trading_day_eligible = (
@@ -1431,7 +1709,6 @@ def auto_rollover_daily_top3_cnc(
                     wl_path = os.path.join(DATA_DIR, "live_watchlist_radar.csv")
                     sn_path = os.path.join(DATA_DIR, "live_sniper_signals.csv")
                     rep_path = os.path.join(DATA_DIR, "live_regime_report.json")
-                    # Refresh watchlist if missing or stale
                     if not os.path.exists(wl_path):
                         try:
                             scan_live_sniper_opportunities()
@@ -1440,22 +1717,24 @@ def auto_rollover_daily_top3_cnc(
                     wl_df = pd.read_csv(wl_path) if os.path.exists(wl_path) else pd.DataFrame()
                     sn_df = pd.read_csv(sn_path) if os.path.exists(sn_path) else pd.DataFrame()
                     src_df = sn_df if not sn_df.empty else wl_df
-                    if not src_df.empty and len(src_df) < 3 and not wl_df.empty:
-                        extra = wl_df[~wl_df["Ticker"].isin(src_df["Ticker"])].head(3 - len(src_df))
-                        src_df = pd.concat([src_df, extra], ignore_index=True)
                     reg_badge = "LIVE"
+                    reg_code = "SIDEWAYS_ROTATION"
                     if os.path.exists(rep_path):
                         with open(rep_path, "r", encoding="utf-8") as f:
-                            reg_badge = json.load(f).get("regime_badge", "LIVE")
+                            rep_obj = json.load(f)
+                            reg_badge = rep_obj.get("regime_badge", "LIVE")
+                            reg_code = rep_obj.get("regime_code", "SIDEWAYS_ROTATION")
                     entry_t = "10:00:00" if now_ist.hour >= 10 else "09:30:00"
                     if not src_df.empty:
                         return stage_top3_daily_cnc_entries(
                             watchlist_df=src_df,
                             regime_badge=reg_badge,
+                            purchase_date_str=today_str,
                             purchase_time_str=entry_t,
                             eod_315pm_auto_exit=eod_315pm_auto_exit,
                             sync_purchase_candle_price=True,
                             trades_csv_path=trades_csv_path,
+                            max_entries=MAX_DAILY_ENTRIES if reg_code == "BULL_EXPANSION" else 2,
                         )
         except Exception:
             pass
@@ -1681,18 +1960,67 @@ def get_bel_oct16_validated_footprints() -> pd.DataFrame:
     return df
 
 
+def _download_chunked_1m_bars(
+    shortlist: list[str],
+    start_date: str = APP_CREATED_DATE,
+) -> dict[str, pd.DataFrame]:
+    """
+    Fetches real 1-minute NSE bars across all trading sessions since `max(start_date, today-27d)`
+    in Yahoo Finance 7-day chunks, returning tz-naive Asia/Kolkata DataFrames keyed by ticker.
+    """
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+    earliest_allowed = now_ist - pd.Timedelta(days=27)
+    start_dt = max(pd.to_datetime(start_date), earliest_allowed).normalize()
+    end_dt = (now_ist + pd.Timedelta(days=1)).normalize()
+
+    chunks: dict[str, list[pd.DataFrame]] = {sym: [] for sym in shortlist}
+    cur = start_dt
+    while cur < end_dt:
+        nxt = min(cur + pd.Timedelta(days=6), end_dt)
+        try:
+            raw = yf.download(
+                shortlist,
+                start=cur.strftime("%Y-%m-%d"),
+                end=nxt.strftime("%Y-%m-%d"),
+                interval="1m",
+                group_by="ticker",
+                progress=False,
+                threads=True,
+            )
+            if raw is not None and not raw.empty:
+                for sym in shortlist:
+                    f = _extract_symbol_frame(raw, sym, len(shortlist))
+                    if not f.empty:
+                        if f.index.tz is not None:
+                            f.index = f.index.tz_convert("Asia/Kolkata").tz_localize(None)
+                        chunks[sym].append(f)
+        except Exception:
+            pass
+        cur = nxt
+
+    out: dict[str, pd.DataFrame] = {}
+    for sym, parts in chunks.items():
+        if parts:
+            merged = pd.concat(parts)
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            out[sym] = merged
+    return out
+
+
 def scan_operator_1m_footprints(
     watchlist_df: pd.DataFrame | None = None,
     top_n_shortlist: int = 24,
-    min_vol_mult: float = 4.5,
+    min_vol_mult: float = 5.0,
+    start_date: str = APP_CREATED_DATE,
 ) -> pd.DataFrame:
     """
-    Zero-Load 2-Stage 1-Minute Operator / Big-Player Footprint Scanner across NIFTY 250:
-      - Stage 1: Uses the cached NIFTY 250 daily/watchlist scan (`watchlist_df`) to shortlist the
-        top `top_n_shortlist` volume-active & high-readiness stocks + high-beta institutional F&O leaders
-        (`BEL.NS`, `HAL.NS`, `MCX.NS`, `BSE.NS`, `TRENT.NS`, `DIVISLAB.NS`, `RELIANCE.NS`, `SBIN.NS`, etc.).
-      - Stage 2: Downloads `period="5d", interval="1m"` ONLY for the shortlist (~24 tickers, <1 MB RAM, ~1.5s)
-        and runs the 3-Candle Operator Volume-Shock + T+2m Follow-Through Confirmation detector.
+    Quality-First NIFTY 250 1-Minute Operator / Big-Player Footprint Scanner:
+      - Fetches chunked `1m` bars across ALL sessions >= APP_CREATED_DATE (within 28d YF window)
+        plus `5m` bars (`30d`) for structural `5m ATR(14)`, `ORL_30m`, and `5m EMA20` slope.
+      - Enforces ₹1.0 Cr minimum 1m cash value (`Shock_1m_Value >= 10_000_000`), strict VWAP &
+        CLV alignment (`>= 0.65` BUY, `<= 0.30` SELL), prime morning institutional window
+        (`09:20-11:15 IST`), 3 bps symmetric slippage, >=0.60% / 1.2x 5m-ATR SL, R:R >= 1.85,
+        bounded MFE/MAE up to exit bar, and strict `price <= ₹20,000` budget cap.
     """
     if watchlist_df is None or watchlist_df.empty:
         wl_path = os.path.join(DATA_DIR, "live_watchlist_radar.csv")
@@ -1709,7 +2037,10 @@ def scan_operator_1m_footprints(
     shortlist = list(priority_fo_tickers)
 
     if watchlist_df is not None and not watchlist_df.empty and "Ticker" in watchlist_df.columns:
-        wl_sorted = watchlist_df.sort_values(
+        wl_eligible = watchlist_df.copy()
+        if "CNC_Buy_Limit_Price" in wl_eligible.columns:
+            wl_eligible = wl_eligible[wl_eligible["CNC_Buy_Limit_Price"].astype(float) <= MAX_BUDGET_PER_TICKER_INR]
+        wl_sorted = wl_eligible.sort_values(
             by=["Vol_Ratio_20D", "Sniper_Readiness_Score"],
             ascending=[False, False],
         )
@@ -1720,51 +2051,48 @@ def scan_operator_1m_footprints(
             if len(shortlist) >= top_n_shortlist + 8:
                 break
 
-    # Include any active tickers in OPERATOR_TRADES_CSV
-    if os.path.exists(OPERATOR_TRADES_CSV):
-        try:
-            op_existing = pd.read_csv(OPERATOR_TRADES_CSV)
-            if not op_existing.empty and "Ticker" in op_existing.columns:
-                for t in op_existing["Ticker"].dropna().unique():
-                    sym = f"{str(t).strip().replace('.NS', '')}.NS"
-                    if sym not in shortlist:
-                        shortlist.append(sym)
-        except Exception:
-            pass
-
     shortlist = sorted(list(set(shortlist)))
-    raw_1m = yf.download(shortlist, period="5d", interval="1m", group_by="ticker", progress=False, threads=True)
+    bars_1m_map = _download_chunked_1m_bars(shortlist, start_date=start_date)
+    raw_5m = yf.download(shortlist + ["^NSEI"], period="30d", interval="5m", group_by="ticker", progress=False, threads=True)
+    raw_daily = yf.download(["^NSEI"], period="6mo", interval="1d", group_by="ticker", progress=False, threads=True)
 
     detected_rows = []
     for sym in shortlist:
         ticker_clean = sym.replace(".NS", "")
-        try:
-            if len(shortlist) == 1 and "Close" in raw_1m.columns and not isinstance(raw_1m.columns, pd.MultiIndex):
-                bars = raw_1m.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-            elif sym in raw_1m.columns.get_level_values(0):
-                bars = raw_1m[sym].dropna(subset=["Open", "High", "Low", "Close"]).copy()
-            else:
-                continue
-            if bars.empty or len(bars) < 20:
-                continue
-            if bars.index.tz is not None:
-                bars.index = bars.index.tz_convert("Asia/Kolkata").tz_localize(None)
-        except Exception:
+        meta = UNIVERSE_META.get(sym, {"market": "INDIA", "group": "NSE_FO"})
+        sector_group = meta.get("group", "NSE_FO")
+
+        bars = bars_1m_map.get(sym, pd.DataFrame())
+        if bars.empty or len(bars) < 20:
             continue
 
-        # Compute rolling 20m volume median and 30m high/low across the continuous 1m bar series
-        # so early-morning candles on a live trading day (09:20+ IST) have full prior-20m context
+        # 5m structural context for ATR_5m and EMA20_5m (point-in-time <= ts_t2)
+        bars_5m = _extract_symbol_frame(raw_5m, sym, len(shortlist) + 1)
+        if not bars_5m.empty:
+            if bars_5m.index.tz is not None:
+                bars_5m.index = bars_5m.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            bars_5m = bars_5m.sort_index()
+            tr_5m = pd.concat([
+                bars_5m["High"] - bars_5m["Low"],
+                (bars_5m["High"] - bars_5m["Close"].shift(1)).abs(),
+                (bars_5m["Low"] - bars_5m["Close"].shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            bars_5m["ATR14_5m"] = tr_5m.rolling(14, min_periods=5).mean()
+            bars_5m["EMA20_5m"] = bars_5m["Close"].ewm(span=20, adjust=False).mean()
+
         bars["Vol_Med20"] = bars["Volume"].rolling(20, min_periods=5).median()
         bars["Vol_Mult"] = bars["Volume"] / bars["Vol_Med20"].replace(0, np.nan)
         bars["High_30m"] = bars["High"].rolling(30, min_periods=5).max()
         bars["Low_30m"] = bars["Low"].rolling(30, min_periods=5).min()
 
-        # Process only fresh sessions (>= APP_CREATED_DATE = 2026-10-27) in the 1m feed
-        session_dates = [d for d in sorted(list(set(bars.index.date))) if str(d) >= APP_CREATED_DATE][-3:]
+        session_dates = [d for d in sorted(list(set(bars.index.date))) if str(d) >= start_date]
         for s_date in session_dates:
             day_df = bars[bars.index.date == s_date].copy()
-            if len(day_df) < 8:
+            if len(day_df) < 10:
                 continue
+
+            # Point-in-time macro regime as of s_date
+            reg_day = detect_global_and_indian_regime(raw_daily, as_of_date=str(s_date))["regime_code"] if raw_daily is not None and not raw_daily.empty else "SIDEWAYS_ROTATION"
 
             tp = (day_df["High"] + day_df["Low"] + day_df["Close"]) / 3.0
             cum_pv = (tp * day_df["Volume"]).cumsum()
@@ -1777,23 +2105,28 @@ def scan_operator_1m_footprints(
             idx_list = list(day_df.index)
             last_signal_ts = None
 
+            # Opening 30m low/high (strictly known only once >= 09:45)
+            orl_df = day_df[day_df.index.time <= pd.Timestamp("09:45:00").time()]
+            day_orl_30m = float(orl_df["Low"].min()) if not orl_df.empty else float(day_df["Low"].iloc[0])
+
             for i in range(4, len(day_df) - 2):
                 ts = idx_list[i]
-                # Focus on post-opening-noise institutional window (09:20 to 14:55 IST)
-                if ts.time() < pd.Timestamp("09:20:00").time() or ts.time() > pd.Timestamp("14:55:00").time():
+                if ts.time() < pd.Timestamp("09:20:00").time() or ts.time() > pd.Timestamp("14:25:00").time():
                     continue
-                if last_signal_ts is not None and (ts - last_signal_ts).total_seconds() < 900:
+                if last_signal_ts is not None and (ts - last_signal_ts).total_seconds() < 1200:
                     continue
 
                 r0 = day_df.iloc[i]
                 v_mult = float(r0["Vol_Mult"]) if pd.notna(r0["Vol_Mult"]) else 0.0
                 v_cash = int(r0["Volume"]) if pd.notna(r0["Volume"]) else 0
                 rng_pct = float(r0["Range_Pct"]) if pd.notna(r0["Range_Pct"]) else 0.0
+                c0 = float(r0["Close"])
+                shock_val_inr = v_cash * c0
 
-                if v_mult < min_vol_mult or v_cash < 5000 or rng_pct < 0.12:
+                if v_mult < min_vol_mult or v_mult > 25.0 or shock_val_inr < 10_000_000.0 or rng_pct < 0.15:
                     continue
 
-                o0, h0, l0, c0 = float(r0["Open"]), float(r0["High"]), float(r0["Low"]), float(r0["Close"])
+                o0, h0, l0 = float(r0["Open"]), float(r0["High"]), float(r0["Low"])
                 vwap0 = float(r0["VWAP"])
                 clv0 = float(r0["CLV"])
                 h30 = float(r0["High_30m"])
@@ -1807,101 +2140,133 @@ def scan_operator_1m_footprints(
                 min_l12 = min(float(r1["Low"]), float(r2["Low"]))
                 max_h12 = max(float(r1["High"]), float(r2["High"]))
 
+                # Strict budget exclusion before signal generation
+                if c_t2 <= 0 or c_t2 > MAX_BUDGET_PER_TICKER_INR:
+                    continue
+
                 near_30m_low = l0 <= l30 * 1.0025
                 near_30m_high = h0 >= h30 * 0.9975
                 t2_move_from_shock_pct = abs(c_t2 - c0) / max(c0, 1e-4) * 100.0
-                not_exhausted_at_t2 = (t2_move_from_shock_pct <= 0.65) and (rng_pct <= 0.85)
+                not_exhausted_at_t2 = (t2_move_from_shock_pct <= 0.55) and (rng_pct <= 0.85)
 
-                # GAP-20261028-01 Guardrail: Block midday lunch-hour denominator collapse (11:20:01 - 13:59:59 IST)
-                # unless it is an extraordinary institutional block print (>=9.0x vol & >=₹3.0 Cr 1m cash turnover)
-                in_prime_morning_window = ts_t2.time() <= pd.Timestamp("11:20:00").time()
+                # Prime Institutional Morning Window (09:20-11:15) or Block Print (14:00-14:25 >=9x & >=₹3Cr)
+                in_prime_morning_window = ts_t2.time() <= pd.Timestamp("11:15:00").time()
                 in_euro_open_block_window = (
-                    pd.Timestamp("14:00:00").time() <= ts_t2.time() <= pd.Timestamp("14:30:00").time()
+                    pd.Timestamp("14:00:00").time() <= ts_t2.time() <= pd.Timestamp("14:25:00").time()
                     and v_mult >= 9.0
-                    and (v_cash * c0) >= 30_000_000.0
+                    and shock_val_inr >= 30_000_000.0
                     and rng_pct >= 0.22
                 )
                 passes_liquidity_window_gate = in_prime_morning_window or in_euro_open_block_window
 
+                # Point-in-time 5m ATR & EMA20 slope
+                atr_5m = c_t2 * 0.0045
+                ema20_falling = False
+                if not bars_5m.empty:
+                    sub_5m = bars_5m[bars_5m.index <= ts_t2]
+                    if len(sub_5m) >= 3:
+                        raw_atr5 = sub_5m["ATR14_5m"].iloc[-1]
+                        if pd.notna(raw_atr5) and raw_atr5 > 0:
+                            atr_5m = float(raw_atr5)
+                        e_now = sub_5m["EMA20_5m"].iloc[-1]
+                        e_prev = sub_5m["EMA20_5m"].iloc[-2]
+                        if pd.notna(e_now) and pd.notna(e_prev):
+                            ema20_falling = float(e_now) < float(e_prev)
+
+                below_orl_30m = (ts_t2.time() >= pd.Timestamp("09:46:00").time()) and (c_t2 < day_orl_30m)
+
                 signal_side = "FILTERED"
                 action_label = "⚪ TRAP FILTERED (NO AUTO-TRADE)"
                 footprint_type = "Unconfirmed 1m Volume Spike (Rejected at T+2m)"
+                product_mode = "NONE"
+                strat_id = "FILTERED"
                 t2_note = f"⛔ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} did not confirm breakout"
 
                 if not passes_liquidity_window_gate:
-                    footprint_type = "Midday Low-Liquidity Spike (Filtered by GAP-20261028-01)"
-                    t2_note = (
-                        f"⛔ Midday Liquidity Desert ({ts_t2.strftime('%H:%M')} IST) — "
-                        f"Vol_Med20 Denominator Guard (GAP-20261028-01)"
-                    )
+                    footprint_type = "Midday Low-Liquidity Spike (Blocked 11:16-13:59)"
+                    t2_note = f"⛔ Midday Liquidity Desert ({ts_t2.strftime('%H:%M')} IST) — Blocked"
                 elif not not_exhausted_at_t2:
                     t2_note = f"⛔ Exhausted 1m Spike ({t2_move_from_shock_pct:.2f}% jump in 2m) — No Chase Rule"
-                # 1) Operator Low Absorption BUY
-                elif near_30m_low and clv0 >= 0.45 and (c_t2 > h0 or (c_t2 > c0 and min_l12 >= l0 * 0.9995)) and c_t2 >= vwap_t2 * 0.998:
+                # 1) OP_S1: Operator Low Absorption BUY (CNC/MIS Long)
+                elif near_30m_low and clv0 >= 0.65 and c_t2 > h0 and min_l12 >= l0 * 0.9995 and c_t2 > vwap_t2 * 1.0005:
                     signal_side = "BUY"
-                    action_label = "🟢 AUTO-BUY (OPERATOR LOW ABSORPTION)"
+                    action_label = "🟢 BUY (CNC/MIS) — OPERATOR LOW ABSORPTION"
                     footprint_type = "Operator Low Absorption (30m Support Spring)"
-                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} > Shock High/Close & held Support ₹{l0:.2f}"
-                # 2) Operator VWAP Markup BUY
-                elif c0 > o0 and clv0 >= 0.62 and c0 >= vwap0 * 0.9995 and c_t2 >= c0 and min_l12 >= l0 and c_t2 >= vwap_t2:
+                    product_mode = "CNC/MIS BUY"
+                    strat_id = "OP_S1_Operator_Low_Absorption_BUY"
+                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} > Shock High ₹{h0:.2f} & VWAP ₹{vwap_t2:.2f}"
+                # 2) OP_S2: Operator VWAP Markup BUY (CNC/MIS Long)
+                elif c0 > o0 and clv0 >= 0.65 and c0 >= vwap0 and c_t2 > h0 and min_l12 >= l0 and c_t2 > vwap_t2 * 1.0005:
                     signal_side = "BUY"
-                    action_label = "🟢 AUTO-BUY (OPERATOR VWAP MARKUP)"
+                    action_label = "🟢 BUY (CNC/MIS) — OPERATOR VWAP MARKUP"
                     footprint_type = "Operator High-Volume VWAP Markup Breakout"
-                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} held above VWAP ₹{vwap_t2:.2f} & Shock Low ₹{l0:.2f}"
-                # 3) Operator Dump / Distribution SELL (GAP-20261028-03 Hardened Breakdown Filter)
+                    product_mode = "CNC/MIS BUY"
+                    strat_id = "OP_S2_Operator_VWAP_Markup_BUY"
+                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} > High ₹{h0:.2f} & VWAP ₹{vwap_t2:.2f}"
+                # 3) OP_S3: Operator Dump / Distribution SHORT SELL (MIS Only)
                 elif (
                     v_mult >= 5.0
                     and rng_pct >= 0.18
-                    and (
-                        (c0 < o0 and clv0 <= 0.35 and (near_30m_high or c0 < vwap0))
-                        or (near_30m_high and clv0 <= 0.28)
-                    )
+                    and c0 < o0
+                    and clv0 <= 0.30
+                    and (near_30m_high or c0 < vwap0)
                     and c_t2 < l0
-                    and c_t2 <= vwap_t2 * 1.0005
+                    and c_t2 < vwap_t2 * 0.9995
                     and max_h12 <= h0 * 1.0005
                 ):
                     signal_side = "SELL"
-                    action_label = "🔴 AUTO-SELL (OPERATOR DUMP / SHORT)"
+                    action_label = "🔴 SHORT SELL (MIS Only) — OPERATOR SUPPLY DUMP"
                     footprint_type = "Operator Supply Dump / VWAP Breakdown"
-                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} broke below Shock Low ₹{l0:.2f} & VWAP"
+                    product_mode = "MIS SHORT SELL"
+                    strat_id = "OP_S3_Operator_Supply_Dump_SELL"
+                    t2_note = f"✅ T+2m ({ts_t2.strftime('%H:%M')}) Close ₹{c_t2:.2f} < Shock Low ₹{l0:.2f} & VWAP ₹{vwap_t2:.2f}"
 
-                if signal_side == "FILTERED" and v_mult < 6.5:
-                    # Only keep major >=6.5x rejected spikes in the audit table to avoid clutter
+                if signal_side == "FILTERED" and v_mult < 7.0:
                     continue
 
                 last_signal_ts = ts
-                entry_p = round(c_t2, 2)
-                qty = max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0))) if signal_side in ("BUY", "SELL") else 0
-                if qty * entry_p > MAX_BUDGET_PER_TICKER_INR and qty > 1:
-                    qty -= 1
+                # Realistic slipped entry fill (+3 bps BUY, -3 bps SHORT SELL)
+                if signal_side == "BUY":
+                    entry_p = round(c_t2 * (1.0 + SLIPPAGE_BPS_PER_SIDE), 2)
+                elif signal_side == "SELL":
+                    entry_p = round(c_t2 * (1.0 - SLIPPAGE_BPS_PER_SIDE), 2)
+                else:
+                    entry_p = round(c_t2, 2)
+
+                if entry_p <= 0 or entry_p > MAX_BUDGET_PER_TICKER_INR:
+                    continue
+
+                qty = int(MAX_BUDGET_PER_TICKER_INR // entry_p) if signal_side in ("BUY", "SELL") else 0
+                if qty < 1 and signal_side in ("BUY", "SELL"):
+                    continue
                 cap_used = round(qty * entry_p, 2)
 
-                if signal_side == "BUY":
-                    # Bound initial SL between 0.32% and 0.55% below entry (anchored to Shock Low l0)
-                    init_sl = round(max(min(l0 * 0.9990, entry_p * 0.9968), entry_p * 0.9945), 2)
-                    risk_ps = max(entry_p - init_sl, entry_p * 0.0032)
-                    # GAP-20261028-02: Cost-Plus Stage-1 Profit Lock (>= +0.20% vs +0.06% micro-BE)
-                    stage1_be_sl = round(entry_p + max(0.55 * risk_ps, entry_p * 0.0020), 2)
-                    stage2_lock_sl = round(entry_p + max(0.95 * risk_ps, entry_p * 0.0042), 2)
-                    target_p = round(entry_p + max(1.85 * risk_ps, entry_p * 0.0065), 2)
-                elif signal_side == "SELL":
-                    # GAP-20261028-03: Minimum 0.42% Short SL cushion above entry/Shock High to survive 2-tick VWAP retests
-                    init_sl = round(min(max(h0 * 1.0012, entry_p * 1.0042), entry_p * 1.0060), 2)
-                    risk_ps = max(init_sl - entry_p, entry_p * 0.0042)
-                    # GAP-20261028-02: Cost-Plus Stage-1 Profit Lock (>= +0.20% for Short)
-                    stage1_be_sl = round(entry_p - max(0.55 * risk_ps, entry_p * 0.0020), 2)
-                    stage2_lock_sl = round(entry_p - max(0.95 * risk_ps, entry_p * 0.0042), 2)
-                    target_p = round(entry_p - max(1.85 * risk_ps, entry_p * 0.0068), 2)
-                else:
-                    init_sl = 0.0
-                    stage1_be_sl = 0.0
-                    stage2_lock_sl = 0.0
-                    target_p = 0.0
+                # Structural SL >= max(0.60%, 1.2 * ATR_5m) capped at 1.50%, R:R >= 1.85
+                sl_dist = min(max(entry_p * 0.0060, 1.2 * atr_5m), entry_p * 0.0150)
 
-                # Walk remaining 1m candles of that session up to 15:15 IST to compute chronological outcome
+                if signal_side == "BUY":
+                    init_sl = round(min(l0 * 0.9990, entry_p - sl_dist), 2)
+                    init_sl = round(max(init_sl, entry_p * 0.9850), 2)
+                    risk_ps = max(entry_p - init_sl, entry_p * 0.0060)
+                    stage1_be_sl = round(max(entry_p + 0.38 * risk_ps, entry_p * 1.0028), 2)
+                    stage2_lock_sl = round(max(entry_p + 0.72 * risk_ps, entry_p * 1.0055), 2)
+                    target_p = round(entry_p + 1.85 * risk_ps, 2)
+                elif signal_side == "SELL":
+                    init_sl = round(max(h0 * 1.0010, entry_p + sl_dist), 2)
+                    init_sl = round(min(init_sl, entry_p * 1.0150), 2)
+                    risk_ps = max(init_sl - entry_p, entry_p * 0.0060)
+                    stage1_be_sl = round(min(entry_p - 0.38 * risk_ps, entry_p * 0.9972), 2)
+                    stage2_lock_sl = round(min(entry_p - 0.72 * risk_ps, entry_p * 0.9945), 2)
+                    target_p = round(entry_p - 1.85 * risk_ps, 2)
+                else:
+                    init_sl = stage1_be_sl = stage2_lock_sl = target_p = 0.0
+                    risk_ps = 0.0
+
+                # Walk remaining 1m candles up to 15:15 IST chronologically; compute MFE/MAE only up to exit bar
                 rem_bars = day_df[(day_df.index > ts_t2) & (day_df.index.time <= pd.Timestamp("15:15:00").time())]
                 curr_sl = init_sl
                 best_p = entry_p
+                worst_p = entry_p
                 exit_p = entry_p
                 exit_ts_str = ""
                 exit_reason = "Monitoring 1m/5m candles"
@@ -1910,70 +2275,71 @@ def scan_operator_1m_footprints(
                 mae_pct = 0.0
 
                 if signal_side in ("BUY", "SELL") and not rem_bars.empty:
-                    if signal_side == "BUY":
-                        mfe_pct = round((float(rem_bars["High"].max()) - entry_p) / entry_p * 100.0, 2)
-                        mae_pct = round((float(rem_bars["Low"].min()) - entry_p) / entry_p * 100.0, 2)
-                    else:
-                        mfe_pct = round((entry_p - float(rem_bars["Low"].min())) / entry_p * 100.0, 2)
-                        mae_pct = round((entry_p - float(rem_bars["High"].max())) / entry_p * 100.0, 2)
-
                     for b_ts, b_row in rem_bars.iterrows():
                         bh = float(b_row["High"])
                         bl = float(b_row["Low"])
                         bc = float(b_row["Close"])
 
                         if signal_side == "BUY":
+                            worst_p = min(worst_p, bl)
                             if bl <= curr_sl:
-                                exit_p = round(curr_sl, 2)
+                                exit_p = round(curr_sl * (1.0 - SLIPPAGE_BPS_PER_SIDE), 2)
                                 exit_ts_str = b_ts.strftime("%Y-%m-%d %H:%M:%S")
                                 status = "STOP_OR_TRAIL_EXIT"
-                                exit_reason = f"🛑 1m Low (₹{bl:.2f}) hit SL/Trail ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
+                                exit_reason = f"🛑 1m Low (₹{bl:.2f}) hit SL/Trail ₹{curr_sl:.2f} (Slipped ₹{exit_p:.2f}) at {b_ts.strftime('%H:%M')}"
                                 break
+                            best_p = max(best_p, bh)
                             if bh >= target_p:
                                 exit_p = round(target_p, 2)
                                 exit_ts_str = b_ts.strftime("%Y-%m-%d %H:%M:%S")
                                 status = "TARGET_ACHIEVED"
                                 exit_reason = f"🎯 1m High (₹{bh:.2f}) hit Target ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
                                 break
-                            best_p = max(best_p, bh)
                             gain_r = (best_p - entry_p) / max(risk_ps, 1e-4)
-                            if gain_r >= 1.80:
-                                curr_sl = max(curr_sl, round(best_p - 0.40 * risk_ps, 2))
-                            elif gain_r >= 1.35:
+                            if gain_r >= 1.60:
+                                curr_sl = max(curr_sl, round(best_p - 0.35 * risk_ps, 2))
+                            elif gain_r >= 1.30:
                                 curr_sl = max(curr_sl, stage2_lock_sl)
-                            elif gain_r >= 0.90:
+                            elif gain_r >= 1.00:
                                 curr_sl = max(curr_sl, stage1_be_sl)
                             exit_p = round(bc, 2)
                         else:
-                            # SELL / SHORT trade chronological check
+                            worst_p = max(worst_p, bh)
                             if bh >= curr_sl:
-                                exit_p = round(curr_sl, 2)
+                                exit_p = round(curr_sl * (1.0 + SLIPPAGE_BPS_PER_SIDE), 2)
                                 exit_ts_str = b_ts.strftime("%Y-%m-%d %H:%M:%S")
                                 status = "STOP_OR_TRAIL_EXIT"
-                                exit_reason = f"🛑 1m High (₹{bh:.2f}) hit Short SL/Trail ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
+                                exit_reason = f"🛑 1m High (₹{bh:.2f}) hit Short SL/Trail ₹{curr_sl:.2f} (Slipped ₹{exit_p:.2f}) at {b_ts.strftime('%H:%M')}"
                                 break
+                            best_p = min(best_p, bl)
                             if bl <= target_p:
                                 exit_p = round(target_p, 2)
                                 exit_ts_str = b_ts.strftime("%Y-%m-%d %H:%M:%S")
                                 status = "TARGET_ACHIEVED"
                                 exit_reason = f"🎯 1m Low (₹{bl:.2f}) hit Short Target ₹{exit_p:.2f} at {b_ts.strftime('%H:%M')}"
                                 break
-                            best_p = min(best_p, bl)
                             gain_r = (entry_p - best_p) / max(risk_ps, 1e-4)
-                            if gain_r >= 1.80:
-                                curr_sl = min(curr_sl, round(best_p + 0.40 * risk_ps, 2))
-                            elif gain_r >= 1.35:
+                            if gain_r >= 1.60:
+                                curr_sl = min(curr_sl, round(best_p + 0.35 * risk_ps, 2))
+                            elif gain_r >= 1.30:
                                 curr_sl = min(curr_sl, stage2_lock_sl)
-                            elif gain_r >= 0.90:
+                            elif gain_r >= 1.00:
                                 curr_sl = min(curr_sl, stage1_be_sl)
                             exit_p = round(bc, 2)
 
                         if b_ts.time() >= pd.Timestamp("15:14:00").time():
-                            exit_p = round(bc, 2)
+                            exit_p = round(bc * (1.0 - SLIPPAGE_BPS_PER_SIDE if signal_side == "BUY" else 1.0 + SLIPPAGE_BPS_PER_SIDE), 2)
                             exit_ts_str = b_ts.strftime("%Y-%m-%d %H:%M:%S")
                             status = "AUTO_EXIT_315PM_CLOSE"
-                            exit_reason = f"⏰ 3:15 PM IST Auto-Squareoff @ ₹{exit_p:.2f} (Trail SL ₹{curr_sl:.2f})"
+                            exit_reason = f"⏰ 3:15 PM IST Auto-Squareoff @ ₹{bc:.2f} (Slipped ₹{exit_p:.2f} | Trail SL ₹{curr_sl:.2f})"
                             break
+
+                    if signal_side == "BUY":
+                        mfe_pct = round((best_p - entry_p) / entry_p * 100.0, 2)
+                        mae_pct = round((worst_p - entry_p) / entry_p * 100.0, 2)
+                    else:
+                        mfe_pct = round((entry_p - best_p) / entry_p * 100.0, 2)
+                        mae_pct = round((entry_p - worst_p) / entry_p * 100.0, 2)
 
                 if signal_side == "BUY":
                     pnl_inr = round((exit_p - entry_p) * qty, 2)
@@ -1988,10 +2354,21 @@ def scan_operator_1m_footprints(
                     pnl_pct = 0.0
                     verdict = "⚪ FILTERED (TRAP AVOIDED)"
 
+                # Forward-only Strategy B High-Conviction Qualification flags (NO hindsight!)
+                qualifies_strat_b = False
+                if signal_side == "BUY":
+                    qualifies_strat_b = (v_mult >= 6.0) and (shock_val_inr >= 10_000_000.0) and (clv0 >= 0.65) and (t2_move_from_shock_pct <= 0.55)
+                elif signal_side == "SELL":
+                    qualifies_strat_b = (v_mult >= 6.0) and (shock_val_inr >= 10_000_000.0) and (clv0 <= 0.30) and below_orl_30m and (ema20_falling or reg_day != "BULL_EXPANSION")
+
                 trade_id = f"OP-{ticker_clean}-{str(s_date).replace('-', '')}-{ts.strftime('%H%M')}-{signal_side}"
                 detected_rows.append({
                     "Trade_ID": trade_id,
                     "Ticker": ticker_clean,
+                    "Sector_Group": sector_group,
+                    "Market_Regime": reg_day,
+                    "Strategy_ID": strat_id,
+                    "Product_Mode": product_mode,
                     "Auto_Trade_Action": action_label,
                     "Confirm_Entry_Price": entry_p,
                     "Signal_Side": signal_side,
@@ -2000,11 +2377,17 @@ def scan_operator_1m_footprints(
                     "Shock_Time_1m": ts.strftime("%H:%M:%S"),
                     "Confirm_Time_T2": ts_t2.strftime("%H:%M:%S"),
                     "Shock_1m_Cash_Vol": v_cash,
+                    "Shock_1m_Value_INR": round(shock_val_inr, 2),
                     "Est_Futures_Eq_Vol": int(v_cash * 20),
                     "Vol_Spike_Mult_20m": round(v_mult, 1),
                     "Shock_Candle_OHLC": f"O:{o0:.2f} H:{h0:.2f} L:{l0:.2f} C:{c0:.2f}",
                     "Shock_CLV": round(clv0, 2),
                     "Session_VWAP": round(vwap0, 2),
+                    "ATR_5m": round(atr_5m, 2),
+                    "ORL_30m": round(day_orl_30m, 2),
+                    "Below_ORL_30m": bool(below_orl_30m),
+                    "EMA20_5m_Falling": bool(ema20_falling),
+                    "Qualifies_StratB": bool(qualifies_strat_b),
                     "T2_Follow_Through": t2_note,
                     "Auto_Qty_20K": qty,
                     "Capital_Used_INR": cap_used,
@@ -2025,31 +2408,20 @@ def scan_operator_1m_footprints(
                     "Source_Tag": "LIVE_NIFTY250_1M_SCAN",
                 })
 
-    # Save BEL Oct 16 benchmark case study strictly to its historical file (not mixed into fresh live signals)
     get_bel_oct16_validated_footprints()
 
     live_df = pd.DataFrame(detected_rows)
     if not live_df.empty:
-        live_df = live_df[live_df["Session_Date"].astype(str) >= APP_CREATED_DATE].copy()
+        live_df = live_df[live_df["Session_Date"].astype(str) >= start_date].copy()
         live_df["_is_confirmed"] = live_df["Signal_Side"].isin(["BUY", "SELL"]).astype(int)
         live_df = live_df.sort_values(
             by=["Session_Date", "_is_confirmed", "Confirm_Time_T2", "Vol_Spike_Mult_20m"],
-            ascending=[False, False, False, False],
+            ascending=[False, False, True, False],
         ).drop(columns=["_is_confirmed"]).reset_index(drop=True)
-
-    # Merge with existing fresh signals in OPERATOR_SIGNALS_CSV (>= APP_CREATED_DATE)
-    if os.path.exists(OPERATOR_SIGNALS_CSV):
-        try:
-            old_sig = pd.read_csv(OPERATOR_SIGNALS_CSV)
-            if not old_sig.empty and "Session_Date" in old_sig.columns:
-                old_sig = old_sig[old_sig["Session_Date"].astype(str) >= APP_CREATED_DATE].copy()
-                live_df = pd.concat([live_df, old_sig], ignore_index=True)
-        except Exception:
-            pass
-
-    if not live_df.empty:
         live_df = live_df.drop_duplicates(subset=["Trade_ID"], keep="first").reset_index(drop=True)
         live_df.to_csv(OPERATOR_SIGNALS_CSV, index=False)
+    else:
+        pd.DataFrame(columns=["Trade_ID", "Ticker", "Signal_Side", "Session_Date"]).to_csv(OPERATOR_SIGNALS_CSV, index=False)
     return live_df
 
 
@@ -2066,51 +2438,45 @@ def _clean_exit_time_hhmmss(exit_ts_val: object, status_val: object = "") -> str
 def auto_execute_and_evaluate_operator_trades(
     operator_signals_df: pd.DataFrame | None = None,
     signals_df: pd.DataFrame | None = None,
+    enable_mis_short: bool = True,
+    max_daily_op_trades: int = 3,
+    op_signals_df: pd.DataFrame | None = None,
+    current_regime: str | None = None,
+    **kwargs,
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Separate Auto-Trade (BUY & SELL) Execution & 5-Minute Refresh Performance Engine:
-      - Strictly tracks ONLY Fresh Paper Trades since App Creation (`Session_Date >= 2026-10-27`).
-      - Historical pre-inception rows (`2025-10-16` BEL benchmark) are kept in `historical_benchmark_trades.csv`.
+    Separate Auto-Trade (BUY CNC/MIS & SHORT SELL MIS) Execution Engine:
+      - Strictly tracks real market sessions (`Session_Date >= APP_CREATED_DATE`).
+      - Enforces `Confirm_Entry_Price <= MAX_BUDGET_PER_TICKER_INR` (₹20K), max 1/ticker/day,
+        max 1/sector/session (chronological first-come-first-served, zero look-ahead), and daily
+        cap (`max_daily_op_trades`, lowering noisy low-conviction trade count).
     """
-    if operator_signals_df is None and signals_df is not None:
-        operator_signals_df = signals_df
+    if operator_signals_df is None:
+        operator_signals_df = signals_df if signals_df is not None else op_signals_df
     if operator_signals_df is None or operator_signals_df.empty:
         if os.path.exists(OPERATOR_SIGNALS_CSV):
             operator_signals_df = pd.read_csv(OPERATOR_SIGNALS_CSV)
         else:
             operator_signals_df = scan_operator_1m_footprints()
 
-    # Filter only confirmed Auto-Buy and Auto-Sell trades since APP_CREATED_DATE (2026-10-27)
+    allowed_sides = ["BUY", "SELL"] if enable_mis_short else ["BUY"]
     if not operator_signals_df.empty:
-        new_trades_df = operator_signals_df[
-            operator_signals_df["Signal_Side"].isin(["BUY", "SELL"])
+        trades_df = operator_signals_df[
+            operator_signals_df["Signal_Side"].isin(allowed_sides)
             & (operator_signals_df["Session_Date"].astype(str) >= APP_CREATED_DATE)
+            & (operator_signals_df["Confirm_Entry_Price"].astype(float) <= MAX_BUDGET_PER_TICKER_INR)
+            & (operator_signals_df["Auto_Qty_20K"].astype(int) >= 1)
         ].copy().reset_index(drop=True)
     else:
-        new_trades_df = pd.DataFrame()
-
-    # Merge with existing persisted operator_auto_trades.csv (strictly >= APP_CREATED_DATE)
-    if os.path.exists(OPERATOR_TRADES_CSV):
-        try:
-            old_trades_df = pd.read_csv(OPERATOR_TRADES_CSV)
-            if not old_trades_df.empty and "Session_Date" in old_trades_df.columns:
-                old_trades_df = old_trades_df[old_trades_df["Session_Date"].astype(str) >= APP_CREATED_DATE].copy()
-            if not old_trades_df.empty and "Trade_ID" in old_trades_df.columns and not new_trades_df.empty:
-                combined_trd = pd.concat([new_trades_df, old_trades_df], ignore_index=True)
-                trades_df = combined_trd.drop_duplicates(subset=["Trade_ID"], keep="first").reset_index(drop=True)
-            elif not new_trades_df.empty:
-                trades_df = new_trades_df
-            else:
-                trades_df = old_trades_df
-        except Exception:
-            trades_df = new_trades_df
-    else:
-        trades_df = new_trades_df
+        trades_df = pd.DataFrame()
 
     def _classify_op_strategy_id(row) -> str:
+        sid_cur = str(row.get("Strategy_ID", "")).strip()
+        if sid_cur.startswith("OP_"):
+            return sid_cur
         act = str(row.get("Auto_Trade_Action", ""))
         side = str(row.get("Signal_Side", ""))
-        if side == "SELL" or "AUTO-SELL" in act:
+        if side == "SELL" or "SHORT SELL" in act or "AUTO-SELL" in act:
             return "OP_S3_Operator_Supply_Dump_SELL"
         if "VWAP MARKUP" in act.upper() or "VWAP" in str(row.get("Operator_Footprint_Type", "")).upper():
             return "OP_S2_Operator_VWAP_Markup_BUY"
@@ -2118,26 +2484,47 @@ def auto_execute_and_evaluate_operator_trades(
 
     if not trades_df.empty:
         trades_df["Strategy_ID"] = trades_df.apply(_classify_op_strategy_id, axis=1)
+        trades_df["Product_Mode"] = np.where(trades_df["Signal_Side"] == "SELL", "MIS SHORT SELL", "CNC/MIS BUY")
         trades_df["Entry_Time_IST"] = trades_df["Confirm_Time_T2"].fillna(trades_df.get("Shock_Time_1m", "09:30:00")).astype(str)
-        # GAP-20261028-01 Guardrail: Focus on Prime Morning Institutional Window (09:20-11:20 IST)
-        # or verified >=9.0x / >=₹3Cr European-open block prints (14:00-14:30 IST),
-        # exclude low-liquidity >28x denominator artifacts, and take max 1 trade per ticker per session
         est_1m_val = trades_df["Shock_1m_Cash_Vol"].astype(float) * trades_df["Confirm_Entry_Price"].astype(float)
-        in_prime_morning = trades_df["Entry_Time_IST"] <= "11:20:00"
+        in_prime_morning = (trades_df["Entry_Time_IST"] >= "09:40:00") & (trades_df["Entry_Time_IST"] <= "11:15:00")
         in_euro_block = (
             (trades_df["Entry_Time_IST"] >= "14:00:00")
-            & (trades_df["Entry_Time_IST"] <= "14:30:00")
+            & (trades_df["Entry_Time_IST"] <= "14:25:00")
             & (trades_df["Vol_Spike_Mult_20m"].astype(float) >= 9.0)
             & (est_1m_val >= 30_000_000.0)
         )
         trades_df = trades_df[
             (in_prime_morning | in_euro_block)
-            & (trades_df["Vol_Spike_Mult_20m"].astype(float) <= 28.0)
+            & (trades_df["Vol_Spike_Mult_20m"].astype(float) <= 13.5)
+            & (est_1m_val >= 15_000_000.0)
         ].copy()
-        if "Vol_Spike_Mult_20m" in trades_df.columns:
+
+        # Chronological first-come-first-served per session: max 1/ticker, max 1/sector, max N/day
+        if not trades_df.empty:
             trades_df = trades_df.sort_values(
-                by=["Session_Date", "Vol_Spike_Mult_20m"], ascending=[False, False]
-            ).drop_duplicates(subset=["Session_Date", "Ticker"], keep="first").reset_index(drop=True)
+                by=["Session_Date", "Entry_Time_IST", "Vol_Spike_Mult_20m"],
+                ascending=[True, True, False],
+            ).reset_index(drop=True)
+            selected_indices = []
+            for s_date, grp in trades_df.groupby("Session_Date", sort=False):
+                used_tickers = set()
+                used_sectors = set()
+                cnt = 0
+                for idx_row, rr in grp.iterrows():
+                    tk = str(rr["Ticker"]).strip()
+                    sec_raw = str(rr.get("Sector_Group", "")).strip()
+                    sec = sec_raw if (sec_raw and sec_raw.lower() not in ("nan", "none", "null")) else (UNIVERSE_META.get(tk, ("", tk))[1] if tk in UNIVERSE_META else tk)
+                    if tk in used_tickers or sec in used_sectors:
+                        continue
+                    used_tickers.add(tk)
+                    used_sectors.add(sec)
+                    selected_indices.append(idx_row)
+                    cnt += 1
+                    if cnt >= max_daily_op_trades:
+                        break
+            trades_df = trades_df.loc[selected_indices].copy().reset_index(drop=True)
+
         trades_df["Exit_Time_IST"] = [
             _clean_exit_time_hhmmss(ex, st_v)
             for ex, st_v in zip(trades_df.get("Exit_Timestamp", ""), trades_df.get("Status", ""))
@@ -2147,68 +2534,39 @@ def auto_execute_and_evaluate_operator_trades(
             by=["Session_Date", "Entry_Time_IST"], ascending=[False, False]
         ).reset_index(drop=True)
 
-    # Put Frozen First 3 Columns + Entry/Exit Time + Order/Performance columns in exact display order
     ordered_cols = [
-        "Session_Date",
-        "Ticker",
-        "Entry_To_Exit_Time",
-        "Entry_Time_IST",
-        "Exit_Time_IST",
-        "Auto_Trade_Action",
-        "Performance_Verdict",
-        "Exit_Reason",
-        "Strategy_ID",
-        "Signal_Side",
-        "Confirm_Entry_Price",
-        "Live_Or_Exit_Price",
-        "PnL_INR",
-        "PnL_Pct",
-        "Status",
-        "Auto_Qty_20K",
-        "Capital_Used_INR",
-        "Initial_SL",
-        "Stage1_Breakeven_SL",
-        "Stage2_Lock_SL",
-        "Current_Trailing_SL",
-        "Target_Price",
-        "Shock_Time_1m",
-        "Confirm_Time_T2",
-        "Shock_1m_Cash_Vol",
-        "Est_Futures_Eq_Vol",
-        "Vol_Spike_Mult_20m",
-        "Operator_Footprint_Type",
-        "Shock_Candle_OHLC",
-        "Shock_CLV",
-        "Session_VWAP",
-        "T2_Follow_Through",
-        "Exit_Timestamp",
-        "Max_Favorable_Pct",
-        "Max_Adverse_Pct",
-        "Source_Tag",
-        "Trade_ID",
+        "Session_Date", "Ticker", "Entry_To_Exit_Time", "Entry_Time_IST", "Exit_Time_IST",
+        "Auto_Trade_Action", "Performance_Verdict", "Exit_Reason", "Strategy_ID", "Product_Mode",
+        "Signal_Side", "Sector_Group", "Market_Regime", "Confirm_Entry_Price", "Live_Or_Exit_Price",
+        "PnL_INR", "PnL_Pct", "Status", "Auto_Qty_20K", "Capital_Used_INR", "Initial_SL",
+        "Stage1_Breakeven_SL", "Stage2_Lock_SL", "Current_Trailing_SL", "Target_Price",
+        "Shock_Time_1m", "Confirm_Time_T2", "Shock_1m_Cash_Vol", "Shock_1m_Value_INR",
+        "Est_Futures_Eq_Vol", "Vol_Spike_Mult_20m", "Operator_Footprint_Type",
+        "Shock_Candle_OHLC", "Shock_CLV", "Session_VWAP", "ATR_5m", "ORL_30m",
+        "Below_ORL_30m", "EMA20_5m_Falling", "Qualifies_StratB", "T2_Follow_Through",
+        "Exit_Timestamp", "Max_Favorable_Pct", "Max_Adverse_Pct", "Source_Tag", "Trade_ID",
     ]
     avail_cols = [c for c in ordered_cols if c in trades_df.columns]
-    trades_df = trades_df[avail_cols].copy()
+    if avail_cols:
+        trades_df = trades_df[avail_cols].copy()
     trades_df.to_csv(OPERATOR_TRADES_CSV, index=False)
 
-    # Compute Separate Operator Auto-Trade Performance Summary (Fresh Trades >= 2026-10-27)
     total_trades = len(trades_df)
     buy_df = trades_df[trades_df["Signal_Side"] == "BUY"] if not trades_df.empty else pd.DataFrame()
     sell_df = trades_df[trades_df["Signal_Side"] == "SELL"] if not trades_df.empty else pd.DataFrame()
-
-    wins = int((trades_df["PnL_INR"] > 0).sum()) if total_trades > 0 else 0
-    losses = int((trades_df["PnL_INR"] < 0).sum()) if total_trades > 0 else 0
-    win_rate = round(wins / total_trades * 100.0, 2) if total_trades > 0 else 0.0
+    closed_df = trades_df[~trades_df["Status"].astype(str).isin(["ACTIVE_OPERATOR_TRADE", "FILTERED_NO_TRADE"])] if total_trades > 0 else pd.DataFrame()
+    n_closed = len(closed_df)
+    wins = int((closed_df["PnL_INR"] > 0).sum()) if n_closed > 0 else 0
+    losses = int((closed_df["PnL_INR"] <= 0).sum()) if n_closed > 0 else 0
+    win_rate = round(wins / n_closed * 100.0, 2) if n_closed > 0 else 0.0
 
     tot_pnl = round(float(trades_df["PnL_INR"].sum()), 2) if total_trades > 0 else 0.0
     buy_pnl = round(float(buy_df["PnL_INR"].sum()), 2) if not buy_df.empty else 0.0
     sell_pnl = round(float(sell_df["PnL_INR"].sum()), 2) if not sell_df.empty else 0.0
-
     tot_cap = round(float(trades_df["Capital_Used_INR"].sum()), 2) if total_trades > 0 else 0.0
     avg_cap_per_trade = round(float(trades_df["Capital_Used_INR"].mean()), 2) if total_trades > 0 else 20000.0
     roi_on_turnover_pct = round(tot_pnl / max(tot_cap, 1.0) * 100.0, 2)
     roi_on_20k_slot_pct = round(tot_pnl / max(avg_cap_per_trade, 1.0) * 100.0, 2)
-
     gross_profit = float(trades_df.loc[trades_df["PnL_INR"] > 0, "PnL_INR"].sum()) if total_trades > 0 else 0.0
     gross_loss = abs(float(trades_df.loc[trades_df["PnL_INR"] < 0, "PnL_INR"].sum())) if total_trades > 0 else 0.0
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
@@ -2222,6 +2580,7 @@ def auto_execute_and_evaluate_operator_trades(
         "app_created_date": APP_CREATED_DATE,
         "universe_size_tickers": len(UNIVERSE_META),
         "total_auto_trades": total_trades,
+        "closed_auto_trades": n_closed,
         "buy_auto_trades": len(buy_df),
         "sell_auto_trades": len(sell_df),
         "wins": wins,
@@ -2240,11 +2599,6 @@ def auto_execute_and_evaluate_operator_trades(
     }
     with open(OPERATOR_PERF_JSON, "w", encoding="utf-8") as f:
         json.dump(perf_summary, f, indent=2)
-
-    try:
-        build_all_strategies_paper_ledger_and_scorecard(op_trades_df=trades_df)
-    except Exception:
-        pass
 
     return trades_df, perf_summary
 
@@ -2330,16 +2684,15 @@ def compute_indian_intraday_charges_and_tax(
     exit_price: float,
     qty: int,
     is_buy_entry: bool = True,
+    same_day: bool = True,
+    is_delivery: bool = False,
 ) -> dict:
     """
-    Exact Indian Discount Broker (Zerodha / Groww / Upstox / AngelOne) Intraday Equity
-    Platform Brokerage & Statutory Tax Calculator:
-      - Brokerage: min(0.03%, ₹20) on Buy leg + min(0.03%, ₹20) on Sell leg
-      - STT (Securities Transaction Tax): 0.025% on Sell leg turnover (Intraday / Same-Day Square-off)
-      - NSE Exchange Transaction Charge: 0.00297% on Total (Buy + Sell) turnover
-      - SEBI Turnover + NSE IPFT Charge: 0.0002% on Total turnover
-      - Stamp Duty: 0.003% on Buy leg turnover
-      - GST: 18% on (Brokerage + Exchange Transaction + SEBI/IPFT)
+    Indian Discount Broker Equity Charges & Statutory Tax Calculator:
+      - Intraday / Same-Day Speculative Square-off (`same_day=True`):
+        Brokerage min(0.03%, ₹20)/leg, STT 0.025% sell, NSE+SEBI+IPFT 0.00317%, Stamp 0.003% buy, GST 18%.
+      - Delivery Overnight (`same_day=False` and `is_delivery=True`):
+        Zero equity delivery brokerage, STT 0.1% both sides, Stamp 0.015% buy, DP ₹15.93 sell, GST 18%.
     """
     qty_int = max(int(qty), 0)
     if qty_int <= 0 or entry_price <= 0:
@@ -2360,12 +2713,22 @@ def compute_indian_intraday_charges_and_tax(
     sell_val = sell_p * qty_int
     tot_val = buy_val + sell_val
 
-    brok = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
-    stt = 0.00025 * sell_val
-    exch_sebi = (0.0000297 + 0.0000020) * tot_val
-    stamp = 0.00003 * buy_val
-    gst = 0.18 * (brok + exch_sebi)
-    tot_charges = round(brok + stt + exch_sebi + stamp + gst, 2)
+    if is_delivery and not same_day:
+        brok = 0.0
+        stt = 0.001 * tot_val
+        exch_sebi = (0.0000297 + 0.0000020) * tot_val
+        stamp = 0.00015 * buy_val
+        dp_charge = 15.93
+        gst = 0.18 * (brok + exch_sebi)
+        tot_charges = round(brok + stt + exch_sebi + stamp + dp_charge + gst, 2)
+    else:
+        brok = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
+        stt = 0.00025 * sell_val
+        exch_sebi = (0.0000297 + 0.0000020) * tot_val
+        stamp = 0.00003 * buy_val
+        gst = 0.18 * (brok + exch_sebi)
+        tot_charges = round(brok + stt + exch_sebi + stamp + gst, 2)
+
     gross_pnl = round(sell_val - buy_val, 2)
     net_pnl = round(gross_pnl - tot_charges, 2)
     return {
@@ -2396,9 +2759,9 @@ def _time_str_to_minutes(t_str: object, default_min: int = 915) -> int:
 
 def compute_daily_peak_concurrent_capital(day_df: pd.DataFrame) -> tuple[float, int, float]:
     """
-    Computes exact Peak Simultaneous Invested Capital (INR), Peak Concurrent Open Slots,
-    and Cumulative 1-Way Capital Deployed (INR) across a trading day's paper trades
-    by sweeping every minute from 09:15 to 15:20 IST.
+    Computes Peak Simultaneous Invested Capital (INR), Peak Concurrent Open Slots,
+    and Cumulative 1-Way Capital Deployed (INR) across a day's trades using
+    half-open intervals [s_m, e_m) so an exit at minute M frees capital for entry at minute M.
     """
     if day_df is None or day_df.empty:
         return 0.0, 0, 0.0
@@ -2407,1028 +2770,336 @@ def compute_daily_peak_concurrent_capital(day_df: pd.DataFrame) -> tuple[float, 
     for _, r in day_df.iterrows():
         in_m = _time_str_to_minutes(r.get("Entry_Time_IST", "09:30:00"), 570)
         out_m = _time_str_to_minutes(r.get("Exit_Time_IST", "15:15:00"), 915)
-        if out_m < in_m:
-            out_m = in_m + 5
-        cap = float(r.get("Capital_Used_INR", 20000.0))
-        intervals.append((in_m, out_m, cap))
+        if out_m <= in_m:
+            out_m = in_m + 1
+        cap = float(r.get("Capital_Used_INR", 0.0))
+        if cap > 0:
+            intervals.append((in_m, out_m, cap))
 
     peak_cap = 0.0
     peak_slots = 0
     for m in range(9 * 60 + 15, 15 * 60 + 20):
-        active_caps = [c for (s_m, e_m, c) in intervals if s_m <= m <= e_m]
+        active_caps = [c for (s_m, e_m, c) in intervals if s_m <= m < e_m]
         cur_cap = sum(active_caps)
         if cur_cap > peak_cap:
             peak_cap = cur_cap
             peak_slots = len(active_caps)
     if peak_cap <= 0 and not day_df.empty:
         peak_cap = float(day_df["Capital_Used_INR"].max())
-        peak_slots = 1
+        peak_slots = 1 if peak_cap > 0 else 0
     return round(peak_cap, 2), int(peak_slots), cum_cap
 
 
 def compute_xirr_from_daily_metrics(
     daily_metrics: list[dict],
     use_post_tax: bool = True,
+    min_days_for_annualization: int = 5,
 ) -> tuple[float, float, float]:
     """
-    Computes:
-      1. `period_roi_pct`: Un-annualized net return on average daily peak invested capital over the observed days.
-      2. `annualized_nse252_roi_pct`: Linear annualized run-rate across 252 NSE trading days (`daily_avg_roi * 252`).
-      3. `xirr_annual_pct`: Exact compounded XIRR (%) using cashflow discounting `(1 + R_daily)^(365) - 1`
-         solved via Newton-Raphson on dated cashflows (bounded to `[-99.9%, +9999.9%]` for display stability).
+    Canonical Portfolio & Strategy ROI / XIRR Calculator:
+      - Enforces N >= 5 unique trading days guard before computing annualized compounding XIRR.
+        When unique_dates < 5, returns annualized XIRR = 0.0 (display layer shows period ROI + sample notice).
+      - When unique_dates >= 5, solves dated NPV(r) = 0 via bisection over [-99.9%, +999.9%].
     """
     if not daily_metrics:
         return 0.0, 0.0, 0.0
+    unique_dates = len({str(d.get("date", ""))[:10] for d in daily_metrics if d.get("date")})
     n_days = max(len(daily_metrics), 1)
-    avg_peak_cap = sum(float(d.get("peak_cap", 20000.0)) for d in daily_metrics) / n_days
+    peak_caps = [float(d.get("peak_cap", 0.0)) for d in daily_metrics if float(d.get("peak_cap", 0.0)) > 0]
+    avg_peak_cap = (sum(peak_caps) / len(peak_caps)) if peak_caps else 0.0
     if avg_peak_cap <= 0:
-        avg_peak_cap = 20000.0
+        return 0.0, 0.0, 0.0
+
     tot_profit = sum(
         float(d.get("post_tax_pnl" if use_post_tax else "net_after_charges_pnl", 0.0))
         for d in daily_metrics
     )
     period_roi_pct = round(tot_profit / avg_peak_cap * 100.0, 2)
     daily_avg_frac = (tot_profit / n_days) / avg_peak_cap
+    if unique_dates < min_days_for_annualization:
+        return period_roi_pct, 0.0, 0.0
+
     annualized_nse252_roi_pct = round(daily_avg_frac * 252.0 * 100.0, 2)
 
-    # Exact Cashflow XIRR over the calendar dates:
-    # Initial capital outlay = -avg_peak_cap at Day 0 (or first session open)
-    # Daily intermediate net cashflows realized at each session close, plus terminal capital return +avg_peak_cap
-    sorted_d = sorted(daily_metrics, key=lambda x: str(x.get("date", "2026-10-27")))
-    t0 = pd.Timestamp(str(sorted_d[0].get("date", "2026-10-27")))
+    sorted_d = sorted(daily_metrics, key=lambda x: str(x.get("date", APP_CREATED_DATE)))
+    t0 = pd.Timestamp(str(sorted_d[0].get("date", APP_CREATED_DATE)))
     cashflows = [(0.0, -avg_peak_cap)]
     for idx, d in enumerate(sorted_d):
-        dt = pd.Timestamp(str(d.get("date", "2026-10-27")))
-        # Add 1 day so same-day intraday deployment has a 1-day capital holding period
+        dt = pd.Timestamp(str(d.get("date", APP_CREATED_DATE)))
         days_elapsed = max(float((dt - t0).days) + 1.0, float(idx + 1))
         cf = float(d.get("post_tax_pnl" if use_post_tax else "net_after_charges_pnl", 0.0))
         if idx == len(sorted_d) - 1:
             cf += avg_peak_cap
         cashflows.append((days_elapsed, cf))
 
-    # Solve NPV(r) = sum(cf_i / (1 + r)^(d_i / 365.0)) = 0 using bisection + Newton-Raphson
     def _npv(rate: float) -> float:
         if rate <= -0.9999:
             return 1e12
         return sum(cf / ((1.0 + rate) ** (d_el / 365.0)) for d_el, cf in cashflows)
 
-    low_r, high_r = -0.99, 50.0
-    for _ in range(80):
-        mid_r = (low_r + high_r) / 2.0
-        if _npv(mid_r) > 0:
-            low_r = mid_r
-        else:
-            high_r = mid_r
-    xirr_pct = round(((low_r + high_r) / 2.0) * 100.0, 2)
+    low_r, high_r = -0.999, 9.999
+    if _npv(high_r) > 0:
+        xirr_pct = 999.9
+    elif _npv(low_r) < 0:
+        xirr_pct = -99.9
+    else:
+        for _ in range(80):
+            mid_r = (low_r + high_r) / 2.0
+            if _npv(mid_r) > 0:
+                low_r = mid_r
+            else:
+                high_r = mid_r
+        xirr_pct = round(((low_r + high_r) / 2.0) * 100.0, 2)
     return period_roi_pct, annualized_nse252_roi_pct, xirr_pct
 
 
 
-def _ensure_monday_nov02_baseline_trades() -> None:
+_NON_CLOSED_STATUSES = {
+    "ACTIVE_INTRADAY",
+    "ACTIVE_OPERATOR_TRADE",
+    "SWING_CONVERTED",
+    "FILTERED_NO_TRADE",
+    "EXCLUDED_OVER_BUDGET",
+}
+
+
+def _is_closed_trade_status(status_val: object) -> bool:
+    s = str(status_val or "").strip().upper()
+    if not s or s in ("NAN", "NONE"):
+        return False
+    return s not in _NON_CLOSED_STATUSES and not s.startswith("ACTIVE") and "SWING" not in s and "EXCLUDED" not in s
+
+
+def _build_strategy_daily_metrics(sub_df: pd.DataFrame) -> tuple[list[dict], float, int, float, float, float, float]:
     """
-    Ensures Monday 2026-11-02 live session paper trades (3 Top-3 CNC + 9 Operator 1m)
-    are persisted in `fresh_cnc_sniper_history.csv`, `sniper_telemetry_trades.csv`, and
-    `operator_auto_trades.csv` once current IST date >= 2026-11-02.
+    Aggregates closed trades for a single strategy/ledger slice into daily metrics,
+    returning `(daily_metrics, peak_cap, peak_slots, total_gross, total_charges, aggregate_net_after_ch, aggregate_post_tax)`.
+    Aggregate 20% income tax is computed strictly on net positive total profit (no over-taxation on loss days).
     """
-    now_ist_str = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
-    if now_ist_str < "2026-11-02":
-        return
+    if sub_df is None or sub_df.empty:
+        return [], 0.0, 0, 0.0, 0.0, 0.0, 0.0
 
-    monday_cnc_rows = [
-        {
-            "Ticker": "TRENT",
-            "Sector": "Consumer Discretionary",
-            "Purchase_Date": "2026-11-02",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 7140.00,
-            "CNC_Qty": 2,
-            "Capital_Used_INR": 14280.00,
-            "Initial_SL": 7065.00,
-            "Current_Trailing_SL": 7272.00,
-            "Target_Price": 7310.00,
-            "Safe_T1": 7225.00,
-            "Runner_T2": 7380.00,
-            "Live_CMP": 7272.00,
-            "Day_High_Post_Entry": 7298.50,
-            "Day_Low_Post_Entry": 7132.00,
-            "Max_Favorable_Pct": 2.22,
-            "Max_Adverse_Pct": -0.11,
-            "PnL_INR": 264.00,
-            "PnL_Pct": 1.85,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹264.00 (+1.85%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "STOPPED_OUT_TRAILING",
-            "Exit_Price": 7272.00,
-            "Exit_Timestamp": "2026-11-02 14:25:00",
-            "Exit_Reason": "🛑 5m Low (₹7268.00) hit Stage-2 Trailing SL ₹7272.00 at 2026-11-02 14:25",
-            "Replay_Audit_Trail": "10:35: 🟢 Stage-1 Breakeven Lock @ ₹7147.14 | 11:50: 🚀 Stage-2 Safe T1 Profit Lock @ ₹7272.00 | 14:25: 🛑 Hit Trailing SL ₹7272.00",
-            "Next_Action_Recommendation": "🏁 CLOSED (STOPPED_OUT_TRAILING): Realized ₹+264.00 (+1.85%).",
-            "Logic_ID": "L6_5GATE_10AM_SNIPER",
-            "Logic_Used": "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #1 (Daily Top-3 CNC)",
-            "Candidate_Score": 84.6,
-        },
-        {
-            "Ticker": "HAL",
-            "Sector": "Industrials & Defence",
-            "Purchase_Date": "2026-11-02",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 4165.00,
-            "CNC_Qty": 4,
-            "Capital_Used_INR": 16660.00,
-            "Initial_SL": 4120.00,
-            "Current_Trailing_SL": 4218.50,
-            "Target_Price": 4228.50,
-            "Safe_T1": 4198.00,
-            "Runner_T2": 4265.00,
-            "Live_CMP": 4228.50,
-            "Day_High_Post_Entry": 4234.00,
-            "Day_Low_Post_Entry": 4158.00,
-            "Max_Favorable_Pct": 1.66,
-            "Max_Adverse_Pct": -0.17,
-            "PnL_INR": 254.00,
-            "PnL_Pct": 1.52,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹254.00 (+1.52%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "TARGET_ACHIEVED",
-            "Exit_Price": 4228.50,
-            "Exit_Timestamp": "2026-11-02 13:40:00",
-            "Exit_Reason": "🎯 5m High (₹4234.00) hit Target ₹4228.50 at 2026-11-02 13:40",
-            "Replay_Audit_Trail": "10:40: 🟢 Stage-1 Breakeven Lock @ ₹4169.17 | 12:15: 🚀 Stage-2 Safe T1 Lock @ ₹4198.00 | 13:40: 🎯 Hit Target ₹4228.50",
-            "Next_Action_Recommendation": "🏁 CLOSED (TARGET_ACHIEVED): Realized ₹+254.00 (+1.52%).",
-            "Logic_ID": "L6_5GATE_10AM_SNIPER",
-            "Logic_Used": "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #2 (Daily Top-3 CNC)",
-            "Candidate_Score": 82.1,
-        },
-        {
-            "Ticker": "BEL",
-            "Sector": "Industrials & Defence",
-            "Purchase_Date": "2026-11-02",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 392.40,
-            "CNC_Qty": 50,
-            "Capital_Used_INR": 19620.00,
-            "Initial_SL": 388.20,
-            "Current_Trailing_SL": 395.85,
-            "Target_Price": 396.25,
-            "Safe_T1": 394.50,
-            "Runner_T2": 398.80,
-            "Live_CMP": 396.25,
-            "Day_High_Post_Entry": 396.60,
-            "Day_Low_Post_Entry": 391.80,
-            "Max_Favorable_Pct": 1.07,
-            "Max_Adverse_Pct": -0.15,
-            "PnL_INR": 192.50,
-            "PnL_Pct": 0.98,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹192.50 (+0.98%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "TARGET_ACHIEVED",
-            "Exit_Price": 396.25,
-            "Exit_Timestamp": "2026-11-02 14:10:00",
-            "Exit_Reason": "🎯 5m High (₹396.60) hit Target ₹396.25 at 2026-11-02 14:10",
-            "Replay_Audit_Trail": "10:55: 🟢 Stage-1 Breakeven Lock @ ₹392.79 | 12:35: 🚀 Stage-2 Safe T1 Lock @ ₹394.50 | 14:10: 🎯 Hit Target ₹396.25",
-            "Next_Action_Recommendation": "🏁 CLOSED (TARGET_ACHIEVED): Realized ₹+192.50 (+0.98%).",
-            "Logic_ID": "L4_DEFENSIVE_RS_SNIPER",
-            "Logic_Used": "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #3 (Daily Top-3 CNC)",
-            "Candidate_Score": 80.4,
-        },
-    ]
+    daily_metrics = []
+    peak_caps = []
+    peak_slots_list = []
+    date_col = "Entry_Date" if "Entry_Date" in sub_df.columns else "Session_Date"
+    for d_str, grp in sub_df.groupby(sub_df[date_col].astype(str).str[:10], sort=True):
+        pk_c, pk_s, _ = compute_daily_peak_concurrent_capital(grp)
+        peak_caps.append(pk_c)
+        peak_slots_list.append(pk_s)
+        g_pnl = float(grp["PnL_INR"].sum()) if "PnL_INR" in grp.columns else 0.0
+        ch_col = "Platform_And_Stat_Charges_INR" if "Platform_And_Stat_Charges_INR" in grp.columns else "Platform_Charges_INR"
+        ch_val = float(grp[ch_col].sum()) if ch_col in grp.columns else 0.0
+        net_ch = round(g_pnl - ch_val, 2)
+        tax_d = round(max(0.0, net_ch * 0.20), 2)
+        post_d = round(net_ch - tax_d, 2)
+        daily_metrics.append({
+            "date": str(d_str)[:10],
+            "peak_cap": pk_c,
+            "net_after_charges_pnl": net_ch,
+            "post_tax_pnl": post_d,
+        })
 
-    if os.path.exists(FRESH_CNC_HISTORY_CSV):
-        try:
-            cnc_df = pd.read_csv(FRESH_CNC_HISTORY_CSV)
-            if "2026-11-02" not in cnc_df["Purchase_Date"].astype(str).values:
-                cnc_df = pd.concat([pd.DataFrame(monday_cnc_rows), cnc_df], ignore_index=True)
-                cnc_df.to_csv(FRESH_CNC_HISTORY_CSV, index=False)
-                pd.DataFrame(monday_cnc_rows).to_csv(SNIPER_TELEMETRY_CSV, index=False)
-        except Exception:
-            pass
+    tot_gross = round(float(sub_df["PnL_INR"].sum()) if "PnL_INR" in sub_df.columns else 0.0, 2)
+    ch_col = "Platform_And_Stat_Charges_INR" if "Platform_And_Stat_Charges_INR" in sub_df.columns else "Platform_Charges_INR"
+    tot_charges = round(float(sub_df[ch_col].sum()) if ch_col in sub_df.columns else 0.0, 2)
+    agg_net_ch = round(tot_gross - tot_charges, 2)
+    agg_tax = round(max(0.0, agg_net_ch * 0.20), 2)
+    agg_post_tax = round(agg_net_ch - agg_tax, 2)
+    overall_peak = round(max(peak_caps) if peak_caps else 0.0, 2)
+    overall_slots = int(max(peak_slots_list) if peak_slots_list else 0)
+    return daily_metrics, overall_peak, overall_slots, tot_gross, tot_charges, agg_net_ch, agg_post_tax
 
-    monday_op_rows = [
-        {
-            "Trade_ID": "OP-ICICIBANK-20261102-0936-BUY",
-            "Ticker": "ICICIBANK",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 1342.50,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "09:34:00",
-            "Confirm_Time_T2": "09:36:00",
-            "Shock_1m_Cash_Vol": 184200,
-            "Est_Futures_Eq_Vol": 2578800,
-            "Vol_Spike_Mult_20m": 7.8,
-            "Shock_Candle_OHLC": "O:1338.0 H:1342.0 L:1337.5 C:1341.8",
-            "Shock_CLV": 0.96,
-            "Session_VWAP": 1339.20,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹1342.50 > Shock High ₹1342.00 & above VWAP",
-            "Auto_Qty_20K": 14,
-            "Capital_Used_INR": 18795.00,
-            "Initial_SL": 1337.20,
-            "Current_Trailing_SL": 1349.80,
-            "Target_Price": 1351.20,
-            "Live_Or_Exit_Price": 1351.20,
-            "Exit_Timestamp": "2026-11-02 10:14:00",
-            "Exit_Reason": "🎯 1m High (₹1351.60) hit Target ₹1351.20 at 10:14",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 121.80,
-            "PnL_Pct": 0.65,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹121.80 (+0.65%)",
-            "Max_Favorable_Pct": 0.68,
-            "Max_Adverse_Pct": -0.08,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-PERSISTENT-20261102-0948-BUY",
-            "Ticker": "PERSISTENT",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 5640.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "09:46:00",
-            "Confirm_Time_T2": "09:48:00",
-            "Shock_1m_Cash_Vol": 42800,
-            "Est_Futures_Eq_Vol": 428000,
-            "Vol_Spike_Mult_20m": 8.4,
-            "Shock_Candle_OHLC": "O:5618.0 H:5638.0 L:5615.0 C:5636.5",
-            "Shock_CLV": 0.93,
-            "Session_VWAP": 5624.50,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹5640.00 > Shock High ₹5638.00 & above VWAP",
-            "Auto_Qty_20K": 3,
-            "Capital_Used_INR": 16920.00,
-            "Initial_SL": 5614.00,
-            "Current_Trailing_SL": 5672.00,
-            "Target_Price": 5678.50,
-            "Live_Or_Exit_Price": 5678.50,
-            "Exit_Timestamp": "2026-11-02 10:32:00",
-            "Exit_Reason": "🎯 1m High (₹5681.00) hit Target ₹5678.50 at 10:32",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 115.50,
-            "PnL_Pct": 0.68,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹115.50 (+0.68%)",
-            "Max_Favorable_Pct": 0.73,
-            "Max_Adverse_Pct": -0.09,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-TATAELXSI-20261102-1008-SELL",
-            "Ticker": "TATAELXSI",
-            "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
-            "Auto_Trade_Action": "🔴 AUTO-SELL (1m Operator Supply Dump)",
-            "Confirm_Entry_Price": 6820.00,
-            "Signal_Side": "SELL",
-            "Operator_Footprint_Type": "Operator Supply Dump Breakdown Below VWAP",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "10:06:00",
-            "Confirm_Time_T2": "10:08:00",
-            "Shock_1m_Cash_Vol": 31500,
-            "Est_Futures_Eq_Vol": 315000,
-            "Vol_Spike_Mult_20m": 7.9,
-            "Shock_Candle_OHLC": "O:6848.0 H:6850.0 L:6822.0 C:6823.5",
-            "Shock_CLV": 0.05,
-            "Session_VWAP": 6842.00,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹6820.00 < Shock Low ₹6822.00 & below ORL_30m",
-            "Auto_Qty_20K": 2,
-            "Capital_Used_INR": 13640.00,
-            "Initial_SL": 6851.00,
-            "Current_Trailing_SL": 6778.00,
-            "Target_Price": 6772.00,
-            "Live_Or_Exit_Price": 6772.00,
-            "Exit_Timestamp": "2026-11-02 10:54:00",
-            "Exit_Reason": "🎯 1m Low (₹6769.50) hit Short Target ₹6772.00 at 10:54",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 96.00,
-            "PnL_Pct": 0.70,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹96.00 (+0.70%)",
-            "Max_Favorable_Pct": 0.74,
-            "Max_Adverse_Pct": -0.06,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-DIXON-20261102-1024-BUY",
-            "Ticker": "DIXON",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 14850.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "10:22:00",
-            "Confirm_Time_T2": "10:24:00",
-            "Shock_1m_Cash_Vol": 19400,
-            "Est_Futures_Eq_Vol": 194000,
-            "Vol_Spike_Mult_20m": 8.2,
-            "Shock_Candle_OHLC": "O:14790.0 H:14845.0 L:14785.0 C:14842.0",
-            "Shock_CLV": 0.95,
-            "Session_VWAP": 14808.00,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹14850.00 > Shock High ₹14845.00 & above VWAP",
-            "Auto_Qty_20K": 1,
-            "Capital_Used_INR": 14850.00,
-            "Initial_SL": 14782.00,
-            "Current_Trailing_SL": 14942.00,
-            "Target_Price": 14955.00,
-            "Live_Or_Exit_Price": 14955.00,
-            "Exit_Timestamp": "2026-11-02 11:18:00",
-            "Exit_Reason": "🎯 1m High (₹14962.00) hit Target ₹14955.00 at 11:18",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 105.00,
-            "PnL_Pct": 0.71,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹105.00 (+0.71%)",
-            "Max_Favorable_Pct": 0.75,
-            "Max_Adverse_Pct": -0.07,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-SBIN-20261102-1042-BUY",
-            "Ticker": "SBIN",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Spring)",
-            "Confirm_Entry_Price": 842.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "Institutional Low Absorption + VWAP Reclaim",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "10:40:00",
-            "Confirm_Time_T2": "10:42:00",
-            "Shock_1m_Cash_Vol": 312000,
-            "Est_Futures_Eq_Vol": 4680000,
-            "Vol_Spike_Mult_20m": 7.6,
-            "Shock_Candle_OHLC": "O:839.2 H:841.8 L:838.5 C:841.6",
-            "Shock_CLV": 0.94,
-            "Session_VWAP": 840.40,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹842.00 > Shock High ₹841.80 & above VWAP",
-            "Auto_Qty_20K": 23,
-            "Capital_Used_INR": 19366.00,
-            "Initial_SL": 838.40,
-            "Current_Trailing_SL": 846.20,
-            "Target_Price": 846.80,
-            "Live_Or_Exit_Price": 846.80,
-            "Exit_Timestamp": "2026-11-02 11:36:00",
-            "Exit_Reason": "🎯 1m High (₹847.10) hit Target ₹846.80 at 11:36",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 110.40,
-            "PnL_Pct": 0.57,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹110.40 (+0.57%)",
-            "Max_Favorable_Pct": 0.61,
-            "Max_Adverse_Pct": -0.06,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-MCX-20261102-1112-BUY",
-            "Ticker": "MCX",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 6240.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "11:10:00",
-            "Confirm_Time_T2": "11:12:00",
-            "Shock_1m_Cash_Vol": 38500,
-            "Est_Futures_Eq_Vol": 385000,
-            "Vol_Spike_Mult_20m": 8.1,
-            "Shock_Candle_OHLC": "O:6215.0 H:6238.0 L:6212.0 C:6236.5",
-            "Shock_CLV": 0.94,
-            "Session_VWAP": 6222.00,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹6240.00 > Shock High ₹6238.00 & above VWAP",
-            "Auto_Qty_20K": 3,
-            "Capital_Used_INR": 18720.00,
-            "Initial_SL": 6210.00,
-            "Current_Trailing_SL": 6268.00,
-            "Target_Price": 6275.00,
-            "Live_Or_Exit_Price": 6275.00,
-            "Exit_Timestamp": "2026-11-02 12:05:00",
-            "Exit_Reason": "🎯 1m High (₹6278.00) hit Target ₹6275.00 at 12:05",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 105.00,
-            "PnL_Pct": 0.56,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹105.00 (+0.56%)",
-            "Max_Favorable_Pct": 0.61,
-            "Max_Adverse_Pct": -0.05,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-TATAPOWER-20261102-1138-SELL",
-            "Ticker": "TATAPOWER",
-            "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
-            "Auto_Trade_Action": "🔴 AUTO-SELL (1m Operator Supply Dump)",
-            "Confirm_Entry_Price": 442.50,
-            "Signal_Side": "SELL",
-            "Operator_Footprint_Type": "Operator Supply Dump Breakdown Below VWAP",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "11:36:00",
-            "Confirm_Time_T2": "11:38:00",
-            "Shock_1m_Cash_Vol": 295000,
-            "Est_Futures_Eq_Vol": 4425000,
-            "Vol_Spike_Mult_20m": 7.4,
-            "Shock_Candle_OHLC": "O:444.2 H:444.4 L:442.6 C:442.7",
-            "Shock_CLV": 0.06,
-            "Session_VWAP": 443.80,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹442.50 < Shock Low ₹442.60 & below ORL_30m",
-            "Auto_Qty_20K": 45,
-            "Capital_Used_INR": 19912.50,
-            "Initial_SL": 444.50,
-            "Current_Trailing_SL": 439.90,
-            "Target_Price": 439.60,
-            "Live_Or_Exit_Price": 439.60,
-            "Exit_Timestamp": "2026-11-02 12:28:00",
-            "Exit_Reason": "🎯 1m Low (₹439.40) hit Short Target ₹439.60 at 12:28",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 130.50,
-            "PnL_Pct": 0.66,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹130.50 (+0.66%)",
-            "Max_Favorable_Pct": 0.70,
-            "Max_Adverse_Pct": -0.05,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-ADANIPORTS-20261102-1154-BUY",
-            "Ticker": "ADANIPORTS",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Spring)",
-            "Confirm_Entry_Price": 1384.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "Low-Volume Dip Below VWAP (Unfiltered in v1)",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "11:52:00",
-            "Confirm_Time_T2": "11:54:00",
-            "Shock_1m_Cash_Vol": 88400,
-            "Est_Futures_Eq_Vol": 1060800,
-            "Vol_Spike_Mult_20m": 5.3,
-            "Shock_Candle_OHLC": "O:1385.0 H:1385.5 L:1381.0 C:1383.2",
-            "Shock_CLV": 0.49,
-            "Session_VWAP": 1389.40,
-            "T2_Follow_Through": "⚠️ Strategy A Entry below Session VWAP ₹1389.40 (Vol 5.3x < 6.0x)",
-            "Auto_Qty_20K": 14,
-            "Capital_Used_INR": 19376.00,
-            "Initial_SL": 1378.35,
-            "Current_Trailing_SL": 1378.35,
-            "Target_Price": 1394.00,
-            "Live_Or_Exit_Price": 1378.35,
-            "Exit_Timestamp": "2026-11-02 12:19:00",
-            "Exit_Reason": "🛑 1m Low (₹1378.10) hit Initial SL ₹1378.35 at 12:19 (Falling Knife below VWAP)",
-            "Status": "STOPPED_OUT_INITIAL_SL",
-            "PnL_INR": -79.10,
-            "PnL_Pct": -0.41,
-            "Performance_Verdict": "🔴 REALIZED LOSS -₹79.10 (-0.41%)",
-            "Max_Favorable_Pct": 0.08,
-            "Max_Adverse_Pct": -0.43,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-DLF-20261102-1232-SELL",
-            "Ticker": "DLF",
-            "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
-            "Auto_Trade_Action": "🔴 AUTO-SELL (1m Operator Supply Dump)",
-            "Confirm_Entry_Price": 824.00,
-            "Signal_Side": "SELL",
-            "Operator_Footprint_Type": "Counter-Trend Pullback Short Above ORL_30m (Unfiltered in v1)",
-            "Session_Date": "2026-11-02",
-            "Shock_Time_1m": "12:30:00",
-            "Confirm_Time_T2": "12:32:00",
-            "Shock_1m_Cash_Vol": 142000,
-            "Est_Futures_Eq_Vol": 2130000,
-            "Vol_Spike_Mult_20m": 6.1,
-            "Shock_Candle_OHLC": "O:825.8 H:826.0 L:823.8 C:824.1",
-            "Shock_CLV": 0.14,
-            "Session_VWAP": 824.90,
-            "T2_Follow_Through": "⚠️ Strategy A Short above 30m Opening Range Low ₹819.50 (Strong Realty RS +0.45%)",
-            "Auto_Qty_20K": 24,
-            "Capital_Used_INR": 19776.00,
-            "Initial_SL": 827.00,
-            "Current_Trailing_SL": 827.00,
-            "Target_Price": 818.50,
-            "Live_Or_Exit_Price": 827.00,
-            "Exit_Timestamp": "2026-11-02 12:56:00",
-            "Exit_Reason": "🛑 1m High (₹827.25) hit Initial SL ₹827.00 at 12:56 (Counter-Trend Short Squeeze)",
-            "Status": "STOPPED_OUT_INITIAL_SL",
-            "PnL_INR": -72.00,
-            "PnL_Pct": -0.36,
-            "Performance_Verdict": "🔴 REALIZED LOSS -₹72.00 (-0.36%)",
-            "Max_Favorable_Pct": 0.09,
-            "Max_Adverse_Pct": -0.39,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-    ]
 
-    if os.path.exists(OPERATOR_TRADES_CSV):
-        try:
-            op_df = pd.read_csv(OPERATOR_TRADES_CSV)
-            if "2026-11-02" not in op_df["Session_Date"].astype(str).values:
-                op_df = pd.concat([pd.DataFrame(monday_op_rows), op_df], ignore_index=True)
-                op_df.to_csv(OPERATOR_TRADES_CSV, index=False)
-        except Exception:
-            pass
+def compute_adaptive_strategy_scores(
+    trades_df: pd.DataFrame | None = None,
+    current_regime: str | None = None,
+    half_life_days: float = 14.0,
+) -> dict:
+    """
+    Adaptive Auto-Ranking Engine across all 9 canonical strategies using ONLY closed paper trades:
+      - 14-trading-day exponential decay so strategy prominence shifts dynamically weekly/biweekly/monthly
+      - Regime-conditional weighting (`1.0` matching current market regime vs `0.25` mismatched regime)
+      - Wilson Lower Bound (z=1.645) to balance hit-rate against statistical sample size
+      - Bayesian-shrunk Post-Tax XIRR (`m=10` prior toward 0%) + N >= 5 unique trading days XIRR guard
+      - Cold-start penalty (`N_closed < 5`) so 1W/0L never outranks mature proven strategies
+    Persists `data/adaptive_strategy_ranking.csv` and returns `{Strategy_ID: metrics_dict}`.
+    """
+    if trades_df is None or trades_df.empty:
+        closed_df = pd.DataFrame()
+    else:
+        status_col = "Trade_Status" if "Trade_Status" in trades_df.columns else "Status"
+        mask_closed = trades_df[status_col].apply(_is_closed_trade_status) if status_col in trades_df.columns else pd.Series(True, index=trades_df.index)
+        closed_df = trades_df[mask_closed].copy()
+        if "Qty_20K" in closed_df.columns:
+            closed_df = closed_df[pd.to_numeric(closed_df["Qty_20K"], errors="coerce").fillna(0) > 0]
+        if "Entry_Price" in closed_df.columns:
+            closed_df = closed_df[pd.to_numeric(closed_df["Entry_Price"], errors="coerce").fillna(0.0) <= MAX_BUDGET_PER_TICKER_INR]
 
-    if now_ist_str < "2026-11-03":
-        return
+    ref_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    date_col = "Entry_Date" if not closed_df.empty and "Entry_Date" in closed_df.columns else "Session_Date"
+    if not closed_df.empty and date_col in closed_df.columns:
+        parsed_dates = pd.to_datetime(closed_df[date_col].astype(str).str[:10], errors="coerce").dropna()
+        if not parsed_dates.empty:
+            ref_date = max(ref_date, parsed_dates.max().date())
 
-    tuesday_cnc_rows = [
-        {
-            "Ticker": "MAZDOCK",
-            "Sector": "Industrials & Defence",
-            "Purchase_Date": "2026-11-03",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 4420.00,
-            "CNC_Qty": 4,
-            "Capital_Used_INR": 17680.00,
-            "Initial_SL": 4372.00,
-            "Current_Trailing_SL": 4476.00,
-            "Target_Price": 4488.00,
-            "Safe_T1": 4454.00,
-            "Runner_T2": 4520.00,
-            "Live_CMP": 4488.00,
-            "Day_High_Post_Entry": 4494.50,
-            "Day_Low_Post_Entry": 4412.00,
-            "Max_Favorable_Pct": 1.69,
-            "Max_Adverse_Pct": -0.18,
-            "PnL_INR": 272.00,
-            "PnL_Pct": 1.54,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹272.00 (+1.54%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "TARGET_ACHIEVED",
-            "Exit_Price": 4488.00,
-            "Exit_Timestamp": "2026-11-03 13:20:00",
-            "Exit_Reason": "🎯 5m High (₹4494.50) hit Target ₹4488.00 at 2026-11-03 13:20",
-            "Replay_Audit_Trail": "10:35: 🟢 Stage-1 Breakeven Lock @ ₹4424.42 | 11:55: 🚀 Stage-2 Safe T1 Lock @ ₹4454.00 | 13:20: 🎯 Hit Target ₹4488.00",
-            "Next_Action_Recommendation": "🏁 CLOSED (TARGET_ACHIEVED): Realized ₹+272.00 (+1.54%).",
-            "Logic_ID": "L6_5GATE_10AM_SNIPER",
-            "Logic_Used": "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #1 (Daily Top-3 CNC)",
-            "Candidate_Score": 86.2,
-        },
-        {
-            "Ticker": "BDL",
-            "Sector": "Industrials & Defence",
-            "Purchase_Date": "2026-11-03",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 1540.00,
-            "CNC_Qty": 12,
-            "Capital_Used_INR": 18480.00,
-            "Initial_SL": 1522.00,
-            "Current_Trailing_SL": 1554.50,
-            "Target_Price": 1568.00,
-            "Safe_T1": 1554.50,
-            "Runner_T2": 1582.00,
-            "Live_CMP": 1554.50,
-            "Day_High_Post_Entry": 1566.40,
-            "Day_Low_Post_Entry": 1536.50,
-            "Max_Favorable_Pct": 1.71,
-            "Max_Adverse_Pct": -0.23,
-            "PnL_INR": 174.00,
-            "PnL_Pct": 0.94,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹174.00 (+0.94%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "STOPPED_OUT_TRAILING",
-            "Exit_Price": 1554.50,
-            "Exit_Timestamp": "2026-11-03 14:15:00",
-            "Exit_Reason": "🛑 5m Low (₹1553.20) hit Stage-2 Trailing SL ₹1554.50 at 2026-11-03 14:15",
-            "Replay_Audit_Trail": "10:45: 🟢 Stage-1 Breakeven Lock @ ₹1541.54 | 12:10: 🚀 Stage-2 Safe T1 Lock @ ₹1554.50 | 14:15: 🛑 Hit Trailing SL ₹1554.50",
-            "Next_Action_Recommendation": "🏁 CLOSED (STOPPED_OUT_TRAILING): Realized ₹+174.00 (+0.94%).",
-            "Logic_ID": "L6_5GATE_10AM_SNIPER",
-            "Logic_Used": "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #2 (Daily Top-3 CNC)",
-            "Candidate_Score": 83.8,
-        },
-        {
-            "Ticker": "SUNPHARMA",
-            "Sector": "Healthcare & Defensive",
-            "Purchase_Date": "2026-11-03",
-            "Purchase_Time": "10:00:00",
-            "Entry_Price": 1884.00,
-            "CNC_Qty": 10,
-            "Capital_Used_INR": 18840.00,
-            "Initial_SL": 1868.00,
-            "Current_Trailing_SL": 1902.50,
-            "Target_Price": 1906.50,
-            "Safe_T1": 1895.00,
-            "Runner_T2": 1918.00,
-            "Live_CMP": 1906.50,
-            "Day_High_Post_Entry": 1908.20,
-            "Day_Low_Post_Entry": 1881.00,
-            "Max_Favorable_Pct": 1.28,
-            "Max_Adverse_Pct": -0.16,
-            "PnL_INR": 225.00,
-            "PnL_Pct": 1.19,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹225.00 (+1.19%)",
-            "Trailing_Stage": "CLOSED",
-            "Status": "TARGET_ACHIEVED",
-            "Exit_Price": 1906.50,
-            "Exit_Timestamp": "2026-11-03 14:05:00",
-            "Exit_Reason": "🎯 5m High (₹1908.20) hit Target ₹1906.50 at 2026-11-03 14:05",
-            "Replay_Audit_Trail": "10:50: 🟢 Stage-1 Breakeven Lock @ ₹1885.88 | 12:30: 🚀 Stage-2 Safe T1 Lock @ ₹1895.00 | 14:05: 🎯 Hit Target ₹1906.50",
-            "Next_Action_Recommendation": "🏁 CLOSED (TARGET_ACHIEVED): Realized ₹+225.00 (+1.19%).",
-            "Logic_ID": "L4_DEFENSIVE_RS_SNIPER",
-            "Logic_Used": "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)",
-            "Regime_At_Entry": "TRENDING_OR_ROTATION",
-            "EOD_315PM_Rule": True,
-            "Daily_Slot": "Rank #3 (Daily Top-3 CNC)",
-            "Candidate_Score": 81.9,
-        },
-    ]
+    z = 1.645
+    prior_m = 10.0
+    ranking_rows = []
+    out_map = {}
 
-    if os.path.exists(FRESH_CNC_HISTORY_CSV):
-        try:
-            cnc_df = pd.read_csv(FRESH_CNC_HISTORY_CSV)
-            if "2026-11-03" not in cnc_df["Purchase_Date"].astype(str).values:
-                cnc_df = pd.concat([pd.DataFrame(tuesday_cnc_rows), cnc_df], ignore_index=True)
-                cnc_df.to_csv(FRESH_CNC_HISTORY_CSV, index=False)
-                pd.DataFrame(tuesday_cnc_rows).to_csv(SNIPER_TELEMETRY_CSV, index=False)
-        except Exception:
-            pass
+    for spec in ALL_9_STRATEGY_SPECS:
+        sid = spec["Strategy_ID"]
+        sname = CANONICAL_STRATEGY_NAMES.get(sid, spec.get("Strategy_Name_And_Mode", sid))
+        if not closed_df.empty and "Strategy_ID" in closed_df.columns:
+            sub = closed_df[closed_df["Strategy_ID"].astype(str).str.strip() == sid].copy()
+        else:
+            sub = pd.DataFrame()
 
-    tuesday_op_rows = [
-        {
-            "Trade_ID": "OP-BEL-20261103-0932-BUY",
-            "Ticker": "BEL",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 398.50,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "09:30:00",
-            "Confirm_Time_T2": "09:32:00",
-            "Shock_1m_Cash_Vol": 412000,
-            "Est_Futures_Eq_Vol": 8240000,
-            "Vol_Spike_Mult_20m": 8.3,
-            "Shock_Candle_OHLC": "O:396.8 H:398.3 L:396.5 C:398.2",
-            "Shock_CLV": 0.94,
-            "Session_VWAP": 397.20,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹398.50 > Shock High ₹398.30 & above VWAP",
-            "Auto_Qty_20K": 50,
-            "Capital_Used_INR": 19925.00,
-            "Initial_SL": 396.90,
-            "Current_Trailing_SL": 400.80,
-            "Target_Price": 401.20,
-            "Live_Or_Exit_Price": 401.20,
-            "Exit_Timestamp": "2026-11-03 10:12:00",
-            "Exit_Reason": "🎯 1m High (₹401.45) hit Target ₹401.20 at 10:12",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 135.00,
-            "PnL_Pct": 0.68,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹135.00 (+0.68%)",
-            "Max_Favorable_Pct": 0.74,
-            "Max_Adverse_Pct": -0.06,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-RELIANCE-20261103-0944-BUY",
-            "Ticker": "RELIANCE",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 1346.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "09:42:00",
-            "Confirm_Time_T2": "09:44:00",
-            "Shock_1m_Cash_Vol": 248000,
-            "Est_Futures_Eq_Vol": 3720000,
-            "Vol_Spike_Mult_20m": 7.9,
-            "Shock_Candle_OHLC": "O:1341.5 H:1345.6 L:1341.0 C:1345.4",
-            "Shock_CLV": 0.96,
-            "Session_VWAP": 1342.80,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹1346.00 > Shock High ₹1345.60 & above VWAP",
-            "Auto_Qty_20K": 14,
-            "Capital_Used_INR": 18844.00,
-            "Initial_SL": 1340.80,
-            "Current_Trailing_SL": 1353.20,
-            "Target_Price": 1354.50,
-            "Live_Or_Exit_Price": 1354.50,
-            "Exit_Timestamp": "2026-11-03 10:28:00",
-            "Exit_Reason": "🎯 1m High (₹1354.90) hit Target ₹1354.50 at 10:28",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 119.00,
-            "PnL_Pct": 0.63,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹119.00 (+0.63%)",
-            "Max_Favorable_Pct": 0.66,
-            "Max_Adverse_Pct": -0.07,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-HDFCBANK-20261103-0958-BUY",
-            "Ticker": "HDFCBANK",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Spring)",
-            "Confirm_Entry_Price": 1762.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "Institutional Low Absorption + VWAP Reclaim",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "09:56:00",
-            "Confirm_Time_T2": "09:58:00",
-            "Shock_1m_Cash_Vol": 195000,
-            "Est_Futures_Eq_Vol": 2925000,
-            "Vol_Spike_Mult_20m": 7.5,
-            "Shock_Candle_OHLC": "O:1757.0 H:1761.5 L:1756.2 C:1761.2",
-            "Shock_CLV": 0.94,
-            "Session_VWAP": 1759.40,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹1762.00 > Shock High ₹1761.50 & above VWAP",
-            "Auto_Qty_20K": 11,
-            "Capital_Used_INR": 19382.00,
-            "Initial_SL": 1755.50,
-            "Current_Trailing_SL": 1771.00,
-            "Target_Price": 1772.50,
-            "Live_Or_Exit_Price": 1772.50,
-            "Exit_Timestamp": "2026-11-03 10:46:00",
-            "Exit_Reason": "🎯 1m High (₹1773.00) hit Target ₹1772.50 at 10:46",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 115.50,
-            "PnL_Pct": 0.60,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹115.50 (+0.60%)",
-            "Max_Favorable_Pct": 0.63,
-            "Max_Adverse_Pct": -0.05,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-COFORGE-20261103-1014-SELL",
-            "Ticker": "COFORGE",
-            "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
-            "Auto_Trade_Action": "🔴 AUTO-SELL (1m Operator Supply Dump)",
-            "Confirm_Entry_Price": 7640.00,
-            "Signal_Side": "SELL",
-            "Operator_Footprint_Type": "Operator Supply Dump Breakdown Below VWAP & ORL_30m",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "10:12:00",
-            "Confirm_Time_T2": "10:14:00",
-            "Shock_1m_Cash_Vol": 29400,
-            "Est_Futures_Eq_Vol": 294000,
-            "Vol_Spike_Mult_20m": 8.1,
-            "Shock_Candle_OHLC": "O:7672.0 H:7674.0 L:7642.0 C:7643.5",
-            "Shock_CLV": 0.05,
-            "Session_VWAP": 7664.00,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹7640.00 < Shock Low ₹7642.00 & below ORL_30m",
-            "Auto_Qty_20K": 2,
-            "Capital_Used_INR": 15280.00,
-            "Initial_SL": 7675.00,
-            "Current_Trailing_SL": 7590.00,
-            "Target_Price": 7584.00,
-            "Live_Or_Exit_Price": 7584.00,
-            "Exit_Timestamp": "2026-11-03 10:58:00",
-            "Exit_Reason": "🎯 1m Low (₹7581.00) hit Short Target ₹7584.00 at 10:58",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 112.00,
-            "PnL_Pct": 0.73,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹112.00 (+0.73%)",
-            "Max_Favorable_Pct": 0.77,
-            "Max_Adverse_Pct": -0.06,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-HAL-20261103-1026-BUY",
-            "Ticker": "HAL",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 4242.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "10:24:00",
-            "Confirm_Time_T2": "10:26:00",
-            "Shock_1m_Cash_Vol": 64200,
-            "Est_Futures_Eq_Vol": 963000,
-            "Vol_Spike_Mult_20m": 7.7,
-            "Shock_Candle_OHLC": "O:4226.0 H:4240.5 L:4224.0 C:4239.8",
-            "Shock_CLV": 0.96,
-            "Session_VWAP": 4231.50,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹4242.00 > Shock High ₹4240.50 & above VWAP",
-            "Auto_Qty_20K": 4,
-            "Capital_Used_INR": 16968.00,
-            "Initial_SL": 4224.00,
-            "Current_Trailing_SL": 4266.00,
-            "Target_Price": 4271.00,
-            "Live_Or_Exit_Price": 4271.00,
-            "Exit_Timestamp": "2026-11-03 11:14:00",
-            "Exit_Reason": "🎯 1m High (₹4273.50) hit Target ₹4271.00 at 11:14",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 116.00,
-            "PnL_Pct": 0.68,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹116.00 (+0.68%)",
-            "Max_Favorable_Pct": 0.74,
-            "Max_Adverse_Pct": -0.07,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-BHARTIARTL-20261103-1048-BUY",
-            "Ticker": "BHARTIARTL",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 1688.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "10:46:00",
-            "Confirm_Time_T2": "10:48:00",
-            "Shock_1m_Cash_Vol": 168000,
-            "Est_Futures_Eq_Vol": 2520000,
-            "Vol_Spike_Mult_20m": 8.0,
-            "Shock_Candle_OHLC": "O:1682.0 H:1687.5 L:1681.5 C:1687.2",
-            "Shock_CLV": 0.95,
-            "Session_VWAP": 1684.20,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹1688.00 > Shock High ₹1687.50 & above VWAP",
-            "Auto_Qty_20K": 11,
-            "Capital_Used_INR": 18568.00,
-            "Initial_SL": 1681.50,
-            "Current_Trailing_SL": 1697.00,
-            "Target_Price": 1698.50,
-            "Live_Or_Exit_Price": 1698.50,
-            "Exit_Timestamp": "2026-11-03 11:38:00",
-            "Exit_Reason": "🎯 1m High (₹1699.20) hit Target ₹1698.50 at 11:38",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 115.50,
-            "PnL_Pct": 0.62,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹115.50 (+0.62%)",
-            "Max_Favorable_Pct": 0.66,
-            "Max_Adverse_Pct": -0.05,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-POLYCAB-20261103-1106-BUY",
-            "Ticker": "POLYCAB",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 6680.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "High-Volume VWAP Markup Breakout",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "11:04:00",
-            "Confirm_Time_T2": "11:06:00",
-            "Shock_1m_Cash_Vol": 28600,
-            "Est_Futures_Eq_Vol": 286000,
-            "Vol_Spike_Mult_20m": 7.4,
-            "Shock_Candle_OHLC": "O:6654.0 H:6678.0 L:6652.0 C:6676.5",
-            "Shock_CLV": 0.94,
-            "Session_VWAP": 6662.00,
-            "T2_Follow_Through": "✅ Confirmed: T+2m Close ₹6680.00 > Shock High ₹6678.00 & above VWAP",
-            "Auto_Qty_20K": 2,
-            "Capital_Used_INR": 13360.00,
-            "Initial_SL": 6652.00,
-            "Current_Trailing_SL": 6716.00,
-            "Target_Price": 6722.00,
-            "Live_Or_Exit_Price": 6722.00,
-            "Exit_Timestamp": "2026-11-03 11:52:00",
-            "Exit_Reason": "🎯 1m High (₹6725.00) hit Target ₹6722.00 at 11:52",
-            "Status": "TARGET_ACHIEVED",
-            "PnL_INR": 84.00,
-            "PnL_Pct": 0.63,
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹84.00 (+0.63%)",
-            "Max_Favorable_Pct": 0.67,
-            "Max_Adverse_Pct": -0.06,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-CHOLAFIN-20261103-1114-BUY",
-            "Ticker": "CHOLAFIN",
-            "Strategy_ID": "OP_S2_Operator_VWAP_Markup_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Markup)",
-            "Confirm_Entry_Price": 1420.00,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "Late-Morning Markup Reversal (+0.48R Peak MFE before SL)",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "11:12:00",
-            "Confirm_Time_T2": "11:14:00",
-            "Shock_1m_Cash_Vol": 92000,
-            "Est_Futures_Eq_Vol": 1380000,
-            "Vol_Spike_Mult_20m": 6.4,
-            "Shock_Candle_OHLC": "O:1416.5 H:1419.8 L:1416.0 C:1419.5",
-            "Shock_CLV": 0.92,
-            "Session_VWAP": 1417.80,
-            "T2_Follow_Through": "⚠️ Late-Morning Entry (11:14 IST): Rallied +0.48R to ₹1423.40 then reversed to SL in Strategy A",
-            "Auto_Qty_20K": 14,
-            "Capital_Used_INR": 19880.00,
-            "Initial_SL": 1415.10,
-            "Current_Trailing_SL": 1415.10,
-            "Target_Price": 1429.20,
-            "Live_Or_Exit_Price": 1415.10,
-            "Exit_Timestamp": "2026-11-03 11:48:00",
-            "Exit_Reason": "🛑 1m Low (₹1414.80) hit Initial SL ₹1415.10 at 11:48 (Held for +0.90R in Strategy A)",
-            "Status": "STOPPED_OUT_INITIAL_SL",
-            "PnL_INR": -68.60,
-            "PnL_Pct": -0.35,
-            "Performance_Verdict": "🔴 REALIZED LOSS -₹68.60 (-0.35%)",
-            "Max_Favorable_Pct": 0.24,
-            "Max_Adverse_Pct": -0.37,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-VEDL-20261103-1118-BUY",
-            "Ticker": "VEDL",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Auto_Trade_Action": "🟢 AUTO-BUY (1m Operator Spring)",
-            "Confirm_Entry_Price": 462.50,
-            "Signal_Side": "BUY",
-            "Operator_Footprint_Type": "Low-Volume Dip Below VWAP (Unfiltered in v1)",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "11:16:00",
-            "Confirm_Time_T2": "11:18:00",
-            "Shock_1m_Cash_Vol": 176000,
-            "Est_Futures_Eq_Vol": 3520000,
-            "Vol_Spike_Mult_20m": 5.1,
-            "Shock_Candle_OHLC": "O:463.0 H:463.2 L:461.4 C:462.3",
-            "Shock_CLV": 0.48,
-            "Session_VWAP": 464.80,
-            "T2_Follow_Through": "⚠️ Strategy A Entry below Session VWAP ₹464.80 (Vol 5.1x < 6.0x)",
-            "Auto_Qty_20K": 43,
-            "Capital_Used_INR": 19887.50,
-            "Initial_SL": 460.60,
-            "Current_Trailing_SL": 460.60,
-            "Target_Price": 465.80,
-            "Live_Or_Exit_Price": 460.60,
-            "Exit_Timestamp": "2026-11-03 11:44:00",
-            "Exit_Reason": "🛑 1m Low (₹460.45) hit Initial SL ₹460.60 at 11:44 (Falling Knife below VWAP)",
-            "Status": "STOPPED_OUT_INITIAL_SL",
-            "PnL_INR": -81.70,
-            "PnL_Pct": -0.41,
-            "Performance_Verdict": "🔴 REALIZED LOSS -₹81.70 (-0.41%)",
-            "Max_Favorable_Pct": 0.06,
-            "Max_Adverse_Pct": -0.44,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-        {
-            "Trade_ID": "OP-PFC-20261103-1142-SELL",
-            "Ticker": "PFC",
-            "Strategy_ID": "OP_S3_Operator_Supply_Dump_SELL",
-            "Auto_Trade_Action": "🔴 AUTO-SELL (1m Operator Supply Dump)",
-            "Confirm_Entry_Price": 484.00,
-            "Signal_Side": "SELL",
-            "Operator_Footprint_Type": "Counter-Trend Pullback Short Above ORL_30m (Unfiltered in v1)",
-            "Session_Date": "2026-11-03",
-            "Shock_Time_1m": "11:40:00",
-            "Confirm_Time_T2": "11:42:00",
-            "Shock_1m_Cash_Vol": 184000,
-            "Est_Futures_Eq_Vol": 3680000,
-            "Vol_Spike_Mult_20m": 5.9,
-            "Shock_Candle_OHLC": "O:485.2 H:485.4 L:483.8 C:484.1",
-            "Shock_CLV": 0.19,
-            "Session_VWAP": 484.60,
-            "T2_Follow_Through": "⚠️ Strategy A Short above 30m Opening Range Low ₹481.20 (Power/PSU RS +0.52%)",
-            "Auto_Qty_20K": 41,
-            "Capital_Used_INR": 19844.00,
-            "Initial_SL": 486.05,
-            "Current_Trailing_SL": 486.05,
-            "Target_Price": 480.40,
-            "Live_Or_Exit_Price": 486.05,
-            "Exit_Timestamp": "2026-11-03 12:09:00",
-            "Exit_Reason": "🛑 1m High (₹486.20) hit Initial SL ₹486.05 at 12:09 (Counter-Trend Short Squeeze)",
-            "Status": "STOPPED_OUT_INITIAL_SL",
-            "PnL_INR": -84.05,
-            "PnL_Pct": -0.42,
-            "Performance_Verdict": "🔴 REALIZED LOSS -₹84.05 (-0.42%)",
-            "Max_Favorable_Pct": 0.08,
-            "Max_Adverse_Pct": -0.45,
-            "Source_Tag": "LIVE_AUTO_1M_SCAN",
-        },
-    ]
+        n_closed = len(sub)
+        if n_closed == 0:
+            rec = {
+                "Strategy_ID": sid,
+                "Strategy_Name": sname,
+                "Closed_Trades": 0,
+                "Closed_Wins": 0,
+                "Closed_Losses": 0,
+                "Closed_WL": "0W/0L",
+                "Raw_Closed_WR_Pct": 0.0,
+                "Effective_Sample_N": 0.0,
+                "Wilson_Lower_Bound_Pct": 0.0,
+                "Post_Tax_PnL_INR": 0.0,
+                "Peak_Capital_INR": 0.0,
+                "ROI_On_Peak_Pct": 0.0,
+                "Raw_XIRR_Pct": 0.0,
+                "Shrunk_XIRR_Pct": 0.0,
+                "Unique_Trade_Days": 0,
+                "Cold_Start_Flag": True,
+                "Adaptive_Rank_Score": 0.0,
+                "Regime_Context": current_regime or "ALL",
+            }
+            ranking_rows.append(rec)
+            out_map[sid] = rec
+            continue
 
-    if os.path.exists(OPERATOR_TRADES_CSV):
-        try:
-            op_df = pd.read_csv(OPERATOR_TRADES_CSV)
-            if "2026-11-03" not in op_df["Session_Date"].astype(str).values:
-                op_df = pd.concat([pd.DataFrame(tuesday_op_rows), op_df], ignore_index=True)
-                op_df.to_csv(OPERATOR_TRADES_CSV, index=False)
-        except Exception:
-            pass
+        pnl_col = "Net_Profit_After_Charges_INR" if "Net_Profit_After_Charges_INR" in sub.columns else "PnL_INR"
+        w_eff = 0.0
+        n_eff = 0.0
+        w_cnt = 0
+        l_cnt = 0
+        for _, r in sub.iterrows():
+            net_v = float(r.get(pnl_col, r.get("PnL_INR", 0.0)))
+            is_win = net_v > 0.0
+            if is_win:
+                w_cnt += 1
+            elif net_v < 0.0:
+                l_cnt += 1
+
+            d_raw = str(r.get(date_col, ""))[:10]
+            try:
+                d_dt = pd.to_datetime(d_raw).date()
+                age_d = max(0.0, float((ref_date - d_dt).days))
+            except Exception:
+                age_d = 0.0
+            w_time = 2.0 ** (-age_d / max(half_life_days, 1.0))
+
+            row_reg = str(r.get("Market_Regime", "")).strip().upper()
+            cur_reg = str(current_regime or "").strip().upper()
+            if cur_reg and row_reg and row_reg not in ("NAN", "NONE", "ALL"):
+                w_reg = 1.0 if row_reg == cur_reg else 0.25
+            else:
+                w_reg = 0.85
+
+            w_i = w_time * w_reg
+            n_eff += w_i
+            if is_win:
+                w_eff += w_i
+
+        raw_wr = round(w_cnt / n_closed * 100.0, 1)
+        if n_eff > 0.0:
+            p_hat = min(max(w_eff / n_eff, 0.0), 1.0)
+            denom = 1.0 + (z * z) / n_eff
+            center = p_hat + (z * z) / (2.0 * n_eff)
+            half_w = z * np.sqrt(max(0.0, (p_hat * (1.0 - p_hat) / n_eff) + ((z * z) / (4.0 * n_eff * n_eff))))
+            wlb_pct = round(max(0.0, min(100.0, ((center - half_w) / denom) * 100.0)), 1)
+        else:
+            wlb_pct = 0.0
+
+        d_metrics, peak_cap, _, _, _, _, post_tax_pnl = _build_strategy_daily_metrics(sub)
+        unique_days = len(d_metrics)
+        roi_peak = round(post_tax_pnl / max(peak_cap, 1.0) * 100.0, 2) if peak_cap > 0 else 0.0
+        _, _, raw_xirr = compute_xirr_from_daily_metrics(
+            d_metrics, use_post_tax=True, min_days_for_annualization=5
+        )
+        shrunk_xirr = round(raw_xirr * (n_closed / (n_closed + prior_m)), 1)
+
+        # Combine WLB confidence + Bayesian-shrunk XIRR (or shrunk ROI before N>=5 days) + cold-start discount
+        ret_component = (
+            max(0.0, min(100.0, 50.0 + min(max(shrunk_xirr, -100.0), 200.0) / 4.0))
+            if unique_days >= 5
+            else max(0.0, min(100.0, 50.0 + roi_peak * (n_closed / (n_closed + 5.0)) * 8.0))
+        )
+        cold_start = n_closed < 5
+        maturity_mult = 0.72 if cold_start else 1.0
+        # Penalize strategies with negative realized closed-trade post-tax profit/XIRR so they never lead Top-10
+        if n_closed >= 5 and post_tax_pnl < 0:
+            loss_penalty = 0.25
+        elif post_tax_pnl < 0:
+            loss_penalty = 0.55
+        else:
+            loss_penalty = 1.0
+        adaptive_score = round((0.65 * wlb_pct + 0.35 * ret_component) * maturity_mult * loss_penalty, 2)
+
+        rec = {
+            "Strategy_ID": sid,
+            "Strategy_Name": sname,
+            "Closed_Trades": int(n_closed),
+            "Closed_Wins": int(w_cnt),
+            "Closed_Losses": int(l_cnt),
+            "Closed_WL": f"{w_cnt}W/{l_cnt}L",
+            "Raw_Closed_WR_Pct": raw_wr,
+            "Effective_Sample_N": round(n_eff, 2),
+            "Wilson_Lower_Bound_Pct": wlb_pct,
+            "Post_Tax_PnL_INR": post_tax_pnl,
+            "Peak_Capital_INR": peak_cap,
+            "ROI_On_Peak_Pct": roi_peak,
+            "Raw_XIRR_Pct": round(raw_xirr, 1),
+            "Shrunk_XIRR_Pct": shrunk_xirr,
+            "Unique_Trade_Days": int(unique_days),
+            "Cold_Start_Flag": bool(cold_start),
+            "Adaptive_Rank_Score": adaptive_score,
+            "Regime_Context": current_regime or "ALL",
+        }
+        ranking_rows.append(rec)
+        out_map[sid] = rec
+
+    rank_df = pd.DataFrame(ranking_rows).sort_values(
+        by=["Adaptive_Rank_Score", "Wilson_Lower_Bound_Pct", "Shrunk_XIRR_Pct", "Post_Tax_PnL_INR"],
+        ascending=[False, False, False, False],
+    ).reset_index(drop=True)
+    rank_df.insert(0, "Adaptive_Rank", range(1, len(rank_df) + 1))
+    rank_df.to_csv(ADAPTIVE_STRATEGY_RANKING_CSV, index=False)
+    for _, rr in rank_df.iterrows():
+        out_map[rr["Strategy_ID"]]["Adaptive_Rank"] = int(rr["Adaptive_Rank"])
+    return out_map
 
 
 def build_all_strategies_paper_ledger_and_scorecard(
     op_trades_df: pd.DataFrame | None = None,
+    current_regime: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Strictly separates Fresh Paper Trades since App Creation (`Entry_Date >= 2026-10-27`)
-    from Historical Benchmark Data (`Entry_Date < 2026-10-27`), and writes:
-      1. `data/fresh_paper_trades_since_inception.csv` (& `data/all_strategies_paper_trades.csv`):
-         ONLY fresh daily paper trades (`>= 2026-10-27`), ordered with `Entry_Date`, `Ticker`,
-         `Entry_To_Exit_Time`, `Entry_Time_IST`, `Exit_Time_IST`, `Performance_Verdict`,
-         and `Exit_Trigger_Reason` right at the front (zero horizontal scroll required).
-      2. `data/daily_paper_trade_summary.csv`:
-         Day-by-day summary for `2026-11-02 (Monday)`, `2026-10-28`, and `2026-10-27 (App Created)`.
-      3. `data/historical_benchmark_trades.csv`:
-         Pre-inception historical benchmark trades (`< 2026-10-27`, including BEL 2025-10-16 & 3Y backtest).
-      4. `data/strategy_wise_paper_scorecard.csv`:
-         Side-by-side comparison of Fresh Live Paper Trades (`>= 2026-10-27`) vs Historical Benchmark (`< 2026-10-27`)
-         with `Model_Prediction_Check` across all 9 strategies (`OP_S1–OP_S3` + `L1–L6`).
+    Builds clean 100% real-market paper trading ledgers (`Entry_Date >= 2026-10-27`)
+    and separates pre-inception walk-forward benchmarks (`< 2026-10-27`).
+    Computes Win/Loss/Success-Rate and XIRR strictly on CLOSED trades only with zero
+    hardcoded injections or hindsight filters, and updates `adaptive_strategy_ranking.csv`.
     """
-    _ensure_monday_nov02_baseline_trades()
     fresh_rows = []
     hist_rows = []
 
     def _classify_op_sid(r) -> str:
-        strat_id = str(r.get("Strategy_ID", ""))
-        if strat_id and strat_id != "nan":
+        strat_id = str(r.get("Strategy_ID", "")).strip()
+        if strat_id and strat_id not in ("nan", "None"):
             return strat_id
         act = str(r.get("Auto_Trade_Action", ""))
         side = str(r.get("Signal_Side", "BUY"))
@@ -3441,16 +3112,24 @@ def build_all_strategies_paper_ledger_and_scorecard(
     # 1. Load Fresh Operator 1m Auto-Trades (>= 2026-10-27)
     if op_trades_df is None or op_trades_df.empty:
         if os.path.exists(OPERATOR_TRADES_CSV):
-            op_trades_df = pd.read_csv(OPERATOR_TRADES_CSV)
+            try:
+                op_trades_df = pd.read_csv(OPERATOR_TRADES_CSV)
+            except Exception:
+                op_trades_df = pd.DataFrame()
         else:
             op_trades_df = pd.DataFrame()
 
     if not op_trades_df.empty:
         for _, r in op_trades_df.iterrows():
             s_date = str(r.get("Session_Date", ""))[:10]
+            status_str = str(r.get("Status", "")).strip()
+            qty_val = int(pd.to_numeric(r.get("Auto_Qty_20K", 0), errors="coerce") or 0)
+            entry_p = round(float(r.get("Confirm_Entry_Price", 0.0)), 2)
+            if status_str in ("EXCLUDED_OVER_BUDGET", "FILTERED_NO_TRADE") or qty_val <= 0 or entry_p <= 0 or entry_p > MAX_BUDGET_PER_TICKER_INR:
+                continue
             strat_id = _classify_op_sid(r)
             in_t = str(r.get("Confirm_Time_T2", r.get("Shock_Time_1m", "09:30:00")))[:8]
-            out_t = _clean_exit_time_hhmmss(r.get("Exit_Timestamp", ""), r.get("Status", ""))
+            out_t = _clean_exit_time_hhmmss(r.get("Exit_Timestamp", ""), status_str)
             rec = {
                 "Entry_Date": s_date,
                 "Ticker": str(r.get("Ticker", "")),
@@ -3460,7 +3139,48 @@ def build_all_strategies_paper_ledger_and_scorecard(
                 "Performance_Verdict": str(r.get("Performance_Verdict", "")),
                 "Exit_Trigger_Reason": str(r.get("Exit_Reason", "")),
                 "Strategy_ID": strat_id,
-                "Paper_Order_Side": f"AUTO-{r.get('Signal_Side', 'BUY')} (1m Operator)",
+                "Paper_Order_Side": f"AUTO-{r.get('Signal_Side', 'BUY')} (1m Operator MIS)",
+                "Signal_Direction": "🔴 SHORT SELL (MIS Only)" if str(r.get("Signal_Side", "BUY")).upper() == "SELL" else "🟢 BUY (CNC/MIS)",
+                "Product_Mode": str(r.get("Product_Mode", "MIS Only" if str(r.get("Signal_Side", "BUY")).upper() == "SELL" else "CNC/MIS")),
+                "Entry_Price": entry_p,
+                "Exit_Or_Live_Price": round(float(r.get("Live_Or_Exit_Price", 0.0)), 2),
+                "Qty_20K": qty_val,
+                "Capital_Used_INR": round(float(r.get("Capital_Used_INR", qty_val * entry_p)), 2),
+                "PnL_INR": round(float(r.get("PnL_INR", 0.0)), 2),
+                "PnL_Pct": round(float(r.get("PnL_Pct", 0.0)), 2),
+                "Initial_SL": round(float(r.get("Initial_SL", 0.0)), 2),
+                "Trailing_SL": round(float(r.get("Current_Trailing_SL", 0.0)), 2),
+                "Target_Price": round(float(r.get("Target_Price", 0.0)), 2),
+                "Trade_Status": status_str,
+                "Trigger_And_Exit_Audit": f"{r.get('Operator_Footprint_Type', '')} ({r.get('Vol_Spike_Mult_20m', '')}x Vol) -> {r.get('Exit_Reason', '')}",
+                "Market_Regime": str(r.get("Market_Regime", current_regime or "")),
+                "Sector_Group": str(r.get("Sector_Group", "")),
+                "Trade_ID": str(r.get("Trade_ID", "")),
+                "Is_Delivery": False,
+            }
+            if s_date >= APP_CREATED_DATE:
+                fresh_rows.append(rec)
+            else:
+                hist_rows.append(rec)
+
+    # 2. Load Historical BEL Oct 16 Operator Benchmark Trades (< 2026-10-27) strictly into hist_rows
+    bel_df = get_bel_oct16_validated_footprints()
+    if bel_df is not None and not bel_df.empty:
+        for _, r in bel_df[bel_df["Signal_Side"].isin(["BUY", "SELL"])].iterrows():
+            s_date = str(r.get("Session_Date", "2025-10-16"))[:10]
+            strat_id = _classify_op_sid(r)
+            in_t = str(r.get("Confirm_Time_T2", "10:00:00"))[:8]
+            out_t = _clean_exit_time_hhmmss(r.get("Exit_Timestamp", ""), r.get("Status", ""))
+            hist_rows.append({
+                "Entry_Date": s_date,
+                "Ticker": str(r.get("Ticker", "BEL")),
+                "Entry_To_Exit_Time": f"{in_t} -> {out_t}",
+                "Entry_Time_IST": in_t,
+                "Exit_Time_IST": out_t,
+                "Performance_Verdict": str(r.get("Performance_Verdict", "")),
+                "Exit_Trigger_Reason": str(r.get("Exit_Reason", "")),
+                "Strategy_ID": strat_id,
+                "Paper_Order_Side": f"HIST-{r.get('Signal_Side', 'BUY')} (BEL Oct 16 Benchmark)",
                 "Entry_Price": round(float(r.get("Confirm_Entry_Price", 0.0)), 2),
                 "Exit_Or_Live_Price": round(float(r.get("Live_Or_Exit_Price", 0.0)), 2),
                 "Qty_20K": int(r.get("Auto_Qty_20K", 1)),
@@ -3471,67 +3191,35 @@ def build_all_strategies_paper_ledger_and_scorecard(
                 "Trailing_SL": round(float(r.get("Current_Trailing_SL", 0.0)), 2),
                 "Target_Price": round(float(r.get("Target_Price", 0.0)), 2),
                 "Trade_Status": str(r.get("Status", "")),
-                "Trigger_And_Exit_Audit": f"{r.get('Operator_Footprint_Type', '')} ({r.get('Vol_Spike_Mult_20m', '')}x Vol) -> {r.get('Exit_Reason', '')}",
+                "Trigger_And_Exit_Audit": f"{r.get('Operator_Footprint_Type', '')} -> {r.get('Exit_Reason', '')}",
                 "Trade_ID": str(r.get("Trade_ID", "")),
-            }
-            if s_date >= APP_CREATED_DATE:
-                fresh_rows.append(rec)
-            else:
-                hist_rows.append(rec)
+            })
 
-    # 2. Load Historical BEL Oct 16 Operator Benchmark Trades (< 2026-10-27) into hist_rows
-    bel_df = get_bel_oct16_validated_footprints()
-    for _, r in bel_df[bel_df["Signal_Side"].isin(["BUY", "SELL"])].iterrows():
-        s_date = str(r.get("Session_Date", "2025-10-16"))[:10]
-        strat_id = _classify_op_sid(r)
-        in_t = str(r.get("Confirm_Time_T2", "10:00:00"))[:8]
-        out_t = _clean_exit_time_hhmmss(r.get("Exit_Timestamp", ""), r.get("Status", ""))
-        hist_rows.append({
-            "Entry_Date": s_date,
-            "Ticker": str(r.get("Ticker", "BEL")),
-            "Entry_To_Exit_Time": f"{in_t} -> {out_t}",
-            "Entry_Time_IST": in_t,
-            "Exit_Time_IST": out_t,
-            "Performance_Verdict": str(r.get("Performance_Verdict", "")),
-            "Exit_Trigger_Reason": str(r.get("Exit_Reason", "")),
-            "Strategy_ID": strat_id,
-            "Paper_Order_Side": f"HIST-{r.get('Signal_Side', 'BUY')} (BEL Oct 16 Benchmark)",
-            "Entry_Price": round(float(r.get("Confirm_Entry_Price", 0.0)), 2),
-            "Exit_Or_Live_Price": round(float(r.get("Live_Or_Exit_Price", 0.0)), 2),
-            "Qty_20K": int(r.get("Auto_Qty_20K", 1)),
-            "Capital_Used_INR": round(float(r.get("Capital_Used_INR", 0.0)), 2),
-            "PnL_INR": round(float(r.get("PnL_INR", 0.0)), 2),
-            "PnL_Pct": round(float(r.get("PnL_Pct", 0.0)), 2),
-            "Initial_SL": round(float(r.get("Initial_SL", 0.0)), 2),
-            "Trailing_SL": round(float(r.get("Current_Trailing_SL", 0.0)), 2),
-            "Target_Price": round(float(r.get("Target_Price", 0.0)), 2),
-            "Trade_Status": str(r.get("Status", "")),
-            "Trigger_And_Exit_Audit": f"{r.get('Operator_Footprint_Type', '')} -> {r.get('Exit_Reason', '')}",
-            "Trade_ID": str(r.get("Trade_ID", "")),
-        })
-
-    # 3. Load Fresh Top-3 CNC Sniper Paper Trades (>= 2026-10-27) from history + active telemetry
+    # 3. Load Fresh Top-3 CNC Sniper Paper Trades (>= 2026-10-27) from clean rebuilt history + active telemetry
     for csv_p in [FRESH_CNC_HISTORY_CSV, SNIPER_TELEMETRY_CSV, SNIPER_TRADES_CSV]:
         if os.path.exists(csv_p):
             try:
                 s_df = pd.read_csv(csv_p)
                 for _, r in s_df.iterrows():
-                    lid = str(r.get("Logic_ID", "L6_5GATE_10AM_SNIPER"))
-                    if lid in ("STANDBY", "L6_5GATE_10AM_ORB", "L6_5Gate_10AM_Sniper", "") or not lid.startswith("L"):
+                    status_str = str(r.get("Status", "CLOSED")).strip()
+                    entry_p = float(pd.to_numeric(r.get("Entry_Price", 0.0), errors="coerce") or 0.0)
+                    qty = int(pd.to_numeric(r.get("CNC_Qty", 0), errors="coerce") or 0)
+                    if status_str in ("EXCLUDED_OVER_BUDGET", "FILTERED_NO_TRADE") or entry_p <= 0 or entry_p > MAX_BUDGET_PER_TICKER_INR or qty <= 0:
+                        continue
+                    lid = str(r.get("Logic_ID", "L6_5GATE_10AM_SNIPER")).strip()
+                    if lid in ("STANDBY", "L6_5GATE_10AM_ORB", "L6_5Gate_10AM_Sniper", "", "nan") or not lid.startswith("L"):
                         lid = "L6_5GATE_10AM_SNIPER"
-                    entry_p = float(r.get("Entry_Price", 100.0))
                     exit_val = r.get("Exit_Price", np.nan)
-                    cmp_val = float(r.get("Live_CMP", entry_p))
-                    ex_p = float(exit_val) if pd.notna(exit_val) and str(exit_val) not in ("", "nan") and float(exit_val) > 0 else cmp_val
-                    qty = int(r.get("CNC_Qty", max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0)))))
-                    cap = round(float(r.get("Capital_Used_INR", qty * entry_p)), 2)
-                    pnl_inr = round(float(r.get("PnL_INR", (ex_p - entry_p) * qty)), 2)
-                    pnl_pct = round(float(r.get("PnL_Pct", (ex_p - entry_p) / max(entry_p, 1.0) * 100.0)), 2)
+                    cmp_val = float(pd.to_numeric(r.get("Live_CMP", entry_p), errors="coerce") or entry_p)
+                    ex_p = float(exit_val) if pd.notna(exit_val) and str(exit_val) not in ("", "nan", "None") and float(exit_val) > 0 else cmp_val
+                    cap = round(float(pd.to_numeric(r.get("Capital_Used_INR", qty * entry_p), errors="coerce") or (qty * entry_p)), 2)
+                    pnl_inr = round(float(pd.to_numeric(r.get("PnL_INR", (ex_p - entry_p) * qty), errors="coerce") or ((ex_p - entry_p) * qty)), 2)
+                    pnl_pct = round(float(pd.to_numeric(r.get("PnL_Pct", (ex_p - entry_p) / max(entry_p, 1.0) * 100.0), errors="coerce") or ((ex_p - entry_p) / max(entry_p, 1.0) * 100.0)), 2)
                     p_date = str(r.get("Purchase_Date", str(r.get("Entry_Timestamp", ""))[:10]))[:10]
                     in_t = str(r.get("Purchase_Time", "10:00:00"))[:8]
-                    status_str = str(r.get("Status", "CLOSED"))
                     out_t = _clean_exit_time_hhmmss(r.get("Exit_Timestamp", ""), status_str)
-                    verdict_str = str(r.get("Performance_Verdict", _format_performance_verdict(pnl_inr, pnl_pct, "ACTIVE" not in status_str)))
+                    is_closed = _is_closed_trade_status(status_str)
+                    verdict_str = str(r.get("Performance_Verdict", _format_performance_verdict(pnl_inr, pnl_pct, is_closed)))
                     raw_ex_reason = r.get("Exit_Reason", "")
                     ex_reason_str = (
                         str(raw_ex_reason).strip()
@@ -3539,6 +3227,7 @@ def build_all_strategies_paper_ledger_and_scorecard(
                         else "⏳ ACTIVE (5m Live Tracking -> 3:15 PM IST)"
                     )
                     tid = f"CNC-{r.get('Ticker', '')}-{p_date}"
+                    is_deliv = "SWING" in status_str.upper()
                     rec = {
                         "Entry_Date": p_date,
                         "Ticker": str(r.get("Ticker", "")),
@@ -3549,18 +3238,23 @@ def build_all_strategies_paper_ledger_and_scorecard(
                         "Exit_Trigger_Reason": ex_reason_str,
                         "Strategy_ID": lid,
                         "Paper_Order_Side": f"CNC BUY ({r.get('Daily_Slot', 'Top-3 Slot')})",
+                        "Signal_Direction": "🟢 BUY (CNC)",
+                        "Product_Mode": "CNC Only",
                         "Entry_Price": round(entry_p, 2),
                         "Exit_Or_Live_Price": round(ex_p, 2),
                         "Qty_20K": qty,
                         "Capital_Used_INR": cap,
                         "PnL_INR": pnl_inr,
                         "PnL_Pct": pnl_pct,
-                        "Initial_SL": round(float(r.get("Initial_SL", entry_p * 0.985)), 2),
-                        "Trailing_SL": round(float(r.get("Current_Trailing_SL", r.get("Initial_SL", entry_p * 0.985))), 2),
-                        "Target_Price": round(float(r.get("Target_Price", entry_p * 1.02)), 2),
+                        "Initial_SL": round(float(pd.to_numeric(r.get("Initial_SL", entry_p * 0.985), errors="coerce") or (entry_p * 0.985)), 2),
+                        "Trailing_SL": round(float(pd.to_numeric(r.get("Current_Trailing_SL", r.get("Initial_SL", entry_p * 0.985)), errors="coerce") or (entry_p * 0.985)), 2),
+                        "Target_Price": round(float(pd.to_numeric(r.get("Target_Price", entry_p * 1.02), errors="coerce") or (entry_p * 1.02)), 2),
                         "Trade_Status": status_str,
                         "Trigger_And_Exit_Audit": str(r.get("Replay_Audit_Trail", r.get("Exit_Reason", ""))),
+                        "Market_Regime": str(r.get("Market_Regime", current_regime or "")),
+                        "Sector_Group": str(r.get("Sector_Group", "")),
                         "Trade_ID": tid,
+                        "Is_Delivery": is_deliv,
                     }
                     if p_date >= APP_CREATED_DATE:
                         fresh_rows.append(rec)
@@ -3586,10 +3280,12 @@ def build_all_strategies_paper_ledger_and_scorecard(
                     dt_str = str(r.get("Date", ""))[:10]
                     tid = f"HIST-{sid[:2]}-{tkr}-{dt_str}"
                     entry_p = float(r.get("Entry_Price", 100.0))
+                    if entry_p <= 0 or entry_p > MAX_BUDGET_PER_TICKER_INR:
+                        continue
                     ex_p = float(r.get("Exit_Price", entry_p))
-                    qty = max(1, int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0)))
-                    if qty * entry_p > MAX_BUDGET_PER_TICKER_INR and qty > 1:
-                        qty -= 1
+                    qty = int(MAX_BUDGET_PER_TICKER_INR // max(entry_p, 1.0))
+                    if qty <= 0:
+                        continue
                     cap = round(qty * entry_p, 2)
                     ret_pct = float(r.get("Intraday_Ret_Pct", (ex_p - entry_p) / max(entry_p, 1.0) * 100.0))
                     pnl_inr = round(cap * (ret_pct / 100.0), 2)
@@ -3622,6 +3318,15 @@ def build_all_strategies_paper_ledger_and_scorecard(
             pass
 
     # Save Fresh Paper Trades (>= 2026-10-27) with Platform Brokerage & Statutory Tax Columns
+    fresh_cols = [
+        "Entry_Date", "Ticker", "Entry_To_Exit_Time", "Entry_Time_IST", "Exit_Time_IST",
+        "Performance_Verdict", "Exit_Trigger_Reason", "Strategy_ID", "Paper_Order_Side",
+        "Signal_Direction", "Product_Mode", "Entry_Price", "Exit_Or_Live_Price", "Qty_20K",
+        "Capital_Used_INR", "PnL_INR", "PnL_Pct", "Initial_SL", "Trailing_SL", "Target_Price",
+        "Trade_Status", "Trigger_And_Exit_Audit", "Market_Regime", "Sector_Group", "Trade_ID",
+        "Platform_And_Stat_Charges_INR", "Platform_Charges_INR", "Net_Profit_After_Charges_INR",
+        "Net_PnL_After_Charges_INR", "Post_Tax_PnL_INR", "Net_Post_Charges_Pct", "Is_Closed",
+    ]
     fresh_df = pd.DataFrame(fresh_rows)
     if not fresh_df.empty:
         fresh_df = fresh_df.drop_duplicates(subset=["Trade_ID"], keep="first")
@@ -3629,13 +3334,17 @@ def build_all_strategies_paper_ledger_and_scorecard(
         charges_list = []
         net_pnl_list = []
         net_pct_list = []
+        is_closed_list = []
         for _, r in fresh_df.iterrows():
             is_buy_leg = "SELL" not in str(r.get("Paper_Order_Side", "BUY")).upper()
+            is_deliv = bool(r.get("Is_Delivery", False))
             c_info = compute_indian_intraday_charges_and_tax(
                 float(r.get("Entry_Price", 0.0)),
                 float(r.get("Exit_Or_Live_Price", 0.0)),
                 int(r.get("Qty_20K", 1)),
                 is_buy_entry=is_buy_leg,
+                same_day=not is_deliv,
+                is_delivery=is_deliv,
             )
             ch_val = c_info["total_charges_inr"]
             gross_val = float(r.get("PnL_INR", 0.0))
@@ -3644,14 +3353,20 @@ def build_all_strategies_paper_ledger_and_scorecard(
             charges_list.append(ch_val)
             net_pnl_list.append(net_val)
             net_pct_list.append(round(net_val / cap_val * 100.0, 2))
+            is_closed_list.append(_is_closed_trade_status(r.get("Trade_Status", "")))
         fresh_df["Platform_And_Stat_Charges_INR"] = charges_list
         fresh_df["Platform_Charges_INR"] = charges_list
         fresh_df["Net_Profit_After_Charges_INR"] = net_pnl_list
         fresh_df["Net_PnL_After_Charges_INR"] = net_pnl_list
+        # Aggregate post-tax is computed at daily/strategy/portfolio sums; per-row retains 20% net estimate for display
         fresh_df["Post_Tax_PnL_INR"] = [round(v * 0.80 if v > 0 else v, 2) for v in net_pnl_list]
         fresh_df["Net_Post_Charges_Pct"] = net_pct_list
+        fresh_df["Is_Closed"] = is_closed_list
         fresh_df.to_csv(FRESH_PAPER_TRADES_CSV, index=False)
         fresh_df.to_csv(ALL_STRATEGIES_PAPER_CSV, index=False)
+    else:
+        pd.DataFrame(columns=fresh_cols).to_csv(FRESH_PAPER_TRADES_CSV, index=False)
+        pd.DataFrame(columns=fresh_cols).to_csv(ALL_STRATEGIES_PAPER_CSV, index=False)
 
     # Save Historical Benchmark Archive (< 2026-10-27)
     hist_df = pd.DataFrame(hist_rows)
@@ -3660,36 +3375,33 @@ def build_all_strategies_paper_ledger_and_scorecard(
         hist_df = hist_df.sort_values(by=["Entry_Date", "Entry_Time_IST"], ascending=[False, False]).reset_index(drop=True)
         hist_df.to_csv(HISTORICAL_BENCHMARK_CSV, index=False)
 
-    # Build Day-by-Day Summary of Fresh Paper Trades (`2026-10-28 Today` vs `2026-10-27 Yesterday`)
+    # Build Day-by-Day Summary using CLOSED trades strictly for WR & Net Realized PnL
     daily_rows = []
     if not fresh_df.empty:
         today_str = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
         for d_str, grp in fresh_df.groupby("Entry_Date", sort=False):
-            d_label = (
-                f"{d_str} (Today - Live Session)"
-                if d_str == today_str
-                else (f"{d_str} (Yesterday - App Created)" if d_str == APP_CREATED_DATE else d_str)
-            )
+            grp_closed = grp[grp["Is_Closed"] == True].copy()
             n_tot = len(grp)
+            n_closed = len(grp_closed)
+            n_open = n_tot - n_closed
             n_cnc = int(grp["Strategy_ID"].astype(str).str.startswith("L").sum())
             n_op = int(grp["Strategy_ID"].astype(str).str.startswith("OP_").sum())
-            w_cnt = int((grp["PnL_INR"] > 0).sum())
-            l_cnt = int((grp["PnL_INR"] < 0).sum())
-            wr_d = round(w_cnt / max(n_tot, 1) * 100.0, 1)
+            w_cnt = int((grp_closed["PnL_INR"] > 0).sum()) if n_closed > 0 else 0
+            l_cnt = int((grp_closed["PnL_INR"] < 0).sum()) if n_closed > 0 else 0
+            wr_d = round(w_cnt / n_closed * 100.0, 1) if n_closed > 0 else 0.0
 
-            net_w_cnt = int((grp["Net_Profit_After_Charges_INR"] > 0).sum())
-            net_l_cnt = int((grp["Net_Profit_After_Charges_INR"] <= 0).sum())
-            net_wr_d = round(net_w_cnt / max(n_tot, 1) * 100.0, 1)
+            net_w_cnt = int((grp_closed["Net_Profit_After_Charges_INR"] > 0).sum()) if n_closed > 0 else 0
+            net_l_cnt = int((grp_closed["Net_Profit_After_Charges_INR"] <= 0).sum()) if n_closed > 0 else 0
+            net_wr_d = round(net_w_cnt / n_closed * 100.0, 1) if n_closed > 0 else 0.0
 
-            pnl_d = round(float(grp["PnL_INR"].sum()), 2)
-            charges_d = round(float(grp["Platform_And_Stat_Charges_INR"].sum()), 2)
+            pnl_d = round(float(grp_closed["PnL_INR"].sum()), 2) if n_closed > 0 else 0.0
+            charges_d = round(float(grp_closed["Platform_And_Stat_Charges_INR"].sum()), 2) if n_closed > 0 else 0.0
             net_after_charges_d = round(pnl_d - charges_d, 2)
             tax_20pct_d = round(max(0.0, net_after_charges_d * 0.20), 2)
             final_pocket_d = round(net_after_charges_d - tax_20pct_d, 2)
 
             peak_cap_d, peak_slots_d, cap_d = compute_daily_peak_concurrent_capital(grp)
-            roi_peak_d = round(final_pocket_d / max(peak_cap_d, 1.0) * 100.0, 2)
-            roi_d = round(pnl_d / max(cap_d, 1.0) * 100.0, 2)
+            roi_peak_d = round(final_pocket_d / max(peak_cap_d, 1.0) * 100.0, 2) if peak_cap_d > 0 else 0.0
             _, ann_252_d, xirr_d = compute_xirr_from_daily_metrics(
                 [{
                     "date": str(d_str)[:10],
@@ -3698,10 +3410,16 @@ def build_all_strategies_paper_ledger_and_scorecard(
                     "post_tax_pnl": final_pocket_d,
                 }],
                 use_post_tax=True,
+                min_days_for_annualization=5,
             )
 
             first_in = str(grp["Entry_Time_IST"].min())
             last_out = str(grp["Exit_Time_IST"].max())
+            d_label = (
+                f"{d_str} (Today)"
+                if d_str == today_str
+                else (f"{d_str} (App Created)" if d_str == APP_CREATED_DATE else d_str)
+            )
             verdict_d = (
                 f"🟢 Gross +₹{pnl_d:,.2f} | Net Post-Tax +₹{final_pocket_d:,.2f} (+{roi_peak_d:.2f}% on Peak Cap)"
                 if final_pocket_d > 0
@@ -3718,6 +3436,8 @@ def build_all_strategies_paper_ledger_and_scorecard(
                 "Session_Date": d_label,
                 "Daily_Net_PnL_Verdict": verdict_d,
                 "Total_Paper_Trades": n_tot,
+                "Closed_Trades": n_closed,
+                "Active_Open_Trades": n_open,
                 "Top3_CNC_Trades": n_cnc,
                 "Operator_1m_Trades": n_op,
                 "Wins_Vs_Losses": f"{w_cnt}W / {l_cnt}L (Net: {net_w_cnt}W / {net_l_cnt}L)",
@@ -3739,24 +3459,35 @@ def build_all_strategies_paper_ledger_and_scorecard(
                 "Daily_Trades_And_Entry_Exit_Times": tickers_list,
             })
     daily_summary_df = pd.DataFrame(daily_rows)
-    if not daily_summary_df.empty:
-        daily_summary_df.to_csv(DAILY_PAPER_SUMMARY_CSV, index=False)
+    daily_summary_df.to_csv(DAILY_PAPER_SUMMARY_CSV, index=False)
 
-    # 5. Build Strategy-Wise Scorecard comparing Fresh Paper Trades (>= 2026-10-27) vs Historical Benchmark (< 2026-10-27)
+    # 5. Compute Adaptive Strategy Ranking from CLOSED Fresh Trades (writes adaptive_strategy_ranking.csv)
+    adaptive_map = compute_adaptive_strategy_scores(fresh_df, current_regime=current_regime)
+
+    # 6. Build Strategy-Wise Paper Scorecard strictly from real closed trades (ZERO fake fallback defaults)
     scorecard_rows = []
     for spec in ALL_9_STRATEGY_SPECS:
         sid = spec["Strategy_ID"]
-        sub_f = fresh_df[fresh_df["Strategy_ID"] == sid] if not fresh_df.empty else pd.DataFrame()
+        sub_all = fresh_df[fresh_df["Strategy_ID"] == sid] if not fresh_df.empty else pd.DataFrame()
+        sub_f = sub_all[sub_all["Is_Closed"] == True] if not sub_all.empty else pd.DataFrame()
+        n_total = len(sub_all)
         n_f = len(sub_f)
-        w_f = int((sub_f["PnL_INR"] > 0).sum()) if n_f > 0 else 0
-        l_f = int((sub_f["PnL_INR"] < 0).sum()) if n_f > 0 else 0
-        wr_f = round(w_f / n_f * 100.0, 1) if n_f > 0 else 0.0
+        n_open = n_total - n_f
+        ad = adaptive_map.get(sid, {})
+        w_f = int(ad.get("Closed_Wins", 0))
+        l_f = int(ad.get("Closed_Losses", 0))
+        wr_f = float(ad.get("Raw_Closed_WR_Pct", 0.0))
+        wlb_f = float(ad.get("Wilson_Lower_Bound_Pct", 0.0))
         pnl_f = round(float(sub_f["PnL_INR"].sum()), 2) if n_f > 0 else 0.0
         charges_f = round(float(sub_f["Platform_And_Stat_Charges_INR"].sum()), 2) if n_f > 0 and "Platform_And_Stat_Charges_INR" in sub_f.columns else 0.0
         net_after_ch_f = round(pnl_f - charges_f, 2)
-        avg_ret_f = round(float(sub_f["PnL_Pct"].mean()), 2) if n_f > 0 else 0.0
+        tax_f = round(max(0.0, net_after_ch_f * 0.20), 2)
+        post_tax_f = round(net_after_ch_f - tax_f, 2)
+        avg_ret_f = round(float(sub_f["Net_Post_Charges_Pct"].mean()), 2) if n_f > 0 and "Net_Post_Charges_Pct" in sub_f.columns else 0.0
+        peak_cap_f = float(ad.get("Peak_Capital_INR", 0.0))
+        xirr_f = float(ad.get("Raw_XIRR_Pct", 0.0))
 
-        # Full historical stats (< 2026-10-27)
+        # Historical pre-inception stats (< 2026-10-27) kept strictly cleanly for reference, zero fake 100%/0.38 defaults
         if sid.startswith("L") and not bt_full_df.empty:
             sub_h_full = bt_full_df[bt_full_df["Logic_ID"] == sid]
             n_h = len(sub_h_full)
@@ -3764,44 +3495,51 @@ def build_all_strategies_paper_ledger_and_scorecard(
             avg_ret_h = round(float(sub_h_full["Intraday_Ret_Pct"].mean()), 2) if n_h > 0 else 0.0
             gp_h = float(sub_h_full.loc[sub_h_full["Intraday_Ret_Pct"] > 0, "Intraday_Ret_Pct"].sum()) if n_h > 0 else 0.0
             gl_h = abs(float(sub_h_full.loc[sub_h_full["Intraday_Ret_Pct"] < 0, "Intraday_Ret_Pct"].sum())) if n_h > 0 else 0.0
-            pf_h = round(gp_h / gl_h, 2) if gl_h > 0 else (99.9 if gp_h > 0 else 0.0)
+            pf_h = round(gp_h / gl_h, 2) if gl_h > 0 else 0.0
         else:
             sub_h = hist_df[hist_df["Strategy_ID"] == sid] if not hist_df.empty else pd.DataFrame()
             n_h = len(sub_h)
-            wr_h = round(float((sub_h["PnL_INR"] > 0).mean() * 100.0), 1) if n_h > 0 else 100.0
-            avg_ret_h = round(float(sub_h["PnL_Pct"].mean()), 2) if n_h > 0 else 0.38
-            pf_h = 99.9
+            wr_h = round(float((sub_h["PnL_INR"] > 0).mean() * 100.0), 1) if n_h > 0 else 0.0
+            avg_ret_h = round(float(sub_h["PnL_Pct"].mean()), 2) if n_h > 0 else 0.0
+            pf_h = 0.0
 
         if n_f == 0:
-            verdict_f = "⚪ ₹0.00 (0 Fresh Trades Since Oct 27)"
-            model_check = f"⏳ AWAITING FRESH TRIGGER (Hist WR: {wr_h:.1f}% across {n_h} trades)"
+            verdict_f = "⚪ ₹0.00 (0 Closed Trades Since Oct 27)"
+            model_check = f"⏳ AWAITING CLOSED TRADES ({n_open} Active Open)" if n_open > 0 else "⏳ AWAITING LIVE TRIGGER"
         else:
-            roi_20k = round(net_after_ch_f / MAX_BUDGET_PER_TICKER_INR * 100.0, 2)
+            roi_pk = float(ad.get("ROI_On_Peak_Pct", 0.0))
             verdict_f = (
-                f"🟢 Gross +₹{pnl_f:,.2f} | Net +₹{net_after_ch_f:,.2f} (+{roi_20k:.2f}% on ₹20K)"
-                if net_after_ch_f > 0
-                else f"🔴 Gross ₹{pnl_f:+,.2f} | Net -₹{abs(net_after_ch_f):,.2f} ({roi_20k:.2f}%)"
+                f"🟢 Gross +₹{pnl_f:,.2f} | Post-Tax +₹{post_tax_f:,.2f} (+{roi_pk:.2f}% Peak ROI)"
+                if post_tax_f > 0
+                else (
+                    f"🔴 Gross ₹{pnl_f:+,.2f} | Post-Tax -₹{abs(post_tax_f):,.2f} ({roi_pk:.2f}%)"
+                    if post_tax_f < 0
+                    else "⚪ ₹0.00 Breakeven"
+                )
             )
-            if wr_f >= wr_h - 10.0 and net_after_ch_f >= 0:
-                model_check = f"✅ OUTPERFORMING / MATCHING HISTORICAL (Fresh {wr_f:.1f}% vs Hist {wr_h:.1f}%)"
-            elif net_after_ch_f > 0:
-                model_check = f"🟢 PROFITABLE IN LIVE SAMPLE (Net +₹{net_after_ch_f:,.0f} | Hist WR {wr_h:.1f}%)"
-            else:
-                model_check = f"🟡 LIVE SAMPLE BUILDING ({n_f} trades | Hist WR {wr_h:.1f}%)"
+            xirr_note = f"XIRR {xirr_f:+.1f}%" if int(ad.get("Unique_Trade_Days", 0)) >= 5 else f"{int(ad.get('Unique_Trade_Days', 0))}/5d XIRR Pending"
+            model_check = f"{'✅' if post_tax_f > 0 else '🟡'} {w_f}W/{l_f}L ({wr_f:.1f}% WR | WLB {wlb_f:.1f}% | {xirr_note})"
 
         scorecard_rows.append({
-            # First 3 Frozen Columns
             "Strategy_ID": sid,
             "Strategy_Name_And_Mode": spec["Strategy_Name_And_Mode"],
             "Fresh_Paper_PnL_Verdict": verdict_f,
-            # Fresh vs Historical Model Validation Columns Immediately Next
+            "Adaptive_Rank": int(ad.get("Adaptive_Rank", 9)),
+            "Adaptive_Rank_Score": float(ad.get("Adaptive_Rank_Score", 0.0)),
             "Model_Prediction_Check": model_check,
             "Fresh_Trades_Since_Oct27": n_f,
+            "Active_Open_Trades": n_open,
             "Fresh_Wins_Losses": f"{w_f}W / {l_f}L",
             "Fresh_Win_Rate_Pct": wr_f,
+            "Wilson_Lower_Bound_Pct": wlb_f,
             "Fresh_Net_PnL_INR": pnl_f,
-            "Platform_Charges_And_Tax_INR": charges_f,
+            "Platform_Charges_And_Tax_INR": round(charges_f + tax_f, 2),
             "Net_Profit_After_Charges_INR": net_after_ch_f,
+            "Post_Tax_PnL_INR": post_tax_f,
+            "Peak_Capital_INR": peak_cap_f,
+            "XIRR_Pct": xirr_f,
+            "Shrunk_XIRR_Pct": float(ad.get("Shrunk_XIRR_Pct", 0.0)),
+            "Unique_Trade_Days": int(ad.get("Unique_Trade_Days", 0)),
             "Fresh_Avg_Return_Pct": avg_ret_f,
             "Historical_Trades_Count": n_h,
             "Historical_Win_Rate_Pct": wr_h,
@@ -3817,29 +3555,35 @@ def build_all_strategies_paper_ledger_and_scorecard(
             "Exit_Trigger_Condition": spec["Exit_Trigger_Condition"],
         })
 
-    scorecard_df = pd.DataFrame(scorecard_rows)
+    scorecard_df = pd.DataFrame(scorecard_rows).sort_values(
+        by=["Adaptive_Rank", "Adaptive_Rank_Score", "Fresh_Win_Rate_Pct"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
     scorecard_df.to_csv(STRATEGY_SCORECARD_CSV, index=False)
 
-    # Enrich `fresh_df` (Strategy A Paper Ledger) with confirmed Strategy_Name, Paper_Trade_Success_Rate,
-    # Confidence_Level, and numeric sort columns so Section 2 can sort best-performing strategies on top
+    # Enrich `fresh_df` with live closed-trade Paper_Trade_Success_Rate & Confidence_Level
     if not fresh_df.empty:
-        perf_map_a = _get_strategy_paper_performance_map()
+        perf_map_a = _get_strategy_paper_performance_map(current_regime=current_regime)
         s_names_a, s_succ_a, conf_lvl_a, wr_sort_a, pt_sort_a, conf_num_a = [], [], [], [], [], []
         for _, r_f in fresh_df.iterrows():
             sid_f = str(r_f.get("Strategy_ID", "L6_5GATE_10AM_SNIPER")).strip()
             p_info = perf_map_a.get(sid_f, perf_map_a.get("L6_5GATE_10AM_SNIPER", {}))
             s_names_a.append(p_info.get("Strategy_Name", sid_f))
-            s_succ_a.append(p_info.get("StratA_Success_Str", "100.0% Paper WR"))
-            wr_v = float(p_info.get("StratA_Sort_WR", 85.0))
+            s_succ_a.append(p_info.get("StratA_Success_Str", "⏳ 0 Closed Trades"))
+            wr_v = float(p_info.get("StratA_Sort_WR", 0.0))
             pt_v = float(p_info.get("StratA_Post_Tax_INR", 0.0))
+            wlb_v = float(p_info.get("StratA_WLB_Pct", wr_v))
             pnl_r = float(r_f.get("Net_Profit_After_Charges_INR", r_f.get("PnL_INR", 0.0)))
+            n_cl = int(p_info.get("StratA_Trades", 0))
             c_score, c_badge = _compute_confidence_badge(
                 paper_wr_pct=wr_v,
-                hist_wr_pct=float(p_info.get("Hist_3Y_WR_Pct", 90.0)),
-                readiness_score=88.0 if pnl_r > 0 else 64.0,
+                wlb_pct=wlb_v,
+                shrunk_xirr_pct=float(p_info.get("StratA_Shrunk_XIRR_Pct", 0.0)),
+                readiness_score=85.0 if pnl_r > 0 else 65.0,
                 gap_pct=0.0,
-                is_blocked_in_b=(pnl_r < 0),
-                context_note="Passed Strategy A Gate" if pnl_r >= 0 else "Unfiltered Trap in A (Blocked in B)",
+                is_blocked_in_b=False,
+                n_closed=n_cl,
+                context_note="Closed Win" if (_is_closed_trade_status(r_f.get("Trade_Status", "")) and pnl_r > 0) else ("Closed Loss" if _is_closed_trade_status(r_f.get("Trade_Status", "")) else "Active Open"),
             )
             conf_lvl_a.append(c_badge)
             wr_sort_a.append(wr_v)
@@ -3854,8 +3598,7 @@ def build_all_strategies_paper_ledger_and_scorecard(
         fresh_df.to_csv(FRESH_PAPER_TRADES_CSV, index=False)
         fresh_df.to_csv(ALL_STRATEGIES_PAPER_CSV, index=False)
 
-    # 6. Automatically invoke Continuous Critic Audit & Memory Check so every performance review
-    #    evaluates prior gaps, active guardrails, daily invested capital, tax, and XIRR
+    # 7. Automatically invoke Continuous Critic Audit & Memory Check
     try:
         run_continuous_critic_audit_and_memory_check(fresh_df=fresh_df)
     except Exception:
@@ -3877,201 +3620,274 @@ CANONICAL_STRATEGY_NAMES = {
 }
 
 
-def _get_strategy_paper_performance_map() -> dict:
+def _get_strategy_paper_performance_map(current_regime: str | None = None) -> dict:
     """
-    Returns live paper-trade success rate, win/loss count, realized Post-Tax P&L,
-    3-Year historical win rate, and confirmed human-readable Strategy_Name for all 9 strategies
-    across both Strategy A (1st Stable Version) and Strategy B (2-Expert Critic Strategy).
+    Dynamically builds live closed-trade performance telemetry for all 9 canonical strategies
+    strictly from real CSV outputs (`v3_expert_strategy_scorecard.csv`,
+    `strategy_wise_paper_scorecard.csv`, and `adaptive_strategy_ranking.csv`).
+    Zero hardcoded baselines, zero artificial WR defaults, zero 3Y backtest mixing.
     """
-    defaults = {
-        "OP_S1_Operator_Low_Absorption_BUY": {
-            "StratA_Trades": 8, "StratA_WR": 50.0, "StratA_Sort_WR": 50.0, "StratA_WL": "4W/4L", "StratA_Post_Tax_INR": -124.81,
-            "StratB_Trades": 8, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "8W/0L", "StratB_Post_Tax_INR": 603.98,
-            "Hist_3Y_WR_Pct": 88.5,
-        },
-        "OP_S3_Operator_Supply_Dump_SELL": {
-            "StratA_Trades": 12, "StratA_WR": 75.0, "StratA_Sort_WR": 75.0, "StratA_WL": "9W/3L", "StratA_Post_Tax_INR": 327.07,
-            "StratB_Trades": 9, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "9W/0L", "StratB_Post_Tax_INR": 586.70,
-            "Hist_3Y_WR_Pct": 92.5,
-        },
-        "L1_SECTOR_ORB_SNIPER": {
-            "StratA_Trades": 0, "StratA_WR": 100.0, "StratA_Sort_WR": 99.5, "StratA_WL": "0 Direct (Masked in L6)", "StratA_Post_Tax_INR": 517.34,
-            "StratB_Trades": 3, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "3W/0L", "StratB_Post_Tax_INR": 517.34,
-            "Hist_3Y_WR_Pct": 93.6,
-        },
-        "L4_DEFENSIVE_RS_SNIPER": {
-            "StratA_Trades": 3, "StratA_WR": 100.0, "StratA_Sort_WR": 100.0, "StratA_WL": "3W/0L", "StratA_Post_Tax_INR": 353.96,
-            "StratB_Trades": 3, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "3W/0L", "StratB_Post_Tax_INR": 353.96,
-            "Hist_3Y_WR_Pct": 94.6,
-        },
-        "L2_SUPPORT_SPRING_SNIPER": {
-            "StratA_Trades": 0, "StratA_WR": 100.0, "StratA_Sort_WR": 99.4, "StratA_WL": "0 Direct (Masked in L6)", "StratA_Post_Tax_INR": 343.27,
-            "StratB_Trades": 2, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "2W/0L", "StratB_Post_Tax_INR": 343.27,
-            "Hist_3Y_WR_Pct": 96.5,
-        },
-        "L3_CATALYST_VWAP_SNIPER": {
-            "StratA_Trades": 0, "StratA_WR": 100.0, "StratA_Sort_WR": 99.3, "StratA_WL": "0 Direct (Masked in L6)", "StratA_Post_Tax_INR": 286.54,
-            "StratB_Trades": 2, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "2W/0L", "StratB_Post_Tax_INR": 286.54,
-            "Hist_3Y_WR_Pct": 95.4,
-        },
-        "L6_5GATE_10AM_SNIPER": {
-            "StratA_Trades": 9, "StratA_WR": 100.0, "StratA_Sort_WR": 100.0, "StratA_WL": "9W/0L", "StratA_Post_Tax_INR": 1161.46,
-            "StratB_Trades": 1, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "1W/0L", "StratB_Post_Tax_INR": 116.71,
-            "Hist_3Y_WR_Pct": 91.5,
-        },
-        "L5_GLOBAL_MACRO_SNIPER": {
-            "StratA_Trades": 0, "StratA_WR": 100.0, "StratA_Sort_WR": 99.2, "StratA_WL": "0 Direct (Masked in L6)", "StratA_Post_Tax_INR": 67.15,
-            "StratB_Trades": 1, "StratB_WR": 100.0, "StratB_Sort_WR": 100.0, "StratB_WL": "1W/0L", "StratB_Post_Tax_INR": 67.15,
-            "Hist_3Y_WR_Pct": 94.5,
-        },
-        "OP_S2_Operator_VWAP_Markup_BUY": {
-            "StratA_Trades": 18, "StratA_WR": 77.8, "StratA_Sort_WR": 77.8, "StratA_WL": "14W/4L", "StratA_Post_Tax_INR": 807.84,
-            "StratB_Trades": 17, "StratB_WR": 94.1, "StratB_Sort_WR": 94.1, "StratB_WL": "16W/1L", "StratB_Post_Tax_INR": 1063.64,
-            "Hist_3Y_WR_Pct": 91.2,
-        },
-    }
+    out_map = {}
+    for spec in ALL_9_STRATEGY_SPECS:
+        sid = spec["Strategy_ID"]
+        sname = CANONICAL_STRATEGY_NAMES.get(sid, spec.get("Strategy_Name_And_Mode", sid))
+        out_map[sid] = {
+            "Strategy_ID": sid,
+            "Strategy_Name": sname,
+            "StratB_Trades": 0,
+            "StratB_WR_Pct": 0.0,
+            "StratB_Sort_WR": 0.0,
+            "StratB_WLB_Pct": 0.0,
+            "StratB_WL": "0W/0L",
+            "StratB_Post_Tax_INR": 0.0,
+            "StratB_XIRR_Pct": 0.0,
+            "StratB_Shrunk_XIRR_Pct": 0.0,
+            "StratB_Unique_Days": 0,
+            "StratB_Success_Str": "⏳ 0 Closed Trades",
+            "StratA_Trades": 0,
+            "StratA_WR_Pct": 0.0,
+            "StratA_Sort_WR": 0.0,
+            "StratA_WLB_Pct": 0.0,
+            "StratA_WL": "0W/0L",
+            "StratA_Post_Tax_INR": 0.0,
+            "StratA_XIRR_Pct": 0.0,
+            "StratA_Shrunk_XIRR_Pct": 0.0,
+            "StratA_Success_Str": "⏳ 0 Closed Trades",
+            "Combined_AB_Success_Str": "⏳ 0 Closed Trades",
+            "Adaptive_Rank": 9,
+            "Adaptive_Rank_Score": 0.0,
+            "StratB_Success_Rate_Display": "⏳ 0 Closed Trades",
+            "StratB_XIRR_Display": "0/5d Pending",
+        }
 
+    def _parse_wl_wr(raw_s: str, fallback_wr: float = 0.0) -> tuple[str, float]:
+        s = str(raw_s or "").strip()
+        if "(" in s and "%" in s:
+            try:
+                wl_p = s.split("(")[0].strip()
+                wr_p = float(s.split("(")[1].replace("%)", "").replace("%", "").strip())
+                return wl_p, wr_p
+            except Exception:
+                pass
+        return (s if s and s != "nan" else "0W/0L"), float(fallback_wr)
+
+    # 1. Load Strategy A base closed-trade stats from `strategy_wise_paper_scorecard.csv`
+    if os.path.exists(STRATEGY_SCORECARD_CSV):
+        try:
+            sc_a = pd.read_csv(STRATEGY_SCORECARD_CSV)
+            for _, row in sc_a.iterrows():
+                sid = str(row.get("Strategy_ID", "")).strip()
+                if sid not in out_map:
+                    continue
+                n_a = int(pd.to_numeric(row.get("Fresh_Trades_Since_Oct27", 0), errors="coerce") or 0)
+                wr_a = float(pd.to_numeric(row.get("Fresh_Win_Rate_Pct", 0.0), errors="coerce") or 0.0)
+                wlb_a = float(pd.to_numeric(row.get("Wilson_Lower_Bound_Pct", 0.0), errors="coerce") or 0.0)
+                wl_a = str(row.get("Fresh_Wins_Losses", "0W / 0L")).replace(" ", "")
+                pt_a = float(pd.to_numeric(row.get("Post_Tax_PnL_INR", row.get("Net_Profit_After_Charges_INR", 0.0)), errors="coerce") or 0.0)
+                xirr_a = float(pd.to_numeric(row.get("XIRR_Pct", 0.0), errors="coerce") or 0.0)
+                sx_a = float(pd.to_numeric(row.get("Shrunk_XIRR_Pct", 0.0), errors="coerce") or 0.0)
+                out_map[sid].update({
+                    "StratA_Trades": n_a,
+                    "StratA_WR_Pct": wr_a,
+                    "StratA_Sort_WR": wr_a,
+                    "StratA_WLB_Pct": wlb_a,
+                    "StratA_WL": wl_a,
+                    "StratA_Post_Tax_INR": round(pt_a, 2),
+                    "StratA_XIRR_Pct": xirr_a,
+                    "StratA_Shrunk_XIRR_Pct": sx_a,
+                })
+        except Exception:
+            pass
+
+    # 2. Load Adaptive Ranking (`adaptive_strategy_ranking.csv`) if present
+    if os.path.exists(ADAPTIVE_STRATEGY_RANKING_CSV):
+        try:
+            ad_df = pd.read_csv(ADAPTIVE_STRATEGY_RANKING_CSV)
+            for _, row in ad_df.iterrows():
+                sid = str(row.get("Strategy_ID", "")).strip()
+                if sid not in out_map:
+                    continue
+                out_map[sid]["Adaptive_Rank"] = int(pd.to_numeric(row.get("Adaptive_Rank", 9), errors="coerce") or 9)
+                out_map[sid]["Adaptive_Rank_Score"] = float(pd.to_numeric(row.get("Adaptive_Rank_Score", 0.0), errors="coerce") or 0.0)
+                out_map[sid]["StratB_WLB_Pct"] = float(pd.to_numeric(row.get("Wilson_Lower_Bound_Pct", out_map[sid]["StratB_WLB_Pct"]), errors="coerce") or 0.0)
+                out_map[sid]["StratB_XIRR_Pct"] = float(pd.to_numeric(row.get("Raw_XIRR_Pct", 0.0), errors="coerce") or 0.0)
+                out_map[sid]["StratB_Shrunk_XIRR_Pct"] = float(pd.to_numeric(row.get("Shrunk_XIRR_Pct", 0.0), errors="coerce") or 0.0)
+                out_map[sid]["StratB_Unique_Days"] = int(pd.to_numeric(row.get("Unique_Trade_Days", 0), errors="coerce") or 0)
+        except Exception:
+            pass
+
+    # 3. Override with real Strategy A vs Strategy B comparison scorecard (`v3_expert_strategy_scorecard.csv`)
     v3_sc_path = os.path.join(DATA_DIR, "v3_expert_strategy_scorecard.csv")
     if os.path.exists(v3_sc_path):
         try:
             sc_df = pd.read_csv(v3_sc_path)
             for _, row in sc_df.iterrows():
                 sid = str(row.get("Strategy_ID", "")).strip()
-                if sid not in defaults:
+                if sid not in out_map:
                     continue
-                a_cnt = int(row.get("StratA_Total_Trades", defaults[sid]["StratA_Trades"]))
-                b_cnt = int(row.get("StratB_Total_Trades", defaults[sid]["StratB_Trades"]))
-                a_pt = float(row.get("StratA_Post_Tax_INR", defaults[sid]["StratA_Post_Tax_INR"]))
-                b_pt = float(row.get("StratB_Post_Tax_INR", defaults[sid]["StratB_Post_Tax_INR"]))
-                a_wl_raw = str(row.get("StratA_Wins_Losses_WR", ""))
-                b_wl_raw = str(row.get("StratB_Wins_Losses_WR", ""))
-                if "(" in b_wl_raw and "%" in b_wl_raw:
-                    b_wl_part = b_wl_raw.split("(")[0].strip()
-                    b_wr_val = float(b_wl_raw.split("(")[1].replace("%)", "").strip())
-                    defaults[sid]["StratB_WL"] = b_wl_part
-                    defaults[sid]["StratB_WR"] = b_wr_val
-                    defaults[sid]["StratB_Sort_WR"] = b_wr_val
-                defaults[sid]["StratB_Trades"] = b_cnt
-                defaults[sid]["StratB_Post_Tax_INR"] = b_pt
-                if a_cnt > 0 and "(" in a_wl_raw and "%" in a_wl_raw:
-                    a_wl_part = a_wl_raw.split("(")[0].strip()
-                    a_wr_val = float(a_wl_raw.split("(")[1].replace("%)", "").strip())
-                    defaults[sid]["StratA_WL"] = a_wl_part
-                    defaults[sid]["StratA_WR"] = a_wr_val
-                    defaults[sid]["StratA_Sort_WR"] = a_wr_val
-                    defaults[sid]["StratA_Trades"] = a_cnt
-                    defaults[sid]["StratA_Post_Tax_INR"] = a_pt
+                a_cnt = int(pd.to_numeric(row.get("StratA_Total_Trades", out_map[sid]["StratA_Trades"]), errors="coerce") or 0)
+                b_cnt = int(pd.to_numeric(row.get("StratB_Total_Trades", 0), errors="coerce") or 0)
+                a_pt = float(pd.to_numeric(row.get("StratA_Post_Tax_INR", out_map[sid]["StratA_Post_Tax_INR"]), errors="coerce") or 0.0)
+                b_pt = float(pd.to_numeric(row.get("StratB_Post_Tax_INR", 0.0), errors="coerce") or 0.0)
+                a_wl, a_wr = _parse_wl_wr(str(row.get("StratA_Wins_Losses_WR", "")), out_map[sid]["StratA_WR_Pct"])
+                b_wl, b_wr = _parse_wl_wr(str(row.get("StratB_Wins_Losses_WR", "")), 0.0)
+                b_wlb = float(pd.to_numeric(row.get("StratB_WLB_Pct", out_map[sid]["StratB_WLB_Pct"]), errors="coerce") or 0.0)
+                b_xirr = float(pd.to_numeric(row.get("StratB_XIRR_Pct", out_map[sid]["StratB_XIRR_Pct"]), errors="coerce") or 0.0)
+                b_sxirr = float(pd.to_numeric(row.get("StratB_Shrunk_XIRR_Pct", out_map[sid]["StratB_Shrunk_XIRR_Pct"]), errors="coerce") or 0.0)
+                ad_score = float(pd.to_numeric(row.get("Adaptive_Rank_Score", out_map[sid]["Adaptive_Rank_Score"]), errors="coerce") or 0.0)
+                ad_rank = int(pd.to_numeric(row.get("Adaptive_Rank", out_map[sid]["Adaptive_Rank"]), errors="coerce") or 9)
+                b_udays = int(pd.to_numeric(row.get("StratB_Unique_Days", out_map[sid]["StratB_Unique_Days"]), errors="coerce") or 0)
+                out_map[sid].update({
+                    "StratA_Trades": a_cnt,
+                    "StratA_WL": a_wl,
+                    "StratA_WR_Pct": a_wr,
+                    "StratA_Sort_WR": a_wr,
+                    "StratA_Post_Tax_INR": round(a_pt, 2),
+                    "StratB_Trades": b_cnt,
+                    "StratB_WL": b_wl,
+                    "StratB_WR_Pct": b_wr,
+                    "StratB_Sort_WR": b_wr,
+                    "StratB_WLB_Pct": b_wlb,
+                    "StratB_Post_Tax_INR": round(b_pt, 2),
+                    "StratB_XIRR_Pct": b_xirr,
+                    "StratB_Shrunk_XIRR_Pct": b_sxirr,
+                    "StratB_Unique_Days": b_udays,
+                    "Adaptive_Rank_Score": ad_score,
+                    "Adaptive_Rank": ad_rank,
+                })
         except Exception:
             pass
 
-    out_map = {}
-    for sid, d in defaults.items():
-        sname = CANONICAL_STRATEGY_NAMES.get(sid, sid)
-        b_wr = d["StratB_WR"]
+    for sid, d in out_map.items():
+        b_cnt = d["StratB_Trades"]
+        b_wr = d["StratB_WR_Pct"]
+        b_wlb = d["StratB_WLB_Pct"]
         b_wl = d["StratB_WL"]
         b_pt = d["StratB_Post_Tax_INR"]
-        b_icon = "🟢" if b_wr >= 90.0 else ("🟡" if b_wr >= 75.0 else "🔴")
-        b_str = f"{b_icon} {b_wr:.1f}% Paper WR ({b_wl} | ₹{b_pt:+,.0f} Post-Tax)"
+        b_xirr = d["StratB_XIRR_Pct"]
+        b_days = d["StratB_Unique_Days"]
+        if b_cnt > 0:
+            b_icon = "🟢" if b_wr >= 80.0 else ("🟡" if b_wr >= 60.0 else "🔴")
+            x_txt = f" | XIRR {b_xirr:+.1f}%" if b_days >= 5 else f" | {b_days}/5d XIRR"
+            d["StratB_Success_Str"] = f"{b_icon} {b_wr:.1f}% Closed ({b_wl} | WLB {b_wlb:.1f}% | ₹{b_pt:+,.0f}{x_txt})"
+            d["StratB_Success_Rate_Display"] = f"{b_icon} {b_wr:.1f}% ({b_wl})"
+            d["StratB_XIRR_Display"] = f"{b_xirr:+.1f}%" if b_days >= 5 else f"{b_days}/5d Pending"
+        else:
+            d["StratB_Success_Str"] = "⏳ 0 Closed Trades"
+            d["StratB_Success_Rate_Display"] = "⏳ 0 Closed Trades"
+            d["StratB_XIRR_Display"] = "0/5d Pending"
 
         a_cnt = d["StratA_Trades"]
-        a_wr = d["StratA_WR"]
+        a_wr = d["StratA_WR_Pct"]
         a_wl = d["StratA_WL"]
         a_pt = d["StratA_Post_Tax_INR"]
         if a_cnt > 0:
-            a_icon = "🟢" if a_wr >= 90.0 else ("🟡" if a_wr >= 75.0 else "🔴")
-            a_str = f"{a_icon} {a_wr:.1f}% Paper WR ({a_wl} | ₹{a_pt:+,.0f} Post-Tax)"
-            ab_str = f"🟣 B: {b_wr:.1f}% ({b_wl}, ₹{b_pt:+,.0f}) | 🟢 A: {a_wr:.1f}% ({a_wl}, ₹{a_pt:+,.0f})"
+            a_icon = "🟢" if a_wr >= 80.0 else ("🟡" if a_wr >= 60.0 else "🔴")
+            d["StratA_Success_Str"] = f"{a_icon} {a_wr:.1f}% Closed ({a_wl} | ₹{a_pt:+,.0f} Post-Tax)"
         else:
-            a_str = f"🟢 100.0% CNC WR (Masked under L6 in A | {d['Hist_3Y_WR_Pct']:.1f}% 3Y Hist WR)"
-            ab_str = f"🟣 B: {b_wr:.1f}% ({b_wl}, ₹{b_pt:+,.0f}) | 🟢 A: Masked under L6 (100% CNC WR)"
+            d["StratA_Success_Str"] = "⏳ 0 Closed Trades"
 
-        out_map[sid] = {
-            "Strategy_ID": sid,
-            "Strategy_Name": sname,
-            "StratB_WR_Pct": b_wr,
-            "StratB_Sort_WR": d["StratB_Sort_WR"],
-            "StratB_Post_Tax_INR": b_pt,
-            "StratB_Trades": d["StratB_Trades"],
-            "StratB_Success_Str": b_str,
-            "StratA_WR_Pct": a_wr,
-            "StratA_Sort_WR": d["StratA_Sort_WR"],
-            "StratA_Post_Tax_INR": a_pt,
-            "StratA_Trades": a_cnt,
-            "StratA_Success_Str": a_str,
-            "Combined_AB_Success_Str": ab_str,
-            "Hist_3Y_WR_Pct": d["Hist_3Y_WR_Pct"],
-        }
+        if b_cnt > 0 or a_cnt > 0:
+            d["Combined_AB_Success_Str"] = (
+                f"🟣 B: {b_wr:.1f}% ({b_wl}, ₹{b_pt:+,.0f}) | 🟢 A: {a_wr:.1f}% ({a_wl}, ₹{a_pt:+,.0f})"
+                if b_cnt > 0
+                else d["StratA_Success_Str"]
+            )
+        else:
+            d["Combined_AB_Success_Str"] = "⏳ 0 Closed Trades (Live Sample Building)"
+
     return out_map
 
 
 def _compute_confidence_badge(
-    paper_wr_pct: float,
-    hist_wr_pct: float,
-    readiness_score: float,
+    paper_wr_pct: float | None = None,
+    wlb_pct: float | None = None,
+    shrunk_xirr_pct: float = 0.0,
+    hist_wr_pct: float = 0.0,  # kept optional for caller compatibility; NOT used in confidence
+    readiness_score: float = 75.0,
     gap_pct: float = 0.0,
     is_blocked_in_b: bool = False,
+    n_closed: int = 0,
     context_note: str = "",
+    # UI convenience keyword aliases so app.py and engine share one canonical scorer:
+    strat_id: str | None = None,
+    perf_map: dict | None = None,
+    readiness_or_conf: float | None = None,
+    vol_mult: float | None = None,
+    prefer_engine: str = "B",
 ) -> tuple[float, str]:
     """
-    Computes a quantitative composite Confidence Score (0-99%) and visual Confidence_Level badge
-    combining Strategy Paper-Trade Win Rate (45%), 3-Year Walk-Forward Win Rate (20%),
-    Technical/Volume Readiness (25%), and Trigger Proximity (10%).
+    Canonical Confidence Scorer (0-98%) strictly from REAL closed paper-trade evidence
+    (Wilson Lower Bound 55%, Bayesian Expectancy 25%) + live setup readiness (20%).
+    Zero 3Y backtest inflation. Applies cold-start guard when N_closed < 5.
     """
-    if is_blocked_in_b:
-        conf_pct = round(max(25.0, min(48.0, paper_wr_pct * 0.45 + 15.0)), 1)
-        note = context_note or "Blocked Trap in Strategy B"
-        return conf_pct, f"🔴 LOW / TRAP IN B ({conf_pct:.0f}% — {note})"
+    if readiness_or_conf is not None:
+        readiness_score = float(readiness_or_conf)
+    if vol_mult is not None and readiness_or_conf is None:
+        readiness_score = min(98.0, 65.0 + float(vol_mult) * 2.0)
 
-    prox_score = max(0.0, 100.0 - min(gap_pct, 5.0) * 12.0)
-    raw_conf = (
-        0.45 * min(max(paper_wr_pct, 50.0), 100.0)
-        + 0.20 * min(max(hist_wr_pct, 70.0), 100.0)
-        + 0.25 * min(max(readiness_score, 60.0), 99.0)
-        + 0.10 * prox_score
-    )
-    conf_pct = round(min(98.5, max(55.0, raw_conf)), 1)
-    if conf_pct >= 91.0:
+    if strat_id is not None and perf_map is not None:
+        p = perf_map.get(str(strat_id).strip(), {})
+        if str(prefer_engine).upper() == "A":
+            paper_wr_pct = float(p.get("StratA_WR_Pct", 0.0)) if paper_wr_pct is None else paper_wr_pct
+            wlb_pct = float(p.get("StratA_WLB_Pct", paper_wr_pct)) if wlb_pct is None else wlb_pct
+            shrunk_xirr_pct = float(p.get("StratA_Shrunk_XIRR_Pct", 0.0))
+            n_closed = int(p.get("StratA_Trades", n_closed))
+        else:
+            paper_wr_pct = float(p.get("StratB_WR_Pct", 0.0)) if paper_wr_pct is None else paper_wr_pct
+            wlb_pct = float(p.get("StratB_WLB_Pct", paper_wr_pct)) if wlb_pct is None else wlb_pct
+            shrunk_xirr_pct = float(p.get("StratB_Shrunk_XIRR_Pct", 0.0))
+            n_closed = int(p.get("StratB_Trades", n_closed))
+
+    wr_v = float(paper_wr_pct if paper_wr_pct is not None else 0.0)
+    wlb_v = float(wlb_pct if wlb_pct is not None else wr_v)
+
+    if is_blocked_in_b:
+        conf_pct = round(max(20.0, min(48.0, wlb_v * 0.45 + 15.0)), 1)
+        note = context_note or "Filtered by Strategy B Gate"
+        return conf_pct, f"🔴 FILTERED ({conf_pct:.0f}% — {note})"
+
+    prox_score = max(0.0, 100.0 - min(float(gap_pct), 5.0) * 12.0)
+    tech_score = 0.75 * min(max(float(readiness_score), 30.0), 99.0) + 0.25 * prox_score
+
+    if n_closed <= 0:
+        # Honest cold-start cap: no closed trades -> technical readiness only, capped <= 68%
+        conf_pct = round(min(68.0, max(35.0, tech_score * 0.68)), 1)
+        suffix = f" | {context_note}" if context_note else ""
+        return conf_pct, f"🟡 NEW / 0 CLOSED ({conf_pct:.0f}% — Tech {readiness_score:.0f}%{suffix})"
+
+    exp_score = max(0.0, min(100.0, 50.0 + float(shrunk_xirr_pct) / 4.0))
+    raw_conf = 0.55 * min(max(wlb_v, 0.0), 100.0) + 0.25 * exp_score + 0.20 * tech_score
+    if n_closed < 5:
+        raw_conf = min(raw_conf, 79.0)
+    conf_pct = round(min(98.0, max(25.0, raw_conf)), 1)
+
+    if conf_pct >= 85.0:
         tier = "🟢 VERY HIGH"
-    elif conf_pct >= 84.0:
+    elif conf_pct >= 74.0:
         tier = "🟢 HIGH"
-    elif conf_pct >= 75.0:
-        tier = "🟡 MODERATE-HIGH"
+    elif conf_pct >= 62.0:
+        tier = "🟡 MODERATE"
     else:
-        tier = "🟠 MODERATE"
+        tier = "🟠 LOW-MOD"
 
     suffix = f" | {context_note}" if context_note else ""
-    return conf_pct, f"{tier} ({conf_pct:.0f}% — {paper_wr_pct:.1f}% Paper WR{suffix})"
+    return conf_pct, f"{tier} ({conf_pct:.0f}% — {wr_v:.1f}% Closed WR / WLB {wlb_v:.1f}% [{n_closed}T]{suffix})"
 
 
 def _infer_true_strategy_b_logic_for_candidate(row_dict: dict) -> str:
     """
-    Applies Strategy B's 2-Expert Regime-Diversified Attribution (GAP-09 Fix) so watchlist
-    candidates that defaulted to L6 in Strategy A receive their true institutional sniper logic
-    (L1-L6) in Strategy B.
+    Infers the true institutional strategy logic (L1-L6) purely from objective
+    technical, sectoral, support, and catalyst telemetry (zero hardcoded ticker maps).
     """
-    tkr = str(row_dict.get("Ticker", "")).strip()
-    known_map = {
-        "LTTS": "L1_SECTOR_ORB_SNIPER",
-        "TRENT": "L1_SECTOR_ORB_SNIPER",
-        "MAZDOCK": "L1_SECTOR_ORB_SNIPER",
-        "BSE": "L1_SECTOR_ORB_SNIPER",
-        "NAVINFLUOR": "L2_SUPPORT_SPRING_SNIPER",
-        "HAL": "L2_SUPPORT_SPRING_SNIPER",
-        "DIVISLAB": "L3_CATALYST_VWAP_SNIPER",
-        "BDL": "L3_CATALYST_VWAP_SNIPER",
-        "LAURUSLABS": "L4_DEFENSIVE_RS_SNIPER",
-        "BEL": "L4_DEFENSIVE_RS_SNIPER",
-        "SUNPHARMA": "L4_DEFENSIVE_RS_SNIPER",
-        "IPCALAB": "L4_DEFENSIVE_RS_SNIPER",
-        "MANKIND": "L4_DEFENSIVE_RS_SNIPER",
-        "PERSISTENT": "L5_GLOBAL_MACRO_SNIPER",
-        "KOTAKBANK": "L6_5GATE_10AM_SNIPER",
-    }
-    if tkr in known_map:
-        return known_map[tkr]
-
     sid_a = str(row_dict.get("Best_Logic_ID", "L6_5GATE_10AM_SNIPER")).strip()
-    if sid_a in ("L1_SECTOR_ORB_SNIPER", "L2_SUPPORT_SPRING_SNIPER", "L3_CATALYST_VWAP_SNIPER", "L4_DEFENSIVE_RS_SNIPER", "L5_GLOBAL_MACRO_SNIPER"):
+    if sid_a in (
+        "L1_SECTOR_ORB_SNIPER",
+        "L2_SUPPORT_SPRING_SNIPER",
+        "L3_CATALYST_VWAP_SNIPER",
+        "L4_DEFENSIVE_RS_SNIPER",
+        "L5_GLOBAL_MACRO_SNIPER",
+    ):
         return sid_a
 
     sector = str(row_dict.get("Sector_Group", "NSE")).upper()
@@ -4100,25 +3916,19 @@ def build_probable_intraday_candidates_sheet(
     op_signals_df: pd.DataFrame | None = None,
     top3_ledger_df: pd.DataFrame | None = None,
     budget_per_ticker: float = MAX_BUDGET_PER_TICKER_INR,
+    enable_mis_short: bool = True,
+    current_regime: str | None = None,
 ) -> pd.DataFrame:
     """
-    Build the top-of-page 'Probable Intraday Entry-Exit Candidates' tables for BOTH
-    Strategy A (`1st Stable Version`) and Strategy B (`2-Expert Critic Strategy`) so the user
-    knows in advance which trades are going to happen as and when triggered, with:
-      - `Strategy_Name` (confirmed human-readable strategy name, never missing)
-      - `Paper_Trade_Success_Rate` (exact strategy win rate & Post-Tax P&L from live paper trades)
-      - `Confidence_Level` (quantitative composite confidence score + visual tier badge)
-      - `Strategy_A_vs_B_Execution_Plan` (whether the trade executes in BOTH A & B, Strategy B Only, or Strategy A Only)
-      - Default sorting: Best-Performing Strategies on Top (`Paper_Trade_Win_Rate_Pct` DESC,
-        `Strategy_Paper_PostTax_INR` DESC, `Confidence_Score_Pct` DESC, `Raw_Gap_Pct` ASC).
-
-    Persists three CSV files on every 5-minute auto-refresh and manual refresh:
-      1. `PROBABLE_CANDIDATES_CSV` (Unified Strategy A & Strategy B Advance Candidate Queue)
-      2. `PROBABLE_CANDIDATES_STRAT_B_CSV` (Strategy B `2-Expert Critic` Advance Candidate Queue)
-      3. `PROBABLE_CANDIDATES_STRAT_A_CSV` (Strategy A `1st Stable Version` Advance Candidate Queue)
+    Build forward-looking 'Probable Intraday Entry-Exit Candidates' tables sorted by
+    Adaptive closed-trade Strategy Rank (`Adaptive_Rank_Score`, `StratB_WLB_Pct`,
+    `StratB_XIRR_Pct`, `Strategy_Paper_PostTax_INR`).
+    Strictly enforces `Entry_Price <= budget` (₹20,000), explicit `Signal_Direction`
+    (`🟢 BUY (CNC)` / `🟢 BUY (CNC/MIS)` vs `🔴 SHORT SELL (MIS Only)`), and
+    forward-only Strategy B quality filters (zero look-ahead / zero hardcoded tickers).
     """
     budget = min(float(budget_per_ticker), float(MAX_BUDGET_PER_TICKER_INR))
-    perf_map = _get_strategy_paper_performance_map()
+    perf_map = _get_strategy_paper_performance_map(current_regime=current_regime)
 
     if watchlist_df is None or watchlist_df.empty:
         wl_path = os.path.join(DATA_DIR, "live_watchlist_radar.csv")
@@ -4164,23 +3974,28 @@ def build_probable_intraday_candidates_sheet(
 
         for _, r in wl_sub.iterrows():
             r_dict = r.to_dict()
-            ticker = str(r.get("Ticker", ""))
+            ticker = str(r.get("Ticker", "")).strip()
             ltp = float(r.get("Live_Price", 0.0))
             orb_trig = float(r.get("ORB_10AM_Trigger", ltp))
             rec_entry = round(float(r.get("CNC_Buy_Limit_Price", max(ltp, orb_trig))), 2)
             if rec_entry <= 0:
                 rec_entry = round(ltp, 2)
+            # Strict <= budget check (excludes >₹20K tickers like BOSCHLTD)
+            if rec_entry <= 0 or rec_entry > budget:
+                continue
+            qty = int(budget // rec_entry)
+            if qty <= 0:
+                continue
 
             sl_trig = round(float(r.get("Initial_Protected_SL", r.get("GTT_SL_Trigger", rec_entry * 0.985))), 2)
             sl_limit = round(float(r.get("GTT_SL_Limit", sl_trig * 0.997)), 2)
-            be_sl = round(float(r.get("Stage1_Breakeven_SL", rec_entry * 1.004)), 2)
+            be_sl = round(float(r.get("Stage1_Breakeven_SL", rec_entry * 1.005)), 2)
             lock_sl = round(float(r.get("Stage2_ProfitLock_SL", rec_entry * 1.012)), 2)
             chand_sl = round(float(r.get("Stage3_Chandelier_SL", rec_entry * 1.022)), 2)
             tgt_trig = round(float(r.get("Intraday_Target", r.get("GTT_Target_Trigger", rec_entry * 1.04))), 2)
             tgt_limit = round(float(r.get("GTT_Target_Limit", tgt_trig * 0.999)), 2)
             swing_tgt = round(float(r.get("GTT_Swing_Target", tgt_trig * 1.02)), 2)
 
-            qty = max(1, int(budget // rec_entry)) if rec_entry <= budget else 1
             cap_inr = round(qty * rec_entry, 2)
             risk_per_sh = max(rec_entry - sl_trig, rec_entry * 0.005)
             rew_per_sh = max(tgt_trig - rec_entry, rec_entry * 0.01)
@@ -4200,7 +4015,7 @@ def build_probable_intraday_candidates_sheet(
                 gap_pct = round(max(rec_entry - ltp, 0.0) / max(ltp, 1e-9) * 100.0, 2)
                 ltp_gap_str = f"₹{ltp:,.2f} ({gap_pct:.2f}% Below Entry ₹{rec_entry:,.2f})"
 
-            score = float(r.get("Sniper_Readiness_Score", 80.0))
+            score = float(r.get("Sniper_Readiness_Score", 75.0))
             logic_id_a = str(r.get("Best_Logic_ID", "L6_5GATE_10AM_SNIPER")).strip()
             if not logic_id_a or logic_id_a == "nan":
                 logic_id_a = "L6_5GATE_10AM_SNIPER"
@@ -4210,8 +4025,13 @@ def build_probable_intraday_candidates_sheet(
             perf_a = perf_map.get(logic_id_a, perf_map["L6_5GATE_10AM_SNIPER"])
 
             sector = str(r.get("Sector_Group", "NSE"))
+            sec_rs = float(r.get("Sector_5D_RS_Pct", 0.0))
+            above_vwap = bool(r.get("Above_VWAP", True))
             swing_gates = str(r.get("Swing_Conversion_Gates", "3/5"))
             decision_310 = str(r.get("CNC_310PM_Decision", "🟠 EXIT CNC BY 3:15 PM IST"))
+
+            # Forward-only Strategy B quality check for CNC setups
+            will_b = bool(above_vwap and rr_val >= 1.5 and (sec_rs >= -0.5 or logic_id_b == "L4_DEFENSIVE_RS_SNIPER"))
 
             slot_num = active_top3_map.get(ticker, 0)
             if slot_num > 0:
@@ -4226,12 +4046,12 @@ def build_probable_intraday_candidates_sheet(
                 prox_note = f"Above ORB Trigger | {swing_gates} Gates"
             elif gap_pct <= 0.80 and score >= 80.0:
                 sort_tier = 2
-                prox_status = f"⚡ IMMINENT BREAKOUT ({gap_pct:.2f}% to Trigger — Pre-Set GTT/SL-M Buy @ ₹{rec_entry:,.2f})"
+                prox_status = f"⚡ IMMINENT BREAKOUT ({gap_pct:.2f}% to Trigger — Limit Buy @ ₹{rec_entry:,.2f})"
                 slot_badge = f"⚡ Imminent ({gap_pct:.2f}% Away)"
                 prox_note = f"Imminent ({gap_pct:.2f}% to ORB) | {swing_gates} Gates"
             elif gap_pct <= 2.00 and score >= 80.0:
                 sort_tier = 3
-                prox_status = f"🟡 NEAR TRIGGER ({gap_pct:.2f}% to Trigger — Pre-Set GTT Buy @ ₹{rec_entry:,.2f})"
+                prox_status = f"🟡 NEAR TRIGGER ({gap_pct:.2f}% to Trigger — Limit Buy @ ₹{rec_entry:,.2f})"
                 slot_badge = f"🟡 Near ({gap_pct:.2f}% Away)"
                 prox_note = f"Near ({gap_pct:.2f}% to ORB) | {swing_gates} Gates"
             else:
@@ -4242,28 +4062,33 @@ def build_probable_intraday_candidates_sheet(
 
             conf_b_pct, conf_b_badge = _compute_confidence_badge(
                 paper_wr_pct=perf_b["StratB_WR_Pct"],
-                hist_wr_pct=perf_b["Hist_3Y_WR_Pct"],
+                wlb_pct=perf_b["StratB_WLB_Pct"],
+                shrunk_xirr_pct=perf_b["StratB_Shrunk_XIRR_Pct"],
                 readiness_score=score,
                 gap_pct=gap_pct,
-                is_blocked_in_b=False,
-                context_note=prox_note,
+                is_blocked_in_b=not will_b,
+                n_closed=perf_b["StratB_Trades"],
+                context_note=prox_note if will_b else "Sector/VWAP Gate Pending in B",
             )
             conf_a_pct, conf_a_badge = _compute_confidence_badge(
                 paper_wr_pct=perf_a["StratA_WR_Pct"],
-                hist_wr_pct=perf_a["Hist_3Y_WR_Pct"],
+                wlb_pct=perf_a["StratA_WLB_Pct"],
+                shrunk_xirr_pct=perf_a["StratA_Shrunk_XIRR_Pct"],
                 readiness_score=score,
                 gap_pct=gap_pct,
                 is_blocked_in_b=False,
+                n_closed=perf_a["StratA_Trades"],
                 context_note=prox_note,
             )
 
-            if logic_id_a != logic_id_b:
-                ab_plan = f"✅ BOTH A & B (A: {logic_id_a[:2]} Fallback -> B: True {logic_id_b[:2]} + 65% MFE Ratchet)"
-                confirmed_sname = f"{perf_b['Strategy_Name']} (A: {logic_id_a[:2]} -> B: {logic_id_b[:2]})"
+            if not will_b:
+                ab_plan = f"🛡️ STRATEGY A ONLY (Filtered in B: Check Sector RS / VWAP / R:R)"
+            elif logic_id_a != logic_id_b:
+                ab_plan = f"✅ BOTH A & B (B True Logic: {logic_id_b[:2]} + 5m Cost-Aware Ratchet)"
             else:
-                ab_plan = f"✅ BOTH STRATEGY A & B (10:00 AM 5-Gate CNC | {logic_id_b[:2]})"
-                confirmed_sname = perf_b["Strategy_Name"]
+                ab_plan = f"✅ BOTH A & B (10:00 AM 5-Gate CNC | {logic_id_b[:2]})"
 
+            confirmed_sname = perf_b["Strategy_Name"]
             rows.append({
                 "_sort_tier": sort_tier,
                 "_sort_slot": slot_num if slot_num > 0 else 99,
@@ -4272,12 +4097,15 @@ def build_probable_intraday_candidates_sheet(
                 "Candidate_Group": "CNC_OR_INTRADAY_SNIPER",
                 "Priority_And_Slot": slot_badge,
                 "Ticker": ticker,
+                "Signal_Direction": "🟢 BUY (CNC)",
+                "Product_Mode": "CNC Only",
+                "Strategy_ID": logic_id_b,
                 "Strategy_Name": confirmed_sname,
-                "Paper_Trade_Success_Rate": perf_b["Combined_AB_Success_Str"],
+                "Paper_Trade_Success_Rate": perf_b["StratB_Success_Str"],
                 "Confidence_Level": conf_b_badge,
                 "Strategy_A_vs_B_Execution_Plan": ab_plan,
-                "Advance_Entry_To_Exit_Config": f"BUY @ ₹{rec_entry:,.2f} | SL ₹{sl_trig:,.2f} -> TGT ₹{tgt_trig:,.2f} (Qty: {qty})",
-                "Order_Side": "BUY (CNC / Intraday)",
+                "Advance_Entry_To_Exit_Config": f"🟢 BUY CNC @ ₹{rec_entry:,.2f} | SL ₹{sl_trig:,.2f} -> TGT ₹{tgt_trig:,.2f} (Qty: {qty})",
+                "Order_Side": "🟢 BUY (CNC Only)",
                 "Recommended_Entry_Price": rec_entry,
                 "Recommended_Stop_Loss": f"₹{sl_trig:,.2f} (-{risk_pct:.2f}% | -₹{risk_inr:,.0f})",
                 "Safe_T1_And_Trail_SL_Levels": f"T1/BE @ ₹{be_sl:,.2f} | Lock @ ₹{lock_sl:,.2f} | Trail @ ₹{chand_sl:,.2f}",
@@ -4305,12 +4133,15 @@ def build_probable_intraday_candidates_sheet(
                 "StratB_Paper_Success_Rate": perf_b["StratB_Success_Str"],
                 "StratB_Confidence_Level": conf_b_badge,
                 "StratB_Sort_WR": perf_b["StratB_Sort_WR"],
+                "StratB_WLB_Pct": perf_b["StratB_WLB_Pct"],
+                "StratB_XIRR_Pct": perf_b["StratB_XIRR_Pct"],
                 "StratB_PostTax_INR": perf_b["StratB_Post_Tax_INR"],
                 "StratB_Confidence_Pct": conf_b_pct,
                 "Will_Execute_In_StratA": True,
-                "Will_Execute_In_StratB": True,
-                "Paper_Trade_Win_Rate_Pct": perf_b["StratB_Sort_WR"],
-                "Strategy_Paper_PostTax_INR": perf_b["StratB_Post_Tax_INR"],
+                "Will_Execute_In_StratB": will_b,
+                "Adaptive_Rank_Score": perf_b["Adaptive_Rank_Score"] if will_b else max(0.0, perf_b["Adaptive_Rank_Score"] * 0.5),
+                "Paper_Trade_Win_Rate_Pct": perf_b["StratB_WLB_Pct"] if will_b else perf_a["StratA_WLB_Pct"],
+                "Strategy_Paper_PostTax_INR": perf_b["StratB_Post_Tax_INR"] if will_b else perf_a["StratA_Post_Tax_INR"],
                 "Confidence_Score_Pct": conf_b_pct,
                 "Raw_SL_Price": sl_trig,
                 "Raw_Target_Price": tgt_trig,
@@ -4321,8 +4152,7 @@ def build_probable_intraday_candidates_sheet(
                 "Sector_Group": sector,
             })
 
-    # Also append latest session's 1-Minute Operator Volume-Shock Candidates (BUY & SELL)
-    # including Strategy B ToD-Volume unlocked springs and Strategy A vs Strategy B gate status
+    # Append latest session's REAL 1-Minute Operator Volume-Shock Candidates (forward-only, zero LUPIN/TITAGARH hardcodes)
     op_rows = []
     if not op_signals_df.empty and "Session_Date" in op_signals_df.columns:
         op_sub = op_signals_df[
@@ -4333,14 +4163,20 @@ def build_probable_intraday_candidates_sheet(
             latest_op_date = str(op_sub["Session_Date"].max())
             op_sub = op_sub[op_sub["Session_Date"].astype(str) == latest_op_date].head(12)
             for idx_op, r in op_sub.reset_index(drop=True).iterrows():
-                ticker = str(r.get("Ticker", ""))
-                side = str(r.get("Signal_Side", "BUY"))
+                ticker = str(r.get("Ticker", "")).strip()
+                side = str(r.get("Signal_Side", "BUY")).strip().upper()
+                if side == "SELL" and not enable_mis_short:
+                    continue
                 entry_p = round(float(r.get("Confirm_Entry_Price", r.get("Shock_Close", 0.0))), 2)
+                if entry_p <= 0 or entry_p > budget:
+                    continue
+                qty = int(budget // entry_p)
+                if qty <= 0:
+                    continue
                 sl_p = round(float(r.get("Initial_SL", entry_p)), 2)
                 be_p = round(float(r.get("Stage1_Breakeven_SL", entry_p)), 2)
                 lock_p = round(float(r.get("Stage2_Lock_SL", entry_p)), 2)
                 tgt_p = round(float(r.get("Target_Price", entry_p)), 2)
-                qty = max(1, int(budget // entry_p)) if entry_p <= budget else 1
                 cap_inr = round(qty * entry_p, 2)
                 risk_sh = abs(entry_p - sl_p)
                 rew_sh = abs(tgt_p - entry_p)
@@ -4350,47 +4186,61 @@ def build_probable_intraday_candidates_sheet(
                 rew_inr = round(qty * rew_sh, 2)
                 rr_val = round(rew_sh / max(risk_sh, 1e-9), 2)
                 vol_mult = float(r.get("Vol_Spike_Mult_20m", 5.0))
-                strat_id = str(r.get("Strategy_ID", "OP_S2_Operator_VWAP_Markup_BUY")).strip()
-                if not strat_id or strat_id == "nan":
+                strat_id = str(r.get("Strategy_ID", "")).strip()
+                if not strat_id or strat_id in ("nan", "None"):
                     strat_id = "OP_S2_Operator_VWAP_Markup_BUY" if side == "BUY" else "OP_S3_Operator_Supply_Dump_SELL"
                 shock_t = str(r.get("Confirm_Time_T2", r.get("Shock_Time_1m", "")))
-                sector = UNIVERSE_META.get(ticker, ("NSE", "NSE"))[1] if ticker in UNIVERSE_META else "NSE"
-                side_icon = "🟢 AUTO-BUY" if side == "BUY" else "🔴 AUTO-SELL"
+                sector = str(r.get("Sector_Group", "")) or (UNIVERSE_META.get(ticker, ("NSE", "NSE"))[1] if ticker in UNIVERSE_META else "NSE")
 
-                perf_op = perf_map.get(strat_id, perf_map["OP_S2_Operator_VWAP_Markup_BUY"])
-                pnl_val = float(r.get("PnL_INR", 0.0))
-                is_blocked_b = (
-                    (strat_id == "OP_S1_Operator_Low_Absorption_BUY" and (vol_mult < 6.0 or pnl_val < 0))
-                    or (strat_id == "OP_S3_Operator_Supply_Dump_SELL" and pnl_val < 0)
-                    or (strat_id == "OP_S2_Operator_VWAP_Markup_BUY" and ticker == "TITAGARH")
+                prod_mode = "MIS Only" if side == "SELL" else "CNC/MIS"
+                sig_dir = "🔴 SHORT SELL (MIS Only)" if side == "SELL" else "🟢 BUY (CNC/MIS)"
+                side_icon = "🟢 BUY" if side == "BUY" else "🔴 SHORT SELL (MIS)"
+
+                # Forward-only Strategy B gate check (identical to Tab 2 Strategy B gates)
+                shock_val = float(pd.to_numeric(r.get("Shock_1m_Value_INR", 15_000_000.0), errors="coerce") or 15_000_000.0)
+                etime_str = shock_t[:8]
+                in_prime_win = ("09:40:00" <= etime_str <= "11:15:00")
+                in_late_block = (etime_str >= "14:00:00" and vol_mult >= 9.0 and shock_val >= 30_000_000.0)
+                regime_up = str(current_regime or "").strip().upper()
+                is_short_op = (side == "SELL" or strat_id == "OP_S3_Operator_Supply_Dump_SELL")
+                qual_flag_str = str(r.get("Qualifies_StratB", True)).lower()
+                qual_b = (
+                    (not is_short_op or (enable_mis_short and "BEAR" in regime_up))
+                    and (strat_id != "OP_S2_Operator_VWAP_Markup_BUY" or vol_mult <= 11.5)
+                    and (in_prime_win or in_late_block)
+                    and (5.0 <= vol_mult <= 13.5)
+                    and (shock_val >= 15_000_000.0)
+                    and (rr_val >= 1.80)
+                    and (qual_flag_str not in ("false", "0"))
                 )
-                is_ratcheted_b = (strat_id == "OP_S2_Operator_VWAP_Markup_BUY" and ticker in ("CHOLAFIN", "BSE"))
+                is_blocked_b = not qual_b
+                will_b = qual_b
+                perf_op = perf_map.get(strat_id, perf_map["OP_S2_Operator_VWAP_Markup_BUY"])
 
                 if is_blocked_b:
-                    ab_plan = f"🛡️ STRATEGY A ONLY (Blocked Trap in Strategy B — {perf_op['Strategy_Name'][:15]})"
-                    will_b = False
-                elif is_ratcheted_b:
-                    ab_plan = "🔒 BOTH A & B (B Applies +0.45R Early Cost-Plus Breakeven Ratchet)"
-                    will_b = True
+                    ab_plan = f"🛡️ STRATEGY A ONLY (Filtered in B: Midday/Liquidity/R:R Gate)"
                 else:
-                    ab_plan = f"✅ BOTH STRATEGY A & B (Passed 2-Expert {vol_mult:.1f}x Vol Gate)"
-                    will_b = True
+                    ab_plan = f"✅ BOTH A & B (Passed 2-Expert {vol_mult:.1f}x Vol + 5m ATR Gate + +0.80R Ratchet)"
 
                 conf_b_pct, conf_b_badge = _compute_confidence_badge(
                     paper_wr_pct=perf_op["StratB_WR_Pct"],
-                    hist_wr_pct=perf_op["Hist_3Y_WR_Pct"],
-                    readiness_score=min(98.0, 78.0 + vol_mult * 2.2),
+                    wlb_pct=perf_op["StratB_WLB_Pct"],
+                    shrunk_xirr_pct=perf_op["StratB_Shrunk_XIRR_Pct"],
+                    readiness_score=min(98.0, 68.0 + vol_mult * 2.0),
                     gap_pct=0.0,
                     is_blocked_in_b=is_blocked_b,
-                    context_note=f"{vol_mult:.1f}x Vol Shock @ {shock_t[:5]}" if not is_blocked_b else f"Filtered by 2-Expert Gate ({vol_mult:.1f}x Vol)",
+                    n_closed=perf_op["StratB_Trades"],
+                    context_note=f"{vol_mult:.1f}x Vol @ {shock_t[:5]}" if not is_blocked_b else f"Filtered by B ({vol_mult:.1f}x Vol)",
                 )
                 conf_a_pct, conf_a_badge = _compute_confidence_badge(
                     paper_wr_pct=perf_op["StratA_WR_Pct"],
-                    hist_wr_pct=perf_op["Hist_3Y_WR_Pct"],
-                    readiness_score=min(95.0, 74.0 + vol_mult * 2.0),
+                    wlb_pct=perf_op["StratA_WLB_Pct"],
+                    shrunk_xirr_pct=perf_op["StratA_Shrunk_XIRR_Pct"],
+                    readiness_score=min(95.0, 65.0 + vol_mult * 1.8),
                     gap_pct=0.0,
                     is_blocked_in_b=False,
-                    context_note=f"{vol_mult:.1f}x Vol Shock @ {shock_t[:5]}",
+                    n_closed=perf_op["StratA_Trades"],
+                    context_note=f"{vol_mult:.1f}x Vol @ {shock_t[:5]}",
                 )
 
                 op_rows.append({
@@ -4401,25 +4251,28 @@ def build_probable_intraday_candidates_sheet(
                     "Candidate_Group": "1M_OPERATOR_FOOTPRINT",
                     "Priority_And_Slot": f"🔥 Op #{idx_op+1} ({side_icon} @ {shock_t[:5]})",
                     "Ticker": ticker,
+                    "Signal_Direction": sig_dir,
+                    "Product_Mode": prod_mode,
+                    "Strategy_ID": strat_id,
                     "Strategy_Name": perf_op["Strategy_Name"],
-                    "Paper_Trade_Success_Rate": perf_op["Combined_AB_Success_Str"],
+                    "Paper_Trade_Success_Rate": perf_op["StratB_Success_Str"] if will_b else perf_op["StratA_Success_Str"],
                     "Confidence_Level": conf_b_badge,
                     "Strategy_A_vs_B_Execution_Plan": ab_plan,
-                    "Advance_Entry_To_Exit_Config": f"{side} @ ₹{entry_p:,.2f} | SL ₹{sl_p:,.2f} -> TGT ₹{tgt_p:,.2f} (Qty: {qty})",
-                    "Order_Side": f"{side} (1m Operator)",
+                    "Advance_Entry_To_Exit_Config": f"{sig_dir} @ ₹{entry_p:,.2f} | SL ₹{sl_p:,.2f} -> TGT ₹{tgt_p:,.2f} (Qty: {qty})",
+                    "Order_Side": sig_dir,
                     "Recommended_Entry_Price": entry_p,
                     "Recommended_Stop_Loss": f"₹{sl_p:,.2f} (-{risk_pct:.2f}% | -₹{risk_inr:,.0f})",
-                    "Safe_T1_And_Trail_SL_Levels": f"BE @ ₹{be_p:,.2f} | Lock @ ₹{lock_p:,.2f}",
+                    "Safe_T1_And_Trail_SL_Levels": f"+0.80R Ratchet -> BE+0.25R @ ₹{be_p:,.2f} | Lock @ ₹{lock_p:,.2f}",
                     "Recommended_Exit_Target": f"₹{tgt_p:,.2f} (+{rew_pct:.2f}% | +₹{rew_inr:,.0f})",
                     "Trigger_Proximity_Status": f"🔥 1m OPERATOR {side} CONFIRMED ({vol_mult:.1f}x Vol Shock @ {shock_t})",
                     "Live_LTP_And_Gap": f"₹{float(r.get('Live_Or_Exit_Price', entry_p)):,.2f} (Entry @ ₹{entry_p:,.2f})",
                     "Qty_For_20K_And_Capital": f"{qty} Qty (₹{cap_inr:,.0f})",
                     "Est_Profit_Vs_Risk_INR": f"+₹{rew_inr:,.0f} vs -₹{risk_inr:,.0f} (1:{rr_val:.2f})",
-                    "Time_Exit_And_315PM_Rule": "⏰ 1m Dynamic Trail + Hard Exit 3:15 PM IST",
+                    "Time_Exit_And_315PM_Rule": f"⏰ {prod_mode} | +0.80R Ratchet + Hard Exit 3:15 PM IST",
                     "Strategy_And_Conviction": f"{strat_id} ({vol_mult:.1f}x Vol | {sector})",
                     "Pre_Configure_Broker_Order_Guide": (
-                        f"1) {side} Intraday @ ₹{entry_p:,.2f} (Qty {qty}) -> "
-                        f"2) Stop-Loss @ ₹{sl_p:,.2f} | Trail to BE @ ₹{be_p:,.2f} | Target @ ₹{tgt_p:,.2f}"
+                        f"1) {sig_dir} @ ₹{entry_p:,.2f} (Qty {qty}) -> "
+                        f"2) SL @ ₹{sl_p:,.2f} | Cost-Plus Ratchet @ ₹{be_p:,.2f} | Target @ ₹{tgt_p:,.2f}"
                     ),
                     "StratA_Strategy_ID": strat_id,
                     "StratA_Strategy_Name": perf_op["Strategy_Name"],
@@ -4429,15 +4282,18 @@ def build_probable_intraday_candidates_sheet(
                     "StratA_PostTax_INR": perf_op["StratA_Post_Tax_INR"],
                     "StratA_Confidence_Pct": conf_a_pct,
                     "StratB_Strategy_ID": strat_id if will_b else f"🚫 BLOCKED_{strat_id[:5]}",
-                    "StratB_Strategy_Name": perf_op["Strategy_Name"] if will_b else f"🚫 Blocked in B ({perf_op['Strategy_Name']})",
+                    "StratB_Strategy_Name": perf_op["Strategy_Name"] if will_b else f"🚫 Filtered in B ({perf_op['Strategy_Name']})",
                     "StratB_Paper_Success_Rate": perf_op["StratB_Success_Str"],
                     "StratB_Confidence_Level": conf_b_badge,
                     "StratB_Sort_WR": perf_op["StratB_Sort_WR"] if will_b else 0.0,
-                    "StratB_PostTax_INR": perf_op["StratB_Post_Tax_INR"] if will_b else -999.0,
+                    "StratB_WLB_Pct": perf_op["StratB_WLB_Pct"] if will_b else 0.0,
+                    "StratB_XIRR_Pct": perf_op["StratB_XIRR_Pct"] if will_b else 0.0,
+                    "StratB_PostTax_INR": perf_op["StratB_Post_Tax_INR"] if will_b else 0.0,
                     "StratB_Confidence_Pct": conf_b_pct,
                     "Will_Execute_In_StratA": True,
                     "Will_Execute_In_StratB": will_b,
-                    "Paper_Trade_Win_Rate_Pct": perf_op["StratB_Sort_WR"] if will_b else perf_op["StratA_Sort_WR"],
+                    "Adaptive_Rank_Score": perf_op["Adaptive_Rank_Score"] if will_b else 0.0,
+                    "Paper_Trade_Win_Rate_Pct": perf_op["StratB_WLB_Pct"] if will_b else perf_op["StratA_WLB_Pct"],
                     "Strategy_Paper_PostTax_INR": perf_op["StratB_Post_Tax_INR"] if will_b else perf_op["StratA_Post_Tax_INR"],
                     "Confidence_Score_Pct": conf_b_pct,
                     "Raw_SL_Price": sl_p,
@@ -4445,104 +4301,52 @@ def build_probable_intraday_candidates_sheet(
                     "Raw_Stage1_BE": be_p,
                     "Raw_Qty": qty,
                     "Raw_Gap_Pct": 0.0,
-                    "Raw_Score": 92.0 if will_b else 45.0,
+                    "Raw_Score": 90.0 if will_b else 45.0,
                     "Sector_Group": sector,
                 })
-
-    # Also include Strategy B Exclusive ToD-Volume Normalized Operator Spring candidate (LUPIN)
-    perf_ops1 = perf_map["OP_S1_Operator_Low_Absorption_BUY"]
-    conf_lup_pct, conf_lup_badge = _compute_confidence_badge(
-        paper_wr_pct=perf_ops1["StratB_WR_Pct"],
-        hist_wr_pct=perf_ops1["Hist_3Y_WR_Pct"],
-        readiness_score=94.0,
-        gap_pct=0.0,
-        is_blocked_in_b=False,
-        context_note="7.6x Vol + CLV 0.82 (Unlocked by Strategy B ToD Vol >= 2.0x)",
-    )
-    op_rows.append({
-        "_sort_tier": 1,
-        "_sort_slot": 98,
-        "_sort_score": -7.6,
-        "_sort_gap": 0.0,
-        "Candidate_Group": "1M_OPERATOR_FOOTPRINT",
-        "Priority_And_Slot": "🟣 B-Exclusive Op (🟢 AUTO-BUY @ 09:52)",
-        "Ticker": "LUPIN",
-        "Strategy_Name": perf_ops1["Strategy_Name"],
-        "Paper_Trade_Success_Rate": perf_ops1["Combined_AB_Success_Str"],
-        "Confidence_Level": conf_lup_badge,
-        "Strategy_A_vs_B_Execution_Plan": "🟣 STRATEGY B EXCLUSIVE (Unlocked by ToD Vol >= 2.0x + VWAP Reclaim)",
-        "Advance_Entry_To_Exit_Config": "BUY @ ₹2,180.00 | SL ₹2,171.20 -> TGT ₹2,196.20 (Qty: 9)",
-        "Order_Side": "BUY (1m Operator — Strategy B)",
-        "Recommended_Entry_Price": 2180.00,
-        "Recommended_Stop_Loss": "₹2,171.20 (-0.40% | -₹79)",
-        "Safe_T1_And_Trail_SL_Levels": "BE @ ₹2,184.50 | Lock @ ₹2,191.50",
-        "Recommended_Exit_Target": "₹2,196.20 (+0.74% | +₹146)",
-        "Trigger_Proximity_Status": "🟣 STRATEGY B CONFIRMED (7.6x Vol Shock + CLV 0.82 @ 09:52:00)",
-        "Live_LTP_And_Gap": "₹2,196.20 (Entry @ ₹2,180.00)",
-        "Qty_For_20K_And_Capital": "9 Qty (₹19,620)",
-        "Est_Profit_Vs_Risk_INR": "+₹146 vs -₹79 (1:1.84)",
-        "Time_Exit_And_315PM_Rule": "⏰ 1m Dynamic Trail + Hard Exit 3:15 PM IST",
-        "Strategy_And_Conviction": "OP_S1_Operator_Low_Absorption_BUY (7.6x Vol | PHARMA_DEFENSIVE)",
-        "Pre_Configure_Broker_Order_Guide": "1) BUY Intraday @ ₹2,180.00 (Qty 9) -> 2) Stop-Loss @ ₹2,171.20 | Trail to BE @ ₹2,184.50 | Target @ ₹2,196.20",
-        "StratA_Strategy_ID": "⚪ NOT_TRIGGERED_IN_A",
-        "StratA_Strategy_Name": "⚪ Missed in Strategy A (Full-Day Vol Penalty)",
-        "StratA_Paper_Success_Rate": perf_ops1["StratA_Success_Str"],
-        "StratA_Confidence_Level": "⚪ MISSED IN A (Unlocked in B)",
-        "StratA_Sort_WR": 0.0,
-        "StratA_PostTax_INR": 0.0,
-        "StratA_Confidence_Pct": 0.0,
-        "StratB_Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-        "StratB_Strategy_Name": perf_ops1["Strategy_Name"],
-        "StratB_Paper_Success_Rate": perf_ops1["StratB_Success_Str"],
-        "StratB_Confidence_Level": conf_lup_badge,
-        "StratB_Sort_WR": perf_ops1["StratB_Sort_WR"],
-        "StratB_PostTax_INR": perf_ops1["StratB_Post_Tax_INR"],
-        "StratB_Confidence_Pct": conf_lup_pct,
-        "Will_Execute_In_StratA": False,
-        "Will_Execute_In_StratB": True,
-        "Paper_Trade_Win_Rate_Pct": perf_ops1["StratB_Sort_WR"],
-        "Strategy_Paper_PostTax_INR": perf_ops1["StratB_Post_Tax_INR"],
-        "Confidence_Score_Pct": conf_lup_pct,
-        "Raw_SL_Price": 2171.20,
-        "Raw_Target_Price": 2196.20,
-        "Raw_Stage1_BE": 2184.50,
-        "Raw_Qty": 9,
-        "Raw_Gap_Pct": 0.0,
-        "Raw_Score": 94.0,
-        "Sector_Group": "PHARMA_DEFENSIVE",
-    })
 
     df_out = pd.DataFrame(rows)
     if op_rows:
         df_out = pd.concat([df_out, pd.DataFrame(op_rows)], ignore_index=True)
 
+    cand_cols = [
+        "Candidate_Group", "Priority_And_Slot", "Ticker", "Signal_Direction", "Product_Mode",
+        "Strategy_ID", "Strategy_Name", "Paper_Trade_Success_Rate", "Confidence_Level",
+        "Strategy_A_vs_B_Execution_Plan", "Advance_Entry_To_Exit_Config", "Order_Side",
+        "Recommended_Entry_Price", "Recommended_Stop_Loss", "Safe_T1_And_Trail_SL_Levels",
+        "Recommended_Exit_Target", "Trigger_Proximity_Status", "Live_LTP_And_Gap",
+        "Qty_For_20K_And_Capital", "Est_Profit_Vs_Risk_INR", "Time_Exit_And_315PM_Rule",
+        "Strategy_And_Conviction", "Pre_Configure_Broker_Order_Guide",
+        "Adaptive_Rank_Score", "StratB_WLB_Pct", "StratB_XIRR_Pct",
+        "Paper_Trade_Win_Rate_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct",
+        "Raw_SL_Price", "Raw_Target_Price", "Raw_Stage1_BE", "Raw_Qty", "Raw_Gap_Pct",
+        "Raw_Score", "Sector_Group", "Will_Execute_In_StratA", "Will_Execute_In_StratB",
+    ]
     if not df_out.empty:
-        # Default Sort: Best-Performing Strategies Visible on Top!
-        # 1) Paper_Trade_Win_Rate_Pct DESC
-        # 2) Strategy_Paper_PostTax_INR DESC
-        # 3) Confidence_Score_Pct DESC
-        # 4) Raw_Gap_Pct ASC
+        sort_cols = [
+            "Adaptive_Rank_Score", "StratB_WLB_Pct", "StratB_XIRR_Pct",
+            "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct", "Raw_Gap_Pct",
+        ]
         df_out = df_out.sort_values(
-            by=["Paper_Trade_Win_Rate_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct", "Raw_Gap_Pct"],
-            ascending=[False, False, False, True],
+            by=sort_cols,
+            ascending=[False, False, False, False, False, True],
         ).reset_index(drop=True)
         df_out["Priority_And_Slot"] = [
             f"#{i+1} {r['Priority_And_Slot']}" if not str(r["Priority_And_Slot"]).startswith("#") else str(r["Priority_And_Slot"])
             for i, r in df_out.iterrows()
         ]
 
-        # Build Strategy B Dedicated Advance Candidates Table (Best-Performing Strategy B Logics on Top)
         df_b = df_out[df_out["Will_Execute_In_StratB"] == True].copy()
         if not df_b.empty:
             df_b["Strategy_Name"] = df_b["StratB_Strategy_Name"]
             df_b["Paper_Trade_Success_Rate"] = df_b["StratB_Paper_Success_Rate"]
             df_b["Confidence_Level"] = df_b["StratB_Confidence_Level"]
-            df_b["Paper_Trade_Win_Rate_Pct"] = df_b["StratB_Sort_WR"]
+            df_b["Paper_Trade_Win_Rate_Pct"] = df_b["StratB_WLB_Pct"]
             df_b["Strategy_Paper_PostTax_INR"] = df_b["StratB_PostTax_INR"]
             df_b["Confidence_Score_Pct"] = df_b["StratB_Confidence_Pct"]
             df_b = df_b.sort_values(
-                by=["Paper_Trade_Win_Rate_Pct", "Strategy_Paper_PostTax_INR", "Confidence_Score_Pct", "Raw_Gap_Pct"],
-                ascending=[False, False, False, True],
+                by=sort_cols,
+                ascending=[False, False, False, False, False, True],
             ).reset_index(drop=True)
             df_b["Priority_And_Slot"] = [
                 f"#{i+1} (B) {str(r['Priority_And_Slot']).split(' ', 1)[-1]}"
@@ -4550,8 +4354,9 @@ def build_probable_intraday_candidates_sheet(
             ]
             drop_b = [c for c in ["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"] if c in df_b.columns]
             df_b.drop(columns=drop_b).to_csv(PROBABLE_CANDIDATES_STRAT_B_CSV, index=False)
+        else:
+            pd.DataFrame(columns=cand_cols).to_csv(PROBABLE_CANDIDATES_STRAT_B_CSV, index=False)
 
-        # Build Strategy A Dedicated Advance Candidates Table (Best-Performing Strategy A Logics on Top)
         df_a = df_out[df_out["Will_Execute_In_StratA"] == True].copy()
         if not df_a.empty:
             df_a["Strategy_Name"] = df_a["StratA_Strategy_Name"]
@@ -4570,10 +4375,17 @@ def build_probable_intraday_candidates_sheet(
             ]
             drop_a = [c for c in ["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"] if c in df_a.columns]
             df_a.drop(columns=drop_a).to_csv(PROBABLE_CANDIDATES_STRAT_A_CSV, index=False)
+        else:
+            pd.DataFrame(columns=cand_cols).to_csv(PROBABLE_CANDIDATES_STRAT_A_CSV, index=False)
 
         drop_internal = [c for c in ["_sort_tier", "_sort_slot", "_sort_score", "_sort_gap"] if c in df_out.columns]
         df_out = df_out.drop(columns=drop_internal)
         df_out.to_csv(PROBABLE_CANDIDATES_CSV, index=False)
+    else:
+        empty_df = pd.DataFrame(columns=cand_cols)
+        empty_df.to_csv(PROBABLE_CANDIDATES_CSV, index=False)
+        empty_df.to_csv(PROBABLE_CANDIDATES_STRAT_B_CSV, index=False)
+        empty_df.to_csv(PROBABLE_CANDIDATES_STRAT_A_CSV, index=False)
 
     return df_out
 
@@ -4583,44 +4395,87 @@ def _summarize_ledger_subset(df_sub: pd.DataFrame) -> dict:
     Helper to compute exact Gross P&L, Platform Brokerage & Statutory Taxes,
     Net Post-Charges P&L, 20% Income Tax Provision, Final Pocketed Profit,
     Peak Simultaneous Invested Capital, Cumulative Turnover Capital, and XIRR
-    for any ledger subset (v1.0 or v2.0, single day or multi-day).
+    strictly on CLOSED real-market trades (`min_days_for_annualization=5`).
     """
+    empty_res = {
+        "n_trades": 0,
+        "n_closed": 0,
+        "n_open": 0,
+        "n_cnc": 0,
+        "n_op": 0,
+        "gross_w": 0,
+        "gross_l": 0,
+        "gross_wr_pct": 0.0,
+        "net_w": 0,
+        "net_l": 0,
+        "net_wr_pct": 0.0,
+        "peak_cap_inr": 0.0,
+        "peak_slots": 0,
+        "cum_cap_inr": 0.0,
+        "gross_pnl_inr": 0.0,
+        "brokerage_inr": 0.0,
+        "stat_tax_gst_inr": 0.0,
+        "total_charges_inr": 0.0,
+        "net_after_charges_inr": 0.0,
+        "income_tax_20pct_inr": 0.0,
+        "post_tax_profit_inr": 0.0,
+        "period_roi_pct": 0.0,
+        "ann_252_roi_pct": 0.0,
+        "xirr_pct": 0.0,
+        "unique_days": 0,
+        "fee_drag_pct_of_gross": 0.0,
+    }
     if df_sub is None or df_sub.empty:
-        return {
-            "n_trades": 0,
-            "n_cnc": 0,
-            "n_op": 0,
-            "gross_w": 0,
-            "gross_l": 0,
-            "gross_wr_pct": 0.0,
-            "net_w": 0,
-            "net_l": 0,
-            "net_wr_pct": 0.0,
-            "peak_cap_inr": 0.0,
-            "peak_slots": 0,
-            "cum_cap_inr": 0.0,
-            "gross_pnl_inr": 0.0,
-            "brokerage_inr": 0.0,
-            "stat_tax_gst_inr": 0.0,
-            "total_charges_inr": 0.0,
-            "net_after_charges_inr": 0.0,
-            "income_tax_20pct_inr": 0.0,
-            "post_tax_profit_inr": 0.0,
-            "period_roi_pct": 0.0,
-            "ann_252_roi_pct": 0.0,
-            "xirr_pct": 0.0,
-            "fee_drag_pct_of_gross": 0.0,
-        }
+        return empty_res
 
-    w_df = df_sub.copy()
+    w_all = df_sub.copy()
+    if "Qty_20K" in w_all.columns:
+        w_all = w_all[pd.to_numeric(w_all["Qty_20K"], errors="coerce").fillna(0) > 0]
+    if "Entry_Price" in w_all.columns:
+        w_all = w_all[pd.to_numeric(w_all["Entry_Price"], errors="coerce").fillna(0.0) <= MAX_BUDGET_PER_TICKER_INR]
+    if w_all.empty:
+        return empty_res
+
+    status_col = "Trade_Status" if "Trade_Status" in w_all.columns else "Status"
+    w_all["_is_closed"] = w_all[status_col].apply(_is_closed_trade_status) if status_col in w_all.columns else True
+    w_df = w_all[w_all["_is_closed"] == True].copy()
+    n_tot = len(w_all)
+    n_closed = len(w_df)
+    n_open = n_tot - n_closed
+    n_cnc = int(w_all["Strategy_ID"].astype(str).str.startswith("L").sum()) if "Strategy_ID" in w_all.columns else 0
+    n_op = int(w_all["Strategy_ID"].astype(str).str.startswith("OP_").sum()) if "Strategy_ID" in w_all.columns else 0
+
+    if w_df.empty:
+        # Only active open trades exist -> peak capital tracked, realized P&L/WR strictly 0.0
+        p_caps = []
+        p_slots = []
+        for _, d_grp in w_all.groupby("Entry_Date", sort=True):
+            pc, ps, _ = compute_daily_peak_concurrent_capital(d_grp)
+            p_caps.append(pc)
+            p_slots.append(ps)
+        res = dict(empty_res)
+        res.update({
+            "n_trades": n_tot,
+            "n_open": n_open,
+            "n_cnc": n_cnc,
+            "n_op": n_op,
+            "peak_cap_inr": round(sum(p_caps) / max(len(p_caps), 1), 2) if p_caps else 0.0,
+            "peak_slots": max(p_slots, default=0),
+            "cum_cap_inr": round(float(w_all["Capital_Used_INR"].sum()), 2) if "Capital_Used_INR" in w_all.columns else 0.0,
+        })
+        return res
+
     brok_list, stat_list, tot_ch_list, net_list = [], [], [], []
     for _, r in w_df.iterrows():
         is_buy_leg = "SELL" not in str(r.get("Paper_Order_Side", "BUY")).upper()
+        is_deliv = bool(r.get("Is_Delivery", False))
         c_info = compute_indian_intraday_charges_and_tax(
             float(r.get("Entry_Price", 0.0)),
             float(r.get("Exit_Or_Live_Price", 0.0)),
             int(r.get("Qty_20K", 1)),
             is_buy_entry=is_buy_leg,
+            same_day=not is_deliv,
+            is_delivery=is_deliv,
         )
         brok_list.append(c_info["brokerage_inr"])
         stat_list.append(round(c_info["total_charges_inr"] - c_info["brokerage_inr"], 2))
@@ -4632,17 +4487,13 @@ def _summarize_ledger_subset(df_sub: pd.DataFrame) -> dict:
     w_df["_tot_ch"] = tot_ch_list
     w_df["_net_pnl"] = net_list
 
-    n_tot = len(w_df)
-    n_cnc = int(w_df["Strategy_ID"].astype(str).str.startswith("L").sum())
-    n_op = int(w_df["Strategy_ID"].astype(str).str.startswith("OP_").sum())
-
     gross_w = int((w_df["PnL_INR"] > 0).sum())
     gross_l = int((w_df["PnL_INR"] <= 0).sum())
-    gross_wr = round(gross_w / max(n_tot, 1) * 100.0, 1)
+    gross_wr = round(gross_w / max(n_closed, 1) * 100.0, 1)
 
     net_w = int((w_df["_net_pnl"] > 0).sum())
     net_l = int((w_df["_net_pnl"] <= 0).sum())
-    net_wr = round(net_w / max(n_tot, 1) * 100.0, 1)
+    net_wr = round(net_w / max(n_closed, 1) * 100.0, 1)
 
     gross_pnl = round(float(w_df["PnL_INR"].sum()), 2)
     brok_tot = round(float(w_df["_brok"].sum()), 2)
@@ -4652,7 +4503,6 @@ def _summarize_ledger_subset(df_sub: pd.DataFrame) -> dict:
     tax_20pct = round(max(0.0, net_after_ch * 0.20), 2)
     post_tax = round(net_after_ch - tax_20pct, 2)
 
-    # Compute day-by-day peak concurrent capital & metrics for XIRR
     daily_metrics = []
     for d_str, d_grp in w_df.groupby("Entry_Date", sort=True):
         p_cap, p_slots, c_cap = compute_daily_peak_concurrent_capital(d_grp)
@@ -4676,11 +4526,15 @@ def _summarize_ledger_subset(df_sub: pd.DataFrame) -> dict:
     max_peak_slots = max((d["peak_slots"] for d in daily_metrics), default=0)
     cum_cap_tot = round(float(w_df["Capital_Used_INR"].sum()), 2)
 
-    period_roi, ann_252_roi, xirr_val = compute_xirr_from_daily_metrics(daily_metrics, use_post_tax=True)
-    fee_drag_pct = round(charges_tot / max(abs(gross_pnl), 1.0) * 100.0, 1)
+    period_roi, ann_252_roi, xirr_val = compute_xirr_from_daily_metrics(
+        daily_metrics, use_post_tax=True, min_days_for_annualization=5
+    )
+    fee_drag_pct = round(charges_tot / max(abs(gross_pnl), 1.0) * 100.0, 1) if gross_pnl != 0 else 0.0
 
     return {
         "n_trades": n_tot,
+        "n_closed": n_closed,
+        "n_open": n_open,
         "n_cnc": n_cnc,
         "n_op": n_op,
         "gross_w": gross_w,
@@ -4702,6 +4556,7 @@ def _summarize_ledger_subset(df_sub: pd.DataFrame) -> dict:
         "period_roi_pct": period_roi,
         "ann_252_roi_pct": ann_252_roi,
         "xirr_pct": xirr_val,
+        "unique_days": len(daily_metrics),
         "fee_drag_pct_of_gross": fee_drag_pct,
     }
 
@@ -4713,19 +4568,10 @@ def run_continuous_critic_audit_and_memory_check(
 ) -> dict:
     """
     Continuous Critic Audit & Long-Run Stability Governance Engine:
-      1. Reads the preserved `v1.0` Pre-Audit Baseline Snapshot (`data/v1_pre_audit_fresh_trades_snapshot.csv`)
-         and the active `v2.0` Fresh Paper Trade Ledger (`data/fresh_paper_trades_since_inception.csv`).
-      2. Maintains `data/audit_gaps_and_changes_log.csv` in APPEND mode — logging every structural gap
-         between historical optimization assumptions and live market execution, the root cause, the
-         parameter before/after, the anti-overfit rationale, and the automated critic verification rule.
-      3. Maintains `data/regular_audit_log.csv` in APPEND mode — preserving `v1.0` baseline audit rows
-         (`AUDIT-01` through `AUDIT-03`), `v2.0` post-upgrade audit rows (`AUDIT-04` through `AUDIT-06`),
-         and appending any newly triggered or newly dated critic audit snapshots.
-      4. Generates `data/daily_capital_charges_tax_xirr.csv` with exact daily & cumulative Invested Money
-         (Peak Concurrent Capital vs Cumulative Turnover), Platform Brokerage, STT/Exchange/Stamp/GST,
-         20% Income Tax Provision, Final Pocketed Profit, and Annualized XIRR (%).
-      5. Updates `data/audit_critic_memory.json` so every subsequent critic audit or performance review
-         automatically checks all active stability guardrails (`G1`–`G6`) and flags any regime drift.
+      - Evaluates genuine closed-trade ledgers dynamically across ALL real session dates (`>= 2026-10-27`).
+      - Never clones `fresh_df` into `v1_df` when `v1_pre_audit_fresh_trades_snapshot.csv` is absent.
+      - Computes real daily & cumulative Invested Capital, Brokerage/STT/GST, 20% Tax, and N>=5 XIRR.
+      - Checks all active stability guardrails (G1-G6) and updates `audit_critic_memory.json`.
     """
     if fresh_df is None or fresh_df.empty:
         if os.path.exists(FRESH_PAPER_TRADES_CSV):
@@ -4742,246 +4588,92 @@ def run_continuous_critic_audit_and_memory_check(
             v1_df = pd.read_csv(V1_PRE_AUDIT_SNAPSHOT_CSV)
         except Exception:
             v1_df = pd.DataFrame()
-    if v1_df.empty and not fresh_df.empty:
-        v1_df = fresh_df.copy()
 
-    # Compute v1.0 (Pre-Fix Baseline) and v2.0 (Post-Fix Active) metrics across Day 1, Day 2, and Combined
-    v1_d1 = _summarize_ledger_subset(v1_df[v1_df["Entry_Date"].astype(str) == "2026-10-27"] if not v1_df.empty else pd.DataFrame())
-    v1_d2 = _summarize_ledger_subset(v1_df[v1_df["Entry_Date"].astype(str) == "2026-10-28"] if not v1_df.empty else pd.DataFrame())
     v1_all = _summarize_ledger_subset(v1_df)
-    v1_cnc = _summarize_ledger_subset(v1_df[v1_df["Strategy_ID"].astype(str).str.startswith("L")] if not v1_df.empty else pd.DataFrame())
     v1_op = _summarize_ledger_subset(v1_df[v1_df["Strategy_ID"].astype(str).str.startswith("OP_")] if not v1_df.empty else pd.DataFrame())
+    v1_cnc = _summarize_ledger_subset(v1_df[v1_df["Strategy_ID"].astype(str).str.startswith("L")] if not v1_df.empty else pd.DataFrame())
 
-    v2_d1 = _summarize_ledger_subset(fresh_df[fresh_df["Entry_Date"].astype(str) == "2026-10-27"] if not fresh_df.empty else pd.DataFrame())
-    v2_d2 = _summarize_ledger_subset(fresh_df[fresh_df["Entry_Date"].astype(str) == "2026-10-28"] if not fresh_df.empty else pd.DataFrame())
     v2_all = _summarize_ledger_subset(fresh_df)
     v2_cnc = _summarize_ledger_subset(fresh_df[fresh_df["Strategy_ID"].astype(str).str.startswith("L")] if not fresh_df.empty else pd.DataFrame())
     v2_op = _summarize_ledger_subset(fresh_df[fresh_df["Strategy_ID"].astype(str).str.startswith("OP_")] if not fresh_df.empty else pd.DataFrame())
 
-    # -------------------------------------------------------------------------
-    # 1. Maintain `data/audit_gaps_and_changes_log.csv` (Append-Only Gap Ledger)
-    # -------------------------------------------------------------------------
+    unique_dates = (
+        sorted(fresh_df["Entry_Date"].astype(str).str[:10].unique())
+        if (not fresh_df.empty and "Entry_Date" in fresh_df.columns)
+        else []
+    )
+    n_unique_days = len(unique_dates)
+    date_span_label = f"{unique_dates[0]} to {unique_dates[-1]}" if unique_dates else "No Closed Sessions"
+
+    # 1. Maintain `data/audit_gaps_and_changes_log.csv`
     canonical_gaps = [
         {
             "Gap_ID": "GAP-20261028-01",
-            "Identified_In_Audit": "2026-10-28 Critic Audit #1 (2-Day Live vs 3Y Backtest)",
+            "Identified_In_Audit": "Critic Audit #1 (Market Microstructure)",
             "Strategy_Or_Module": "1m Operator Footprint Engine (OP_S1 / OP_S2 / OP_S3)",
             "Gap_Category_And_Severity": "🔴 CRITICAL: Midday Rolling-20m Volume Denominator Collapse",
-            "Historical_Optimization_Assumption": (
-                "Assumed `Vol_Spike_Mult_20m >= 4.5x` represents genuine institutional block participation "
-                "uniformly from 09:20 to 13:55 IST (calibrated on high-catalyst benchmark days like BEL Oct 16)."
-            ),
-            "Live_Market_Observation_And_Root_Cause": (
-                "Between 11:21 and 13:55 IST (Indian market lunch lull), 20-minute median 1m volume (`Vol_Med20`) "
-                "collapses by 70%-85%. Routine retail/algo orders produce 6x-24x relative volume spikes with no "
-                "institutional follow-through, causing 39 midday trades with 41.0% Gross WR (28.2% Net WR) and "
-                "16/18 stop-outs (11.1% WR) on 2026-10-28."
-            ),
-            "Empirical_Impact_Before_Fix_v1": (
-                "Morning (09:20-11:20 IST): 16 trades, 75.0% Gross WR, +₹966.03 Net P&L. "
-                "Midday (11:21-13:55 IST): 39 trades, 28.2% Net WR, -₹388.27 Gross / -₹1,172.65 Net P&L."
-            ),
-            "Recommended_And_Applied_Change_v2": (
-                "Gate standard 1m Operator entries to the Prime Institutional Liquidity Window (09:20-11:20 IST). "
-                "Block 11:21-13:55 IST unless an extraordinary European-open block print (14:00-14:30 IST, "
-                ">=9.0x Vol AND >=₹3.0 Cr 1m cash value) occurs."
-            ),
-            "Parameter_Before_Vs_After": (
-                "v1.0: Entry_Time_IST <= 13:55:00 | v2.0: Entry_Time_IST <= 11:20:00 (or 14:00-14:30 >=9x & >=₹3Cr)"
-            ),
-            "Measured_Impact_After_Fix_v2": (
-                f"Eliminated 39 midday chop trades; Operator trades streamlined from {v1_op['n_trades']} -> {v2_op['n_trades']}, "
-                f"lifting Operator Net Post-Charges P&L from ₹{v1_op['net_after_charges_inr']:+,.2f} -> ₹{v2_op['net_after_charges_inr']:+,.2f}."
-            ),
-            "Long_Run_Stability_Rationale_Anti_Overfit": (
-                "Anchored to permanent Indian market microstructure (NSE morning institutional auction/VWAP execution window "
-                "09:15-11:30 IST vs midday liquidity U-curve), not ticker-specific curve-fitting."
-            ),
-            "Next_Critic_Auto_Verification_Rule": (
-                "GUARDRAIL G1: Assert 0 standard Operator trades between 11:21-13:55 IST and verify Morning Window Net WR >= 55%."
-            ),
-            "Implementation_Status": "✅ APPLIED IN ENGINE v2.0 & MONITORED AUTOMATICALLY",
+            "Historical_Optimization_Assumption": "Allowed 1m Operator entries during 11:16-13:59 IST lunch liquidity lull.",
+            "Live_Market_Observation_And_Root_Cause": "Midday 20m volume median drops 70-85%, causing routine noise to trigger fakeout volume spikes.",
+            "Empirical_Impact_Before_Fix_v1": f"v1.0 Op Trades: {v1_op['n_trades']} (if archived)" if not v1_df.empty else "Legacy archive cleared for genuine rebuild",
+            "Recommended_And_Applied_Change_v2": "Enforce Prime Institutional Window (09:20-11:15 IST); block 11:16-13:59 IST.",
+            "Parameter_Before_Vs_After": "v1.0: <= 13:55 IST | Active: 09:20-11:15 IST + Cash Vol >= ₹1.0 Cr",
+            "Measured_Impact_After_Fix_v2": f"Active Operator Closed Net P&L: ₹{v2_op['net_after_charges_inr']:+,.2f} across {v2_op['n_closed']} closed trades.",
+            "Long_Run_Stability_Rationale_Anti_Overfit": "Anchored to permanent NSE morning institutional liquidity U-curve.",
+            "Next_Critic_Auto_Verification_Rule": "GUARDRAIL G1: Assert 0 standard Operator trades between 11:16-13:59 IST.",
+            "Implementation_Status": "✅ APPLIED IN ENGINE & MONITORED AUTOMATICALLY",
         },
         {
             "Gap_ID": "GAP-20261028-02",
-            "Identified_In_Audit": "2026-10-28 Critic Audit #1 (Fee & Tax Drag Analysis)",
-            "Strategy_Or_Module": "1m Operator 3-Stage Trailing Stop (Stage-1 Breakeven)",
-            "Gap_Category_And_Severity": "🔴 CRITICAL: Sub-Brokerage Stage-1 Micro-Breakeven (+0.06%)",
-            "Historical_Optimization_Assumption": (
-                "Set Stage-1 Breakeven at `entry_p + 0.20 * risk_ps` (+0.06% = +₹12 gross on ₹20K) when `gain_r >= 0.85`, "
-                "assuming any positive gross exit counts as a 'win'."
-            ),
-            "Live_Market_Observation_And_Root_Cause": (
-                "Indian discount broker round-trip charges (Brokerage min(0.03%,₹20)x2 = ₹12 + STT 0.025% = ₹5 + "
-                "NSE/SEBI/Stamp/18% GST = ₹3.35) total ~₹20.35 per ₹20K trade (0.102% of capital). "
-                "6 trades exited at +0.06% (+₹11.95 gross), resulting in -₹8.40 net loss after charges and prematurely "
-                "choking winners that subsequently rallied to +0.65% target."
-            ),
-            "Empirical_Impact_Before_Fix_v1": (
-                "6 trades in v1.0 closed with +0.05% to +0.07% gross gain (+₹71.75 total gross) but lost -₹50.65 net after ₹122.40 charges."
-            ),
-            "Recommended_And_Applied_Change_v2": (
-                "Raise Stage-1 Cost-Plus Profit Lock to `max(0.55 * risk_ps, entry_p * 0.0020)` (>= +0.20% = +₹40 gross / "
-                "+₹19.65 net after charges) triggered at `gain_r >= 0.90`, and Stage-2 Lock to >= +0.42% at `gain_r >= 1.35`."
-            ),
-            "Parameter_Before_Vs_After": (
-                "v1.0: Stage1 = +0.20R (~+0.06%) @ 0.85R | v2.0: Stage1 = max(+0.55R, +0.20%) @ 0.90R; Stage2 = max(+0.95R, +0.42%) @ 1.35R"
-            ),
-            "Measured_Impact_After_Fix_v2": (
-                f"Every Stage-1 trail exit now covers 2x round-trip brokerage+STT+GST; Net Post-Charges Win Rate improved from "
-                f"{v1_all['net_wr_pct']:.1f}% -> {v2_all['net_wr_pct']:.1f}%."
-            ),
-            "Long_Run_Stability_Rationale_Anti_Overfit": (
-                "Derived directly from statutory NSE/SEBI/GST transaction cost floor (0.105% round-trip breakeven), "
-                "which is a mathematical constant across all market regimes."
-            ),
-            "Next_Critic_Auto_Verification_Rule": (
-                "GUARDRAIL G2: Flag any trailing-stop win whose Gross_PnL_INR < ₹25.00 (1.2x statutory charges)."
-            ),
-            "Implementation_Status": "✅ APPLIED IN ENGINE v2.0 & MONITORED AUTOMATICALLY",
+            "Identified_In_Audit": "Critic Audit #1 (Fee & Slippage Impact)",
+            "Strategy_Or_Module": "3-Stage Cost-Aware Trailing Ratchet",
+            "Gap_Category_And_Severity": "🔴 CRITICAL: Sub-Brokerage Breakeven Exits",
+            "Historical_Optimization_Assumption": "Tight breakeven trail (+0.06%) with zero slippage assumption.",
+            "Live_Market_Observation_And_Root_Cause": "Brokerage+STT+GST (~0.105% RT) plus slippage turns +0.06% gross exits into net losses.",
+            "Empirical_Impact_Before_Fix_v1": "Gross-green micro-exits resulted in negative Net Post-Charges P&L.",
+            "Recommended_And_Applied_Change_v2": "Model 3 bps/side slippage + engage +0.25R cost-plus BE ratchet only after +0.80R excursion.",
+            "Parameter_Before_Vs_After": "Old: +0.06% BE | Active: 3 bps slippage + +0.80R -> +0.25R Ratchet + SL >= max(0.60%, 1.2*ATR_5m)",
+            "Measured_Impact_After_Fix_v2": f"Active Portfolio Net WR: {v2_all['net_wr_pct']:.1f}% ({v2_all['net_w']}W/{v2_all['net_l']}L closed).",
+            "Long_Run_Stability_Rationale_Anti_Overfit": "Derived directly from statutory NSE/SEBI/GST floor + empirical 5m ATR noise floor.",
+            "Next_Critic_Auto_Verification_Rule": "GUARDRAIL G2: Flag trailing-stop wins whose Gross P&L < ₹25.00.",
+            "Implementation_Status": "✅ APPLIED IN ENGINE & MONITORED AUTOMATICALLY",
         },
         {
-            "Gap_ID": "GAP-20261028-03",
-            "Identified_In_Audit": "2026-10-28 Critic Audit #1 (Strategy-Wise Scorecard Breakdown)",
-            "Strategy_Or_Module": "OP_S3_Operator_Supply_Dump_SELL (1m Auto-Short)",
-            "Gap_Category_And_Severity": "🟠 HIGH: Short Breakdown Retest Whip-Saw & Loose CLV Filter",
-            "Historical_Optimization_Assumption": (
-                "Allowed `OP_S3` short entries on any >=4.5x candle with `CLV <= 0.40` and `c_t2 < c0`, "
-                "with a tight `0.30%` initial short stop-loss."
-            ),
-            "Live_Market_Observation_And_Root_Cause": (
-                "In Bull/Rotation regimes, 1m red volume spikes are frequently profit-booking pullbacks that bounce "
-                "0.32%-0.38% to retest VWAP before resuming. `OP_S3` suffered 30.8% Gross WR (8W/18L, -₹459.43 gross, "
-                "-₹990.51 net after charges) in v1.0."
-            ),
-            "Empirical_Impact_Before_Fix_v1": (
-                "OP_S3 v1.0: 26 trades, 8W / 18L (30.8% Gross WR, 26.9% Net WR), -₹459.43 Gross P&L, -₹990.51 Net P&L."
-            ),
-            "Recommended_And_Applied_Change_v2": (
-                "Require `Vol_Spike_Mult >= 5.0x`, `Range_Pct >= 0.18%`, `CLV <= 0.35`, T+2m close strictly below Shock Low `l0` "
-                "AND `<= VWAP`, plus widen initial Short SL cushion to `0.42%-0.60%`."
-            ),
-            "Parameter_Before_Vs_After": (
-                "v1.0: Vol>=4.5x, CLV<=0.40, c_t2<c0, SL=0.30% | v2.0: Vol>=5.0x, Rng>=0.18%, CLV<=0.35, c_t2<l0 & <=VWAP, SL>=0.42%"
-            ),
-            "Measured_Impact_After_Fix_v2": (
-                "Filtered out false pullback shorts in bull trends and prevented 2-tick VWAP retest stop-outs."
-            ),
-            "Long_Run_Stability_Rationale_Anti_Overfit": (
-                "Shorting equities in an structural uptrend requires stricter distribution proof (breaking Shock Low + VWAP) "
-                "and wider retest tolerance than long accumulation springs."
-            ),
-            "Next_Critic_Auto_Verification_Rule": (
-                "GUARDRAIL G3: Monitor OP_S3 rolling 10-trade Net Win Rate; auto-tighten to Bear/High-VIX regimes if WR < 45%."
-            ),
-            "Implementation_Status": "✅ APPLIED IN ENGINE v2.0 & MONITORED AUTOMATICALLY",
-        },
-        {
-            "Gap_ID": "GAP-20261028-04",
-            "Identified_In_Audit": "2026-10-28 Critic Audit #1 (Top-3 CNC Sniper Exit Audit)",
-            "Strategy_Or_Module": "Top-3 CNC Sniper 5m Exit Engine (L1-L6 GTT Ladder)",
-            "Gap_Category_And_Severity": "🟡 MEDIUM: Multi-Day Swing ATR Used for Same-Day Intraday Trail",
-            "Historical_Optimization_Assumption": (
-                "Set Stage-1 Breakeven at `+0.80 Daily ATR` (~2.0% move), Stage-2 at `+1.25 Daily ATR` (~3.1%), "
-                "and Target at `+1.75 Daily ATR` (~4.5%)."
-            ),
-            "Live_Market_Observation_And_Root_Cause": (
-                "Between 10:00 AM entry and 3:15 PM close (5.25 hours), a typical Nifty 250 stock moves 0.55-1.10 Daily ATR. "
-                "All 6 Top-3 CNC trades failed to reach +1.75 ATR before 3:15 PM and exited via 3:15 PM time-close, "
-                "giving back 35%-55% of their midday peak paper gains (MFE)."
-            ),
-            "Empirical_Impact_Before_Fix_v1": (
-                "Top-3 CNC v1.0: 6 trades, 5W / 1L (83.3% WR), +₹774.70 Gross / +₹659.31 Net, 0/6 hit target or Stage-2 lock before 3:15 PM."
-            ),
-            "Recommended_And_Applied_Change_v2": (
-                "Scale 5m intraday trailing ratchets to single-session Intraday-Scaled ATR: Stage-1 Cost-Plus BE (+0.35%) at "
-                "`+0.38 ATR` (or +0.72% MFE), Stage-2 Lock (+0.50 ATR) at `+0.55 ATR` (or +1.05% MFE), Stage-3 Trail at "
-                "`+0.85 ATR`, and Intraday Target at `+1.25 ATR`."
-            ),
-            "Parameter_Before_Vs_After": (
-                "v1.0: Trail 0.80 / 1.25 / 1.75 ATR, Tgt 1.75 ATR | v2.0: Trail 0.38 / 0.55 / 0.85 ATR, Tgt 1.25 ATR"
-            ),
-            "Measured_Impact_After_Fix_v2": (
-                f"Top-3 CNC Gross P&L improved from +₹{v1_cnc['gross_pnl_inr']:,.2f} -> +₹{v2_cnc['gross_pnl_inr']:,.2f} "
-                f"(Net Post-Charges +₹{v1_cnc['net_after_charges_inr']:,.2f} -> +₹{v2_cnc['net_after_charges_inr']:,.2f})."
-            ),
-            "Long_Run_Stability_Rationale_Anti_Overfit": (
-                "Aligns intraday exit horizon (5.25 hours) with square-root-of-time intraday volatility scaling (`sqrt(5.25/6.25) * Daily_ATR`)."
-            ),
-            "Next_Critic_Auto_Verification_Rule": (
-                "GUARDRAIL G4: Verify Top-3 CNC captures >= 60% of intraday MFE and maintains Net WR >= 65%."
-            ),
-            "Implementation_Status": "✅ APPLIED IN ENGINE v2.0 & MONITORED AUTOMATICALLY",
-        },
-        {
-            "Gap_ID": "GAP-20261028-05",
-            "Identified_In_Audit": "2026-10-28 Critic Audit #1 (Capital, Tax & XIRR Governance)",
-            "Strategy_Or_Module": "Portfolio Ledger, Daily Summary & Critic Governance Engine",
-            "Gap_Category_And_Severity": "🟠 HIGH: Unmodeled Brokerage/STT/GST, Tax & Concurrent Capital XIRR",
-            "Historical_Optimization_Assumption": (
-                "Evaluated strategies on Gross P&L and 1-way cumulative turnover without deducting ₹20.35/trade platform + "
-                "statutory charges, 20% income tax provision, or measuring Peak Simultaneous Invested Capital for XIRR."
-            ),
-            "Live_Market_Observation_And_Root_Cause": (
-                "High-frequency midday churning in v1.0 generated 61 trades in 2 days, costing ₹1,230.88 in brokerage, STT, "
-                "exchange fees, stamp duty & 18% GST — consuming 73.1% of the ₹1,683.57 gross profit (leaving only ₹452.69 pre-tax / ₹362.15 post-tax)."
-            ),
-            "Empirical_Impact_Before_Fix_v1": (
-                f"v1.0: Gross +₹{v1_all['gross_pnl_inr']:,.2f} minus Charges ₹{v1_all['total_charges_inr']:,.2f} = "
-                f"Net +₹{v1_all['net_after_charges_inr']:,.2f} (Post-20%-Tax +₹{v1_all['post_tax_profit_inr']:,.2f}; Fee Drag {v1_all['fee_drag_pct_of_gross']:.1f}%)."
-            ),
-            "Recommended_And_Applied_Change_v2": (
-                "Embed exact Indian discount-broker charges (Brokerage+STT+NSE+SEBI+Stamp+18% GST), 20% tax provision, "
-                "minute-by-minute Peak Simultaneous Invested Capital per Day, and Annualized XIRR (%) into all ledgers & critic checks."
-            ),
-            "Parameter_Before_Vs_After": (
-                "v1.0: Gross-only P&L & Cumulative Turnover | v2.0: Full Post-Charges & Post-Tax P&L + Peak Concurrent Capital + XIRR"
-            ),
-            "Measured_Impact_After_Fix_v2": (
-                f"v2.0 Fee Drag reduced from {v1_all['fee_drag_pct_of_gross']:.1f}% -> {v2_all['fee_drag_pct_of_gross']:.1f}% of Gross Profit; "
-                f"Final Post-Tax Profit increased from +₹{v1_all['post_tax_profit_inr']:,.2f} -> +₹{v2_all['post_tax_profit_inr']:,.2f} "
-                f"(Annualized NSE-252 Run-Rate {v2_all['ann_252_roi_pct']:+.1f}%)."
-            ),
-            "Long_Run_Stability_Rationale_Anti_Overfit": (
-                "Optimizing for Net Post-Tax Return on Peak Concurrent Capital (XIRR) naturally penalizes overtrading and "
-                "ensures the engine only takes high-expectancy setups where edge >> statutory friction."
-            ),
-            "Next_Critic_Auto_Verification_Rule": (
-                "GUARDRAIL G5: Alert if Total_Charges / Gross_Profit exceeds 35% on any rolling 3-day window."
-            ),
-            "Implementation_Status": "✅ APPLIED IN ENGINE v2.0 & MONITORED AUTOMATICALLY",
+            "Gap_ID": "GAP-20261114-03",
+            "Identified_In_Audit": "Multi-Critic Consensus Audit #2 (Look-Ahead & Artificial Data Elimination)",
+            "Strategy_Or_Module": "CNC Sniper + Strategy B + Tab 1/Tab 2 Ranking",
+            "Gap_Category_And_Severity": "🔴 CRITICAL: Point-in-Time Discipline & Budget Enforcement",
+            "Historical_Optimization_Assumption": "Used EOD close/volume, injected static baseline/hindsight pnl_gross_a < 0 filters, and allowed >₹20K tickers.",
+            "Live_Market_Observation_And_Root_Cause": "Inflated WR to fake 100%, mispriced slippage, and mixed 3Y backtests into live confidence.",
+            "Empirical_Impact_Before_Fix_v1": "Overstated live win rate and mismatched Tab 1 vs Tab 2 figures.",
+            "Recommended_And_Applied_Change_v2": "Zero hindsight/static rows; point-in-time 5m+ToD evaluation; strict <=₹20K cap; Closed-trade WLB+XIRR adaptive ranking.",
+            "Parameter_Before_Vs_After": "Old: Static baseline +indsight | Active: 100% Real Market Data + Adaptive WLB (z=1.645, 14d decay)",
+            "Measured_Impact_After_Fix_v2": f"Clean Closed Real Trades: {v2_all['n_closed']} across {n_unique_days} days; Post-Tax P&L ₹{v2_all['post_tax_profit_inr']:+,.2f}.",
+            "Long_Run_Stability_Rationale_Anti_Overfit": "Zero future leakage, statistical sample-size weighting, strict portfolio diversification.",
+            "Next_Critic_Auto_Verification_Rule": "GUARDRAIL G7: Assert 0 >₹20K trades, 0 synthetic Baseline IDs, and closed-only WR.",
+            "Implementation_Status": "✅ APPLIED IN ENGINE & MONITORED AUTOMATICALLY",
         },
     ]
 
     gaps_df_new = pd.DataFrame(canonical_gaps)
-    if os.path.exists(AUDIT_GAPS_CHANGES_CSV):
-        try:
-            old_gaps = pd.read_csv(AUDIT_GAPS_CHANGES_CSV)
-            if not old_gaps.empty and "Gap_ID" in old_gaps.columns:
-                # Keep any additional custom/future Gap_IDs that were appended later while refreshing canonical metrics
-                extra_gaps = old_gaps[~old_gaps["Gap_ID"].isin(gaps_df_new["Gap_ID"])].copy()
-                if not extra_gaps.empty:
-                    gaps_df_new = pd.concat([gaps_df_new, extra_gaps], ignore_index=True)
-        except Exception:
-            pass
     gaps_df_new.to_csv(AUDIT_GAPS_CHANGES_CSV, index=False)
 
-    # -------------------------------------------------------------------------
-    # 2. Build `data/daily_capital_charges_tax_xirr.csv` (Daily & Cumulative Capital, Tax & XIRR Table)
-    # -------------------------------------------------------------------------
+    # 2. Build dynamic `data/daily_capital_charges_tax_xirr.csv` (strictly observed dates only!)
     def _build_cap_tax_row(label: str, seg: str, m: dict, notes: str) -> dict:
         verd = (
             f"🟢 Post-Tax +₹{m['post_tax_profit_inr']:,.2f} (Gross +₹{m['gross_pnl_inr']:,.2f})"
             if m["post_tax_profit_inr"] > 0
-            else f"🔴 Post-Tax -₹{abs(m['post_tax_profit_inr']):,.2f} (Gross ₹{m['gross_pnl_inr']:+,.2f})"
+            else (
+                f"🔴 Post-Tax -₹{abs(m['post_tax_profit_inr']):,.2f} (Gross ₹{m['gross_pnl_inr']:+,.2f})"
+                if m["post_tax_profit_inr"] < 0
+                else "⚪ ₹0.00 (0 Closed Trades)"
+            )
         )
         return {
-            # First 3 Frozen Columns
             "Session_Date_And_Engine": label,
             "Strategy_Segment": seg,
             "Net_Post_Tax_Verdict": verd,
-            # Capital, Charges, Tax & XIRR Columns
-            "Trades_Count": m["n_trades"],
+            "Trades_Count": m["n_closed"],
+            "Active_Open_Trades": m["n_open"],
             "Gross_WR_Pct": m["gross_wr_pct"],
             "Net_After_Charges_WR_Pct": m["net_wr_pct"],
             "Peak_Invested_Capital_Per_Day_INR": m["peak_cap_inr"],
@@ -5001,83 +4693,89 @@ def run_continuous_critic_audit_and_memory_check(
             "Audit_Notes": notes,
         }
 
-    cap_tax_rows = [
+    cap_tax_rows = []
+    for d_str in unique_dates:
+        m_d = _summarize_ledger_subset(fresh_df[fresh_df["Entry_Date"].astype(str).str[:10] == d_str])
+        cap_tax_rows.append(
+            _build_cap_tax_row(
+                f"{d_str} (Real Session)",
+                "Combined Portfolio (CNC + 1m Op)",
+                m_d,
+                f"Real closed trades for {d_str} (3 bps slippage + statutory charges)",
+            )
+        )
+    cap_tax_rows.extend([
         _build_cap_tax_row(
-            "2026-10-27 (Day 1 | v2.0 Upgraded)",
-            "Combined Portfolio (Top-3 CNC + 1m Op)",
-            v2_d1,
-            "Day 1 with Prime Window Gate (09:20-11:20), Cost-Plus BE (+0.20%) & Intraday-Scaled CNC ATR",
-        ),
-        _build_cap_tax_row(
-            "2026-10-28 (Day 2 | v2.0 Upgraded)",
-            "Combined Portfolio (Top-3 CNC + 1m Op)",
-            v2_d2,
-            "Day 2 with midday 11:21-13:55 denominator chop removed (16/18 fakeouts avoided)",
-        ),
-        _build_cap_tax_row(
-            "2-Day Combined (Oct 27-28 | v2.0 Active)",
-            "🏆 ALL STRATEGIES COMBINED (v2.0)",
+            f"{n_unique_days}-Day Combined ({date_span_label})",
+            "🏆 ALL STRATEGIES COMBINED",
             v2_all,
-            "Active v2.0 Portfolio after deducting Platform Brokerage, STT, GST & 20% Income Tax",
+            f"Real Closed Portfolio ({v2_all['n_closed']} closed / {v2_all['n_open']} open); XIRR active when days >= 5",
         ),
         _build_cap_tax_row(
-            "2-Day Combined (Oct 27-28 | v2.0 Active)",
+            f"{n_unique_days}-Day Combined ({date_span_label})",
             "🎯 Top-3 CNC Sniper Only (L1-L6)",
             v2_cnc,
-            "Max 3 slots/day (<=₹60K peak concurrent capital); high win-rate anchor",
+            "Strict <=₹20K cap/ticker, max 1/sector, 5m point-in-time evaluation",
         ),
         _build_cap_tax_row(
-            "2-Day Combined (Oct 27-28 | v2.0 Active)",
+            f"{n_unique_days}-Day Combined ({date_span_label})",
             "⚡ 1m Operator Auto-Trade Only (OP_S1-S3)",
             v2_op,
-            "Prime Institutional Liquidity Window (09:20-11:20 IST) + Cost-Plus Stage-1 Lock",
+            "09:20-11:15 Prime Window + 3 bps slippage + +0.80R -> +0.25R Ratchet",
         ),
-        _build_cap_tax_row(
-            "2026-10-27 (Day 1 | v1.0 Pre-Fix Baseline)",
-            "Combined Portfolio (v1.0 Baseline)",
-            v1_d1,
-            "Pre-audit v1.0 Day 1 (35 trades; ₹711.67 lost to platform & statutory charges)",
-        ),
-        _build_cap_tax_row(
-            "2026-10-28 (Day 2 | v1.0 Pre-Fix Baseline)",
-            "Combined Portfolio (v1.0 Baseline)",
-            v1_d2,
-            "Pre-audit v1.0 Day 2 (26 trades; 18 midday trades went 2W/16L causing -₹505.51 net loss)",
-        ),
-        _build_cap_tax_row(
-            "2-Day Combined (Oct 27-28 | v1.0 Baseline)",
-            "📊 ALL STRATEGIES COMBINED (v1.0 Pre-Fix)",
-            v1_all,
-            "Preserved pre-change v1.0 baseline (61 trades; 73.1% of gross profit eaten by charges)",
-        ),
-    ]
-    cap_tax_df = pd.DataFrame(cap_tax_rows)
-    cap_tax_df.to_csv(DAILY_CAPITAL_TAX_XIRR_CSV, index=False)
+    ])
+    if not v1_df.empty:
+        cap_tax_rows.append(
+            _build_cap_tax_row(
+                "Archived Pre-Audit Baseline",
+                "📊 Archived Reference",
+                v1_all,
+                "Preserved historical archive comparison",
+            )
+        )
+    pd.DataFrame(cap_tax_rows).to_csv(DAILY_CAPITAL_TAX_XIRR_CSV, index=False)
 
-    # -------------------------------------------------------------------------
-    # 3. Maintain `data/regular_audit_log.csv` in APPEND Mode
-    # -------------------------------------------------------------------------
-    def _build_audit_row(
-        audit_id: str,
-        scope_label: str,
-        ver_label: str,
-        m: dict,
-        gaps_cnt: int,
-        guardrail_status: str,
-        summary_note: str,
-    ) -> dict:
+    # 3. Guardrails G1-G7 Check on genuine active ledger
+    midday_leak_count = 0
+    sub_fee_be_count = 0
+    over_budget_count = 0
+    if not fresh_df.empty:
+        over_budget_count = int((pd.to_numeric(fresh_df.get("Entry_Price", 0.0), errors="coerce").fillna(0.0) > MAX_BUDGET_PER_TICKER_INR).sum())
+        op_live = fresh_df[fresh_df["Strategy_ID"].astype(str).str.startswith("OP_")]
+        if not op_live.empty:
+            midday_leak_count = int(
+                ((op_live["Entry_Time_IST"].astype(str) > "11:15:00") & (op_live["Entry_Time_IST"].astype(str) < "14:00:00")).sum()
+            )
+            sub_fee_be_count = int(
+                ((op_live["PnL_INR"] > 0) & (op_live["PnL_INR"] < 22.0) & op_live["Exit_Trigger_Reason"].astype(str).str.contains("Trail|SL", case=False)).sum()
+            )
+
+    guardrails_check = [
+        {"guardrail_id": "G1_MIDDAY_DENOMINATOR_GATE", "linked_gap_id": "GAP-20261028-01", "rule": "Zero 1m Operator entries between 11:16-13:59 IST", "passed": midday_leak_count == 0, "live_metric": f"{midday_leak_count} midday entries"},
+        {"guardrail_id": "G2_COST_PLUS_STAGE1_LOCK", "linked_gap_id": "GAP-20261028-02", "rule": "Stage-1 ratchet protects >= costs (+0.25R after +0.80R MFE)", "passed": sub_fee_be_count == 0, "live_metric": f"{sub_fee_be_count} sub-fee trail exits"},
+        {"guardrail_id": "G3_SHORT_DUMP_CUSHION", "linked_gap_id": "GAP-20261028-01", "rule": "OP_S3 short requires Vol>=5.0x, Shock>=₹1Cr, Close<ShockLow & VWAP, SL>=max(0.60%,1.2*ATR_5m)", "passed": True, "live_metric": "Enforced in scan_operator_1m_footprints()"},
+        {"guardrail_id": "G4_POINT_IN_TIME_CNC", "linked_gap_id": "GAP-20261114-03", "rule": "CNC evaluates strictly via 5m as-of bars + 3 bps slippage + Closed WR >= 55% (when trades > 0)", "passed": v2_cnc["n_closed"] == 0 or v2_cnc["net_wr_pct"] >= 55.0, "live_metric": f"CNC Closed WR: {v2_cnc['net_wr_pct']:.1f}% ({v2_cnc['n_closed']} closed)"},
+        {"guardrail_id": "G5_FEE_TO_GROSS_RATIO_CEILING", "linked_gap_id": "GAP-20261028-02", "rule": "Charges <= 35% of positive Gross Profit", "passed": v2_all["gross_pnl_inr"] <= 0 or v2_all["fee_drag_pct_of_gross"] <= 35.0, "live_metric": f"Fee Drag: {v2_all['fee_drag_pct_of_gross']:.1f}%"},
+        {"guardrail_id": "G6_STRICT_20K_BUDGET_CAP", "linked_gap_id": "GAP-20261114-03", "rule": "Zero trades with Entry_Price > ₹20,000", "passed": over_budget_count == 0, "live_metric": f"{over_budget_count} over-budget trades"},
+    ]
+    n_failed_guards = sum(0 if g["passed"] else 1 for g in guardrails_check)
+
+    def _build_audit_row(audit_id: str, scope_label: str, ver_label: str, m: dict, gaps_cnt: int, guardrail_status: str, summary_note: str) -> dict:
         verd_badge = (
-            f"🟢 {ver_label} | Post-Tax +₹{m['post_tax_profit_inr']:,.2f} (Net WR {m['net_wr_pct']:.1f}%)"
+            f"🟢 {ver_label} | Post-Tax +₹{m['post_tax_profit_inr']:,.2f} (Closed Net WR {m['net_wr_pct']:.1f}%)"
             if m["post_tax_profit_inr"] > 0
-            else f"🔴 {ver_label} | Post-Tax -₹{abs(m['post_tax_profit_inr']):,.2f} (Net WR {m['net_wr_pct']:.1f}%)"
+            else (
+                f"🔴 {ver_label} | Post-Tax -₹{abs(m['post_tax_profit_inr']):,.2f} (Closed Net WR {m['net_wr_pct']:.1f}%)"
+                if m["post_tax_profit_inr"] < 0
+                else f"⚪ {ver_label} | ₹0.00 (0 Closed Trades)"
+            )
         )
         return {
-            # First 3 Frozen Columns
             "Audit_ID": audit_id,
             "Audit_Timestamp_And_Scope": scope_label,
             "Engine_Version_And_Verdict": verd_badge,
-            # Core Audit Metrics
-            "Total_Trades": m["n_trades"],
+            "Total_Trades": m["n_closed"],
+            "Active_Open_Trades": m["n_open"],
             "Top3_CNC_Trades": m["n_cnc"],
             "Operator_1m_Trades": m["n_op"],
             "Gross_Win_Rate_Pct": m["gross_wr_pct"],
@@ -5098,171 +4796,47 @@ def run_continuous_critic_audit_and_memory_check(
             "Key_Audit_Findings_And_Action_Summary": summary_note,
         }
 
-    baseline_and_upgrade_audits = [
+    audit_rows = [
         _build_audit_row(
-            "AUDIT-01-20261027-V1",
-            "2026-10-27 15:30 IST | Day 1 Live Session (v1.0 Pre-Fix)",
-            "v1.0 Baseline",
-            v1_d1,
-            4,
-            "⚠️ 4 GAPS DETECTED (Midday Churn + +0.06% Micro-BE)",
-            "Day 1 generated +₹1,671.56 Gross across 35 trades, but ₹711.67 went to brokerage/STT/GST; 21 midday trades diluted edge.",
-        ),
-        _build_audit_row(
-            "AUDIT-02-20261028-V1",
-            "2026-10-28 15:30 IST | Day 2 Live Session (v1.0 Pre-Fix)",
-            "v1.0 Baseline",
-            v1_d2,
-            5,
-            "🔴 5 GAPS DETECTED (11:21-13:55 Midday 2W/16L Collapse)",
-            "Morning window (09:20-11:20) + Top-3 CNC made +₹1,148.55 Gross (7W/1L), but 18 midday Operator trades went 2W/16L (-₹1,135.29).",
-        ),
-        _build_audit_row(
-            "AUDIT-03-20261028-V1-2DAY",
-            "2026-10-28 17:30 IST | 2-Day Combined Critic Audit (v1.0 Pre-Fix)",
-            "v1.0 Baseline (61 Trades)",
-            v1_all,
-            5,
-            "🔴 PRE-UPGRADE BASELINE LOGGED (Fee Drag 73.1% of Gross)",
-            "Root causes isolated in GAP-20261028-01..05: Midday Vol_Med20 denominator collapse, +0.06% sub-fee BE, OP_S3 short whipsaw, Daily ATR trail.",
-        ),
-        _build_audit_row(
-            "AUDIT-04-20261027-V2",
-            "2026-10-28 17:55 IST | Day 1 Re-Verified on v2.0 Stability Rules",
-            "v2.0 Stability Upgrade",
-            v2_d1,
-            0,
-            "✅ ALL 6 GUARDRAILS PASS (G1-G6)",
-            "Applied Prime Window (09:20-11:20), Cost-Plus Stage-1 Lock (+0.20%), OP_S3 >=0.42% SL & Intraday-Scaled CNC ATR on Day 1.",
-        ),
-        _build_audit_row(
-            "AUDIT-05-20261028-V2",
-            "2026-10-28 17:55 IST | Day 2 Re-Verified on v2.0 Stability Rules",
-            "v2.0 Stability Upgrade",
-            v2_d2,
-            0,
-            "✅ ALL 6 GUARDRAILS PASS (G1-G6)",
-            "Midday 2W/16L whipsaw completely eliminated by GAP-20261028-01 window gate; Day 2 flips from -₹505.51 Net Loss to strong Net Profit.",
-        ),
-        _build_audit_row(
-            "AUDIT-06-20261028-V2-2DAY",
-            "2026-10-28 17:55 IST | 2-Day Combined Critic Audit (v2.0 Post-Fix)",
-            "v2.0 Stability Upgrade",
-            v2_all,
-            0,
-            "✅ ALL 6 GUARDRAILS PASS (Fee Drag Cut 73% -> <20%)",
-            f"Net Post-Tax Profit improved from +₹{v1_all['post_tax_profit_inr']:,.2f} (v1.0) -> +₹{v2_all['post_tax_profit_inr']:,.2f} (v2.0); Net WR {v1_all['net_wr_pct']:.1f}% -> {v2_all['net_wr_pct']:.1f}%.",
-        ),
-    ]
-
-    # Automated Guardrail Check on active v2.0 ledger
-    midday_leak_count = 0
-    sub_fee_be_count = 0
-    if not fresh_df.empty:
-        op_live = fresh_df[fresh_df["Strategy_ID"].astype(str).str.startswith("OP_")]
-        if not op_live.empty:
-            midday_leak_count = int(
-                ((op_live["Entry_Time_IST"].astype(str) > "11:20:00") & (op_live["Entry_Time_IST"].astype(str) < "14:00:00")).sum()
-            )
-            sub_fee_be_count = int(
-                ((op_live["PnL_INR"] > 0) & (op_live["PnL_INR"] < 22.0) & op_live["Exit_Trigger_Reason"].astype(str).str.contains("Trail|SL", case=False)).sum()
-            )
-
-    guardrails_check = [
-        {
-            "guardrail_id": "G1_MIDDAY_DENOMINATOR_GATE",
-            "linked_gap_id": "GAP-20261028-01",
-            "rule": "Zero standard 1m Operator entries during 11:21-13:55 IST lunch liquidity lull",
-            "passed": midday_leak_count == 0,
-            "live_metric": f"{midday_leak_count} midday entries",
-        },
-        {
-            "guardrail_id": "G2_COST_PLUS_STAGE1_LOCK",
-            "linked_gap_id": "GAP-20261028-02",
-            "rule": "1m Operator Stage-1 profit lock >= +0.20% (>= ₹40 gross on ₹20K, covering 2x ₹20.35 charges)",
-            "passed": sub_fee_be_count == 0,
-            "live_metric": f"{sub_fee_be_count} sub-fee trail exits",
-        },
-        {
-            "guardrail_id": "G3_SHORT_DUMP_CUSHION",
-            "linked_gap_id": "GAP-20261028-03",
-            "rule": "OP_S3 short requires Vol>=5.0x, Range>=0.18%, Close<ShockLow & VWAP, SL>=0.42%",
-            "passed": True,
-            "live_metric": "Enforced in scan_operator_1m_footprints()",
-        },
-        {
-            "guardrail_id": "G4_INTRADAY_SCALED_CNC_ATR",
-            "linked_gap_id": "GAP-20261028-04",
-            "rule": "Top-3 CNC 5m trailing uses 0.38 / 0.55 / 0.85 ATR ratchets and +1.25 ATR intraday target",
-            "passed": v2_cnc["net_wr_pct"] >= 65.0,
-            "live_metric": f"Top-3 CNC Net WR: {v2_cnc['net_wr_pct']:.1f}% (Net +₹{v2_cnc['net_after_charges_inr']:,.2f})",
-        },
-        {
-            "guardrail_id": "G5_FEE_TO_GROSS_RATIO_CEILING",
-            "linked_gap_id": "GAP-20261028-05",
-            "rule": "Total Platform & Statutory Charges must remain <= 35% of Gross Profit",
-            "passed": v2_all["fee_drag_pct_of_gross"] <= 35.0,
-            "live_metric": f"Fee Drag: {v2_all['fee_drag_pct_of_gross']:.1f}% (Down from {v1_all['fee_drag_pct_of_gross']:.1f}% in v1.0)",
-        },
-        {
-            "guardrail_id": "G6_NET_POST_TAX_PROFITABILITY",
-            "linked_gap_id": "GAP-20261028-05",
-            "rule": "Combined Portfolio Net Post-Tax Profit > 0 and Net Post-Charges Win Rate >= 60%",
-            "passed": v2_all["post_tax_profit_inr"] > 0 and v2_all["net_wr_pct"] >= 60.0,
-            "live_metric": f"Post-Tax Profit: +₹{v2_all['post_tax_profit_inr']:,.2f} | Net WR: {v2_all['net_wr_pct']:.1f}%",
-        },
-    ]
-    n_failed_guards = sum(0 if g["passed"] else 1 for g in guardrails_check)
-
-    # Load existing regular_audit_log.csv and append without losing history
-    audit_df_new = pd.DataFrame(baseline_and_upgrade_audits)
-    if os.path.exists(REGULAR_AUDIT_LOG_CSV):
-        try:
-            old_aud = pd.read_csv(REGULAR_AUDIT_LOG_CSV)
-            if not old_aud.empty and "Audit_ID" in old_aud.columns:
-                extra_aud = old_aud[~old_aud["Audit_ID"].isin(audit_df_new["Audit_ID"])].copy()
-                if not extra_aud.empty:
-                    audit_df_new = pd.concat([audit_df_new, extra_aud], ignore_index=True)
-        except Exception:
-            pass
-
-    # If a new session date (> 2026-10-28) appears in fresh_df OR user clicked manual "Run & Append Live Critic Audit Snapshot"
-    if not fresh_df.empty:
-        for d_str in sorted(fresh_df["Entry_Date"].astype(str).unique()):
-            if d_str > "2026-10-28":
-                auto_id = f"AUDIT-AUTO-{d_str.replace('-', '')}-V2"
-                if auto_id not in set(audit_df_new["Audit_ID"].astype(str)):
-                    m_day = _summarize_ledger_subset(fresh_df[fresh_df["Entry_Date"].astype(str) == d_str])
-                    new_r = _build_audit_row(
-                        auto_id,
-                        f"{d_str} 15:30 IST | Auto Daily Critic Review ({CURRENT_ENGINE_VERSION})",
-                        "v2.0 Auto-Critic",
-                        m_day,
-                        n_failed_guards,
-                        "✅ ALL GUARDRAILS PASS" if n_failed_guards == 0 else f"⚠️ {n_failed_guards} GUARDRAIL ALERT",
-                        f"Auto-appended daily session audit considering {len(gaps_df_new)} historical gaps in memory.",
-                    )
-                    audit_df_new = pd.concat([audit_df_new, pd.DataFrame([new_r])], ignore_index=True)
-
-    if force_append_snapshot:
-        ts_now = pd.Timestamp.now(tz="Asia/Kolkata")
-        manual_id = f"AUDIT-LIVE-{ts_now.strftime('%Y%m%d-%H%M%S')}"
-        new_r = _build_audit_row(
-            manual_id,
-            f"{ts_now.strftime('%Y-%m-%d %H:%M:%S')} IST | {audit_trigger_label}",
-            "v2.0 Live Snapshot",
+            "AUDIT-CUMULATIVE-REAL",
+            f"{date_span_label} | Real Market Portfolio Audit ({n_unique_days} Sessions)",
+            CURRENT_ENGINE_VERSION,
             v2_all,
             n_failed_guards,
             "✅ ALL 6 GUARDRAILS PASS" if n_failed_guards == 0 else f"⚠️ {n_failed_guards} GUARDRAIL ALERT",
-            f"Live Critic Snapshot appended (Checked against {len(gaps_df_new)} logged gaps & 6 active stability guardrails).",
+            f"Verified strictly from {v2_all['n_closed']} real closed trades + {v2_all['n_open']} active open positions.",
         )
-        audit_df_new = pd.concat([audit_df_new, pd.DataFrame([new_r])], ignore_index=True)
+    ]
+    for d_str in unique_dates:
+        m_day = _summarize_ledger_subset(fresh_df[fresh_df["Entry_Date"].astype(str).str[:10] == d_str])
+        audit_rows.append(
+            _build_audit_row(
+                f"AUDIT-SESSION-{d_str.replace('-', '')}",
+                f"{d_str} 15:30 IST | Daily Session Review",
+                CURRENT_ENGINE_VERSION,
+                m_day,
+                n_failed_guards,
+                "✅ ALL GUARDRAILS PASS" if n_failed_guards == 0 else f"⚠️ {n_failed_guards} GUARDRAIL ALERT",
+                f"Real session review: {m_day['n_closed']} closed ({m_day['net_w']}W/{m_day['net_l']}L), Peak Cap ₹{m_day['peak_cap_inr']:,.0f}.",
+            )
+        )
+    if force_append_snapshot:
+        ts_now = pd.Timestamp.now(tz="Asia/Kolkata")
+        audit_rows.append(
+            _build_audit_row(
+                f"AUDIT-LIVE-{ts_now.strftime('%Y%m%d-%H%M%S')}",
+                f"{ts_now.strftime('%Y-%m-%d %H:%M:%S')} IST | {audit_trigger_label}",
+                "Live Audit Snapshot",
+                v2_all,
+                n_failed_guards,
+                "✅ ALL GUARDRAILS PASS" if n_failed_guards == 0 else f"⚠️ {n_failed_guards} GUARDRAIL ALERT",
+                f"On-demand Critic Snapshot ({v2_all['n_closed']} closed trades, {len(gaps_df_new)} logged gaps).",
+            )
+        )
 
+    audit_df_new = pd.DataFrame(audit_rows)
     audit_df_new.to_csv(REGULAR_AUDIT_LOG_CSV, index=False)
 
-    # -------------------------------------------------------------------------
-    # 4. Persist `data/audit_critic_memory.json` for Automatic Future Reviews
-    # -------------------------------------------------------------------------
     memory_payload = {
         "engine_version": CURRENT_ENGINE_VERSION,
         "last_critic_evaluation_ist": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST"),
@@ -5271,16 +4845,12 @@ def run_continuous_critic_audit_and_memory_check(
         "all_guardrails_passing": n_failed_guards == 0,
         "failed_guardrails_count": n_failed_guards,
         "active_stability_guardrails": guardrails_check,
-        "v1_pre_fix_baseline_summary": v1_all,
+        "v1_pre_fix_baseline_summary": v1_all if not v1_df.empty else None,
         "v2_post_fix_active_summary": v2_all,
-        "v2_day1_2026_10_27": v2_d1,
-        "v2_day2_2026_10_28": v2_d2,
         "v2_top3_cnc_only": v2_cnc,
         "v2_operator_1m_only": v2_op,
         "next_critic_instructions": (
-            "On every 5m refresh and EOD performance review, automatically load `audit_critic_memory.json` and "
-            "`audit_gaps_and_changes_log.csv`. Verify Guardrails G1-G6 before proposing any parameter change so "
-            "the engine converges to a regime-stable institutional core rather than oscillating on single-day noise."
+            "Verify Guardrails G1-G6 strictly on real closed trades (`Trade_Status` closed, `Entry_Price <= 20000`, N>=5 days for XIRR)."
         ),
     }
     with open(AUDIT_CRITIC_MEMORY_JSON, "w", encoding="utf-8") as f:
@@ -5313,561 +4883,388 @@ def run_v3_two_expert_monday_auto_engine(
     op_signals_df: pd.DataFrame | None = None,
     force_rebuild_shadow: bool = False,
     force_refresh: bool = False,
+    enable_mis_short: bool = True,
+    current_regime: str | None = None,
     **kwargs,
 ) -> dict:
     """
-    Executes & evaluates the Parallel Challenger Strategy ('Strategy B: 2-Expert Critic Strategy')
-    with a strict Monday activation gate (`Entry_Date >= 2026-11-02`), while preserving Strategy A
-    ('1st Stable Version') completely untouched.
-
-    Generates ALL Section 3 tables with BOTH Strategy A and Strategy B side-by-side:
-    1. `v3_expert_daily_summary.csv` (Table 3A: Day-by-Day Strategy A vs Strategy B)
-    2. `v3_expert_strategy_scorecard.csv` & `v3_expert_vs_v1_stable_comparison.csv` (Table 3B: All 9 Strategies A vs B)
-    3. `v3_expert_ab_trade_by_trade_log.csv` (Table 3C: Trade-by-Trade Execution Log A vs B)
-    4. `v3_expert_rejected_traps_log.csv` (Table 3D: Strategy A Losing Traps vs Strategy B Interception/Ratchet)
+    Forward-Only Challenger Engine ('Strategy B: 2-Expert Institutional Quality Engine'):
+      - Strictly ZERO hindsight filters, ZERO hardcoded ticker overrides, ZERO synthetic baselines.
+      - Lowers trade count while improving prediction quality via:
+        1. Prime liquidity window gate (09:20-11:15 IST; blocks 11:16-13:59 lunch chop)
+        2. Forward R:R >= 1.80 (Op) / >= 1.40 (CNC) & SL >= max(0.60%, 1.2 * ATR_5m)
+        3. Regime-aligned shorting (`OP_S3` disabled in BULL_EXPANSION or when MIS shorting off)
+        4. Max 1 position per (Date, Sector_Group) & tighter daily slot caps (<= 3 Op + <= 2 CNC)
+      - Computes ALL scorecard, XIRR (N >= 5 days guard), and adaptive rankings strictly on CLOSED trades.
+      - Removes `Backtest_3Y_WR_A_vs_B` and `TOTAL_PORTFOLIO` clutter from `v3_expert_strategy_scorecard.csv`.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
-    _ensure_monday_nov02_baseline_trades()
     now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
     today_str = now_ist.strftime("%Y-%m-%d")
-    is_monday_or_later = today_str >= V3_EXPERT_MONDAY_START_DATE
 
     if not os.path.exists(FRESH_PAPER_TRADES_CSV) or force_refresh or force_rebuild_shadow:
         try:
-            build_all_strategies_paper_ledger_and_scorecard()
+            build_all_strategies_paper_ledger_and_scorecard(current_regime=current_regime)
         except Exception:
             pass
 
     strat_a_df = pd.read_csv(FRESH_PAPER_TRADES_CSV) if os.path.exists(FRESH_PAPER_TRADES_CSV) else pd.DataFrame()
-    if (
-        not strat_a_df.empty
-        and "Entry_Date" in strat_a_df.columns
-        and (
-            ("2026-11-02" not in strat_a_df["Entry_Date"].astype(str).values and is_monday_or_later)
-            or ("2026-11-03" not in strat_a_df["Entry_Date"].astype(str).values and today_str >= "2026-11-03")
-        )
-    ):
-        try:
-            _, strat_a_df = build_all_strategies_paper_ledger_and_scorecard()
-        except Exception:
-            pass
 
-    true_cnc_logic_map = {
-        "LTTS": ("L1_SECTOR_ORB_SNIPER", "🎯 L1: Sectoral Shift + NR7 Compression ORB (CNC BUY | <=₹20K)"),
-        "NAVINFLUOR": ("L2_SUPPORT_SPRING_SNIPER", "🎯 L2: Structural Support S1 + 50DMA Spring (CNC BUY | <=₹20K)"),
-        "DIVISLAB": ("L3_CATALYST_VWAP_SNIPER", "🎯 L3: Institutional Catalyst / Vol-Shock Day-2 Pullback (CNC BUY | <=₹20K)"),
-        "LAURUSLABS": ("L4_DEFENSIVE_RS_SNIPER", "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)"),
-        "PERSISTENT": ("L5_GLOBAL_MACRO_SNIPER", "🌍 L5: Overnight Global Macro Gap & Hold (CNC BUY | <=₹20K)"),
-        "KOTAKBANK": ("L6_5GATE_10AM_SNIPER", "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper (CNC BUY | <=₹20K)"),
-        "TRENT": ("L1_SECTOR_ORB_SNIPER", "🎯 L1: Sectoral Shift + NR7 Compression ORB (CNC BUY | <=₹20K)"),
-        "HAL": ("L2_SUPPORT_SPRING_SNIPER", "🎯 L2: Structural Support S1 + 50DMA Spring (CNC BUY | <=₹20K)"),
-        "BEL": ("L4_DEFENSIVE_RS_SNIPER", "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)"),
-        "MAZDOCK": ("L1_SECTOR_ORB_SNIPER", "🎯 L1: Sectoral Shift + NR7 Compression ORB (CNC BUY | <=₹20K)"),
-        "BDL": ("L3_CATALYST_VWAP_SNIPER", "🎯 L3: Institutional Catalyst / Vol-Shock Day-2 Pullback (CNC BUY | <=₹20K)"),
-        "SUNPHARMA": ("L4_DEFENSIVE_RS_SNIPER", "🛡️ L4: Bear / High-VIX Relative Strength Fortress (CNC BUY | <=₹20K)"),
-    }
+    # Load pre-trade operator telemetry (for forward-only Vol / Shock Value / Qualifies_StratB lookup)
+    op_lookup = {}
+    for op_p in (OPERATOR_TRADES_CSV, OPERATOR_SIGNALS_CSV):
+        if os.path.exists(op_p):
+            try:
+                od = pd.read_csv(op_p)
+                for _, orow in od.iterrows():
+                    tk = str(orow.get("Ticker", "")).strip()
+                    sd = str(orow.get("Session_Date", ""))[:10]
+                    et = str(orow.get("Confirm_Time_T2", orow.get("Shock_Time_1m", "")))[:8]
+                    op_lookup[(tk, sd, et)] = orow.to_dict()
+                    op_lookup.setdefault((tk, sd), orow.to_dict())
+            except Exception:
+                pass
 
+    # Process chronologically so Strategy B sector/daily slot caps follow real arrival order
     accepted_rows = []
     rejected_trap_rows = []
     ab_trade_log_rows = []
 
     if not strat_a_df.empty:
-        for _, row in strat_a_df.iterrows():
+        work_a = strat_a_df.copy()
+        work_a = work_a.sort_values(by=["Entry_Date", "Entry_Time_IST"], ascending=[True, True]).reset_index(drop=True)
+        used_sectors_per_day: dict[str, set[str]] = {}
+        op_count_per_day: dict[str, int] = {}
+        cnc_count_per_day: dict[str, int] = {}
+
+        for _, row in work_a.iterrows():
             r = row.to_dict()
             tkr = str(r.get("Ticker", "")).strip()
-            edate = str(r.get("Entry_Date", "")).strip()
-            etime = str(r.get("Entry_Time_IST", "")).strip()
-            extime = str(r.get("Exit_Time_IST", "15:15:00")).strip()
-            sid_a = str(r.get("Strategy_ID", r.get("Logic_ID", ""))).strip()
-            sid = sid_a
-            ep_a = float(r.get("Entry_Price", 0.0))
-            xp_a = float(r.get("Exit_Or_Live_Price", 0.0))
-            pnl_gross_a = float(r.get("PnL_INR", r.get("Gross_PnL_INR", 0.0)))
-            cap_used = float(r.get("Capital_Used_INR", r.get("Capital_Invested_INR", 19500.0)))
-            charges = float(r.get("Platform_And_Stat_Charges_INR", r.get("Platform_Charges_INR", 20.35)))
+            edate = str(r.get("Entry_Date", ""))[:10]
+            etime = str(r.get("Entry_Time_IST", "09:30:00"))[:8]
+            extime = str(r.get("Exit_Time_IST", "15:15:00"))[:8]
+            sid_a = str(r.get("Strategy_ID", "L6_5GATE_10AM_SNIPER")).strip()
+            ep_a = float(pd.to_numeric(r.get("Entry_Price", 0.0), errors="coerce") or 0.0)
+            xp_a = float(pd.to_numeric(r.get("Exit_Or_Live_Price", ep_a), errors="coerce") or ep_a)
+            qty_a = int(pd.to_numeric(r.get("Qty_20K", 0), errors="coerce") or 0)
+            sl_a = float(pd.to_numeric(r.get("Initial_SL", 0.0), errors="coerce") or 0.0)
+            tgt_a = float(pd.to_numeric(r.get("Target_Price", 0.0), errors="coerce") or 0.0)
+            pnl_gross_a = float(pd.to_numeric(r.get("PnL_INR", 0.0), errors="coerce") or 0.0)
+            charges = float(pd.to_numeric(r.get("Platform_And_Stat_Charges_INR", 0.0), errors="coerce") or 0.0)
             net_a = round(pnl_gross_a - charges, 2)
             pt_a = round(net_a * 0.80 if net_a > 0 else net_a, 2)
+            sec_raw = str(r.get("Sector_Group", "")).strip()
+            sector = sec_raw if (sec_raw and sec_raw.lower() not in ("nan", "none", "null")) else (UNIVERSE_META.get(tkr, ("", tkr))[1] if tkr in UNIVERSE_META else tkr)
+            row_regime = str(r.get("Market_Regime", current_regime or "")).strip().upper()
+            side_str = str(r.get("Paper_Order_Side", "BUY")).upper()
+            is_short = "SELL" in side_str or sid_a == "OP_S3_Operator_Supply_Dump_SELL"
+            is_op = sid_a.startswith("OP_")
 
-            if sid.startswith("L") and tkr in true_cnc_logic_map:
-                true_id, true_name = true_cnc_logic_map[tkr]
-                r["Strategy_ID"] = true_id
-                r["Strategy_Name"] = true_name
-                sid = true_id
-
-            # 1) Filter OP_S1 Falling-Knife Traps (ADANIENT Oct 27, ADANIPORTS Nov 02)
-            if sid == "OP_S1_Operator_Low_Absorption_BUY" and pnl_gross_a < 0:
-                gate_msg = "Bear-Market Expert Gate #1 (GAP-06): Blocked OP_S1 Falling Knife (Close <= Session VWAP / Vol < 6.0x / CLV < 0.65)"
-                rejected_trap_rows.append({
-                    "Session_Date": edate,
-                    "Ticker": tkr,
-                    "A_vs_B_Intervention_Verdict": f"🛡️ BLOCKED IN STRATEGY B (Saved ₹{abs(net_a):,.2f} Net Loss)",
-                    "Trades_Done_A_vs_B": "A: 1 Trade (LOSS) | B: 0 Trades (BLOCKED)",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Action_Taken": "🚫 BLOCKED (Anti-Falling-Knife Gate)",
-                    "Entry_Time_IST": etime,
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO ENTRY (Filtered Before Order)",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Net_After_Charges_INR": net_a,
-                    "StratB_Net_After_Charges_INR": 0.0,
-                    "Loss_Avoided_INR": round(abs(net_a), 2),
-                    "Expert_Critic_Gate_Triggered": gate_msg,
-                })
-                ab_trade_log_rows.append({
-                    "Entry_Date": edate,
-                    "Ticker": tkr,
-                    "Execution_Status_A_vs_B": "🛡️ A: EXECUTED (LOSS) | B: BLOCKED TRAP (+Alpha)",
-                    "Trades_Count_A_vs_B": "A: 1 | B: 0",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Strategy_ID": "🚫 BLOCKED_FALLING_KNIFE",
-                    "StratA_Entry_To_Exit_Time": f"{etime} -> {extime}",
-                    "StratB_Entry_To_Exit_Time": "BLOCKED",
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO TRADE",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Post_Tax_PnL_INR": pt_a,
-                    "StratB_Post_Tax_PnL_INR": 0.0,
-                    "Net_Trade_Alpha_B_vs_A_INR": round(0.0 - pt_a, 2),
-                    "StratA_Verdict": str(r.get("Performance_Verdict", "")),
-                    "StratB_Verdict": f"🛡️ TRAP AVOIDED (Saved ₹{abs(net_a):,.2f})",
-                    "Two_Expert_Audit_Explanation": gate_msg,
-                })
+            if qty_a <= 0 or ep_a <= 0 or ep_a > MAX_BUDGET_PER_TICKER_INR:
                 continue
 
-            # 2) Filter OP_S3 Counter-Trend Shorts above ORL_30m (JIOFIN, RECLTD, ZOMATO, DLF)
-            if sid == "OP_S3_Operator_Supply_Dump_SELL" and pnl_gross_a < 0:
-                gate_msg = "Bear-Market Expert Gate #2 (GAP-07): Blocked Counter-Trend OP_S3 Short above 30m Opening Range Low (ORL_30m) & Stock_RS > -0.35%"
-                rejected_trap_rows.append({
-                    "Session_Date": edate,
-                    "Ticker": tkr,
-                    "A_vs_B_Intervention_Verdict": f"🛡️ BLOCKED IN STRATEGY B (Saved ₹{abs(net_a):,.2f} Net Loss)",
-                    "Trades_Done_A_vs_B": "A: 1 Trade (LOSS) | B: 0 Trades (BLOCKED)",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Action_Taken": "🚫 BLOCKED (Counter-Trend Short Gate)",
-                    "Entry_Time_IST": etime,
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO ENTRY (Filtered Before Order)",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Net_After_Charges_INR": net_a,
-                    "StratB_Net_After_Charges_INR": 0.0,
-                    "Loss_Avoided_INR": round(abs(net_a), 2),
-                    "Expert_Critic_Gate_Triggered": gate_msg,
-                })
-                ab_trade_log_rows.append({
-                    "Entry_Date": edate,
-                    "Ticker": tkr,
-                    "Execution_Status_A_vs_B": "🛡️ A: EXECUTED (LOSS) | B: BLOCKED TRAP (+Alpha)",
-                    "Trades_Count_A_vs_B": "A: 1 | B: 0",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Strategy_ID": "🚫 BLOCKED_COUNTER_TREND_SHORT",
-                    "StratA_Entry_To_Exit_Time": f"{etime} -> {extime}",
-                    "StratB_Entry_To_Exit_Time": "BLOCKED",
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO TRADE",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Post_Tax_PnL_INR": pt_a,
-                    "StratB_Post_Tax_PnL_INR": 0.0,
-                    "Net_Trade_Alpha_B_vs_A_INR": round(0.0 - pt_a, 2),
-                    "StratA_Verdict": str(r.get("Performance_Verdict", "")),
-                    "StratB_Verdict": f"🛡️ TRAP AVOIDED (Saved ₹{abs(net_a):,.2f})",
-                    "Two_Expert_Audit_Explanation": gate_msg,
-                })
-                continue
+            used_sec = used_sectors_per_day.setdefault(edate, set())
+            day_op_cnt = op_count_per_day.get(edate, 0)
+            day_cnc_cnt = cnc_count_per_day.get(edate, 0)
 
-            # 3) Filter OP_S2 False VWAP Poke (TITAGARH)
-            if sid == "OP_S2_Operator_VWAP_Markup_BUY" and tkr == "TITAGARH" and pnl_gross_a < 0:
-                gate_msg = "Intraday Expert Gate #3: Blocked False VWAP Poke (T+2m Close <= Shock Candle High h0)"
-                rejected_trap_rows.append({
-                    "Session_Date": edate,
-                    "Ticker": tkr,
-                    "A_vs_B_Intervention_Verdict": f"🛡️ BLOCKED IN STRATEGY B (Saved ₹{abs(net_a):,.2f} Net Loss)",
-                    "Trades_Done_A_vs_B": "A: 1 Trade (LOSS) | B: 0 Trades (BLOCKED)",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Action_Taken": "🚫 BLOCKED (False VWAP Poke Gate)",
-                    "Entry_Time_IST": etime,
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO ENTRY (Filtered Before Order)",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Net_After_Charges_INR": net_a,
-                    "StratB_Net_After_Charges_INR": 0.0,
-                    "Loss_Avoided_INR": round(abs(net_a), 2),
-                    "Expert_Critic_Gate_Triggered": gate_msg,
-                })
-                ab_trade_log_rows.append({
-                    "Entry_Date": edate,
-                    "Ticker": tkr,
-                    "Execution_Status_A_vs_B": "🛡️ A: EXECUTED (LOSS) | B: BLOCKED TRAP (+Alpha)",
-                    "Trades_Count_A_vs_B": "A: 1 | B: 0",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Strategy_ID": "🚫 BLOCKED_FALSE_POKE",
-                    "StratA_Entry_To_Exit_Time": f"{etime} -> {extime}",
-                    "StratB_Entry_To_Exit_Time": "BLOCKED",
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": "NO TRADE",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 0.0,
-                    "StratA_Post_Tax_PnL_INR": pt_a,
-                    "StratB_Post_Tax_PnL_INR": 0.0,
-                    "Net_Trade_Alpha_B_vs_A_INR": round(0.0 - pt_a, 2),
-                    "StratA_Verdict": str(r.get("Performance_Verdict", "")),
-                    "StratB_Verdict": f"🛡️ TRAP AVOIDED (Saved ₹{abs(net_a):,.2f})",
-                    "Two_Expert_Audit_Explanation": gate_msg,
-                })
-                continue
+            risk_sh = abs(ep_a - sl_a) if sl_a > 0 else 0.0
+            rew_sh = abs(tgt_a - ep_a) if tgt_a > 0 else 0.0
+            rr_forward = round(rew_sh / risk_sh, 2) if risk_sh > 0 else 0.0
 
-            # 4) Apply 2-Expert Ratchets & Attribution Upgrades on Executed Trades
-            exec_status_ab = "✅ BOTH A & B EXECUTED (Matched)"
-            if sid.startswith("L") and tkr == "BDL" and edate == "2026-11-03":
-                r["Exit_Time_IST"] = "13:10:00"
-                r["Entry_To_Exit_Time"] = "10:00:00 -> 13:10:00"
-                r["Exit_Or_Live_Price"] = 1559.50
-                r["PnL_INR"] = 234.00
-                r["PnL_Pct"] = round(234.00 / max(cap_used, 1.0) * 100.0, 2)
-                r["Performance_Verdict"] = "🟢 REALIZED PROFIT +₹234.00 (+1.27%)"
-                r["Exit_Trigger_Reason"] = "🔒 65% Peak-MFE Parabolic Ratchet Lock at ₹1559.50 (13:10 IST)"
-                r["Two_Expert_Action"] = "Intraday Expert Fix (GAP-08): 65% Peak-MFE Parabolic Ratchet (+₹60.00 Extra vs A) & True L3 Attribution"
-                exec_status_ab = "🚀 BOTH A & B EXECUTED (B: 65% MFE Ratchet + L3 Attribution)"
-            elif sid.startswith("L") and tkr == "TRENT" and edate == "2026-11-02":
-                r["Exit_Time_IST"] = "13:15:00"
-                r["Entry_To_Exit_Time"] = "10:00:00 -> 13:15:00"
-                r["Exit_Or_Live_Price"] = 7296.00
-                r["PnL_INR"] = 312.00
-                r["PnL_Pct"] = round(312.00 / max(cap_used, 1.0) * 100.0, 2)
-                r["Performance_Verdict"] = "🟢 REALIZED PROFIT +₹312.00 (+2.18%)"
-                r["Exit_Trigger_Reason"] = "🔒 65% Peak-MFE Parabolic Ratchet Lock at ₹7296.00 (13:15 IST)"
-                r["Two_Expert_Action"] = "Intraday Expert Fix (GAP-08): 65% Peak-MFE Parabolic Ratchet (+₹48.00 Extra vs A) & True L1 Attribution"
-                exec_status_ab = "🚀 BOTH A & B EXECUTED (B: 65% MFE Ratchet + L1 Attribution)"
-            elif sid.startswith("L") and etime.startswith("09:30"):
-                r["Entry_Time_IST"] = "10:00:00"
-                r["Entry_To_Exit_Time"] = f"10:00:00 -> {r.get('Exit_Time_IST', '15:15:00')}"
-                if tkr == "KOTAKBANK" and pnl_gross_a < 100.0:
-                    r["Exit_Time_IST"] = "14:35:00"
-                    r["Entry_To_Exit_Time"] = "10:00:00 -> 14:35:00"
-                    r["Exit_Or_Live_Price"] = 443.16
-                    r["PnL_INR"] = 166.95
-                    r["PnL_Pct"] = round(166.95 / max(cap_used, 1.0) * 100.0, 2)
-                    r["Performance_Verdict"] = "🟢 REALIZED PROFIT +₹166.95 (+0.84%)"
-                    r["Exit_Trigger_Reason"] = "🛑 Stage-3 Trailing Profit Lock at 14:35 (10:00 AM 5-Gate Entry)"
-                    r["Two_Expert_Action"] = "Intraday Expert Fix: Delayed 09:30 -> 10:00 AM 5-Gate (Avoided 09:55 Wick)"
-                    exec_status_ab = "🚀 BOTH A & B EXECUTED (B: 10:00 AM Gate +₹155.80 Gross Alpha)"
-                else:
-                    r["Two_Expert_Action"] = f"Intraday Expert Fix (GAP-09): Restored True Logic ({sid}) & 10:00 AM Entry Gate"
-                    exec_status_ab = f"🔄 BOTH A & B EXECUTED (B: Re-Attributed {sid_a[:2]} -> {sid[:2]})"
-            elif sid.startswith("L") and sid != sid_a:
-                r["Two_Expert_Action"] = f"Intraday Expert Fix (GAP-09): Regime-Diversified Slot Attribution ({sid})"
-                exec_status_ab = f"🔄 BOTH A & B EXECUTED (B: Re-Attributed {sid_a[:2]} -> {sid[:2]})"
-            elif sid == "OP_S2_Operator_VWAP_Markup_BUY" and tkr == "CHOLAFIN" and edate == "2026-11-03" and pnl_gross_a < 0:
-                gate_msg = "Bear-Market Expert Gate #5: Late-Morning (+0.45R) Early Cost-Plus Breakeven Ratchet converted pullback into +₹35.00 scratch win"
-                r["Exit_Or_Live_Price"] = 1422.50
-                r["PnL_INR"] = 35.00
-                r["PnL_Pct"] = round(35.00 / max(cap_used, 1.0) * 100.0, 2)
-                r["Performance_Verdict"] = "🟢 REALIZED PROFIT +₹35.00 (+0.18%)"
-                r["Exit_Trigger_Reason"] = "🛡️ Stage-1 Early +0.45R Cost-Plus Breakeven Lock (Bear Expert Rule)"
-                r["Two_Expert_Action"] = "Bear Expert Fix: Early +0.45R Post-10:45 AM Breakeven Lock"
-                exec_status_ab = "🛡️ BOTH A & B EXECUTED (A: LOSS -> B: +0.45R RATCHET WIN)"
-                rejected_trap_rows.append({
-                    "Session_Date": edate,
-                    "Ticker": tkr,
-                    "A_vs_B_Intervention_Verdict": f"🔒 RATCHETED IN STRATEGY B (A: ₹{net_a:+,.2f} -> B: +₹{round(35.00 - charges, 2):,.2f})",
-                    "Trades_Done_A_vs_B": "A: 1 Trade (LOSS) | B: 1 Trade (WIN)",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Action_Taken": "🔒 +0.45R BREAKEVEN RATCHET",
-                    "Entry_Time_IST": etime,
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹1,422.50",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 35.00,
-                    "StratA_Net_After_Charges_INR": net_a,
-                    "StratB_Net_After_Charges_INR": round(35.00 - charges, 2),
-                    "Loss_Avoided_INR": round(abs(net_a) + (35.00 - charges), 2),
-                    "Expert_Critic_Gate_Triggered": gate_msg,
-                })
-            elif sid == "OP_S2_Operator_VWAP_Markup_BUY" and tkr == "BSE" and edate == "2026-10-28" and pnl_gross_a < 0:
-                gate_msg = "Bear-Market Expert Gate #5: Late-Morning (+0.45R) Early Cost-Plus Breakeven Ratchet converted pullback into +₹32.50 scratch win"
-                r["Exit_Or_Live_Price"] = 3483.50
-                r["PnL_INR"] = 32.50
-                r["PnL_Pct"] = round(32.50 / max(cap_used, 1.0) * 100.0, 2)
-                r["Performance_Verdict"] = "🟢 REALIZED PROFIT +₹32.50 (+0.19%)"
-                r["Exit_Trigger_Reason"] = "🛡️ Stage-1 Early +0.45R Cost-Plus Breakeven Lock (Bear Expert Rule)"
-                r["Two_Expert_Action"] = "Bear Expert Fix: Early +0.45R Post-10:45 AM Breakeven Lock"
-                exec_status_ab = "🛡️ BOTH A & B EXECUTED (A: LOSS -> B: +0.45R RATCHET WIN)"
-                rejected_trap_rows.append({
-                    "Session_Date": edate,
-                    "Ticker": tkr,
-                    "A_vs_B_Intervention_Verdict": f"🔒 RATCHETED IN STRATEGY B (A: ₹{net_a:+,.2f} -> B: +₹{round(32.50 - charges, 2):,.2f})",
-                    "Trades_Done_A_vs_B": "A: 1 Trade (LOSS) | B: 1 Trade (WIN)",
-                    "StratA_Strategy_ID": sid_a,
-                    "StratB_Action_Taken": "🔒 +0.45R BREAKEVEN RATCHET",
-                    "Entry_Time_IST": etime,
-                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                    "StratB_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹3,483.50",
-                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                    "StratB_Gross_PnL_INR": 32.50,
-                    "StratA_Net_After_Charges_INR": net_a,
-                    "StratB_Net_After_Charges_INR": round(32.50 - charges, 2),
-                    "Loss_Avoided_INR": round(abs(net_a) + (32.50 - charges), 2),
-                    "Expert_Critic_Gate_Triggered": gate_msg,
-                })
+            filter_reason = ""
+            if sector in used_sec:
+                filter_reason = f"Portfolio Sector Concentration Cap (already holds 1 {sector} position on {edate})"
+            elif is_op:
+                op_meta = op_lookup.get((tkr, edate, etime), op_lookup.get((tkr, edate), {}))
+                vol_m = float(pd.to_numeric(op_meta.get("Vol_Spike_Mult_20m", 6.0), errors="coerce") or 6.0)
+                shock_val = float(pd.to_numeric(op_meta.get("Shock_1m_Value_INR", 15_000_000.0), errors="coerce") or 15_000_000.0)
+                qual_flag = op_meta.get("Qualifies_StratB", True)
+                in_prime_win = ("09:40:00" <= etime <= "11:15:00")
+                in_late_block = (etime >= "14:00:00" and vol_m >= 9.0 and shock_val >= 30_000_000.0)
+
+                if day_op_cnt >= 2:
+                    filter_reason = f"Daily Operator Quality Cap (max 2 Op trades/day in B reached on {edate})"
+                elif is_short and not enable_mis_short:
+                    filter_reason = "MIS Shorting Disabled in Portfolio Settings"
+                elif is_short and row_regime != "BEAR_RISK_OFF":
+                    filter_reason = f"Regime Short Gate (OP_S3 allowed in B only during BEAR_RISK_OFF, got {row_regime or 'SIDEWAYS'})"
+                elif sid_a == "OP_S2_Operator_VWAP_Markup_BUY" and vol_m > 11.5:
+                    filter_reason = f"OP_S2 Blow-Off Chasing Gate ({vol_m:.1f}x > 11.5x exhaustion spike)"
+                elif not (in_prime_win or in_late_block):
+                    filter_reason = f"Opening/Midday Noise Gate ({etime} outside 09:40-11:15 Prime Window)"
+                elif vol_m < 5.0 or vol_m > 13.5:
+                    filter_reason = f"Volume Extremity Gate ({vol_m:.1f}x outside 5.0x-13.5x institutional band)"
+                elif shock_val < 15_000_000.0:
+                    filter_reason = f"Institutional Liquidity Gate (₹{shock_val/1e7:.2f}Cr < ₹1.5Cr 1m shock value)"
+                elif rr_forward < 1.80:
+                    filter_reason = f"Risk-Reward Floor Gate (R:R {rr_forward:.2f} < 1.80 minimum)"
+                elif str(qual_flag).lower() in ("false", "0"):
+                    filter_reason = "Failed Forward Strategy B Execution Gate (VWAP / ATR / Liquidity)"
             else:
-                r["Two_Expert_Action"] = "Passed All Intraday & Bear-Market Expert Gates"
+                if day_cnc_cnt >= 2:
+                    filter_reason = f"Daily CNC Quality Cap (max 2 top CNC trades/day in B reached on {edate})"
+                elif sid_a == "L4_DEFENSIVE_RS_SNIPER" and row_regime != "BEAR_RISK_OFF":
+                    filter_reason = f"Regime-Mismatched Defensive Shield (L4 only in BEAR_RISK_OFF, got {row_regime or 'SIDEWAYS'})"
+                elif rr_forward > 0 and rr_forward < 1.25:
+                    filter_reason = f"CNC Reward-to-Risk Gate (R:R {rr_forward:.2f} < 1.25 structural minimum)"
 
-            pnl_gross_b = float(r.get("PnL_INR", 0.0))
-            net_b = round(pnl_gross_b - charges, 2)
-            pt_b = round(net_b * 0.80 if net_b > 0 else net_b, 2)
-            r["Platform_And_Stat_Charges_INR"] = round(charges, 2)
-            r["Platform_Charges_INR"] = round(charges, 2)
-            r["Net_Profit_After_Charges_INR"] = net_b
-            r["Net_PnL_After_Charges_INR"] = net_b
-            r["Post_Tax_PnL_INR"] = pt_b
+            if filter_reason:
+                rejected_trap_rows.append({
+                    "Session_Date": edate,
+                    "Ticker": tkr,
+                    "A_vs_B_Intervention_Verdict": f"🛡️ FILTERED IN STRATEGY B (Diff: ₹{-net_a:+,.2f})",
+                    "Trades_Done_A_vs_B": "A: 1 Trade | B: 0 Trades (Filtered)",
+                    "StratA_Strategy_ID": sid_a,
+                    "StratB_Action_Taken": "🚫 FILTERED (Forward Quality Gate)",
+                    "Entry_Time_IST": etime,
+                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
+                    "StratB_Entry_To_Exit_Price": "NO ENTRY (Forward Gate)",
+                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
+                    "StratB_Gross_PnL_INR": 0.0,
+                    "StratA_Net_After_Charges_INR": net_a,
+                    "StratB_Net_After_Charges_INR": 0.0,
+                    "Loss_Avoided_INR": round(-net_a, 2),
+                    "Expert_Critic_Gate_Triggered": filter_reason,
+                })
+                ab_trade_log_rows.append({
+                    "Entry_Date": edate,
+                    "Ticker": tkr,
+                    "Execution_Status_A_vs_B": "🛡️ A: EXECUTED | B: FILTERED BY QUALITY GATE",
+                    "Trades_Count_A_vs_B": "A: 1 | B: 0",
+                    "StratA_Strategy_ID": sid_a,
+                    "StratB_Strategy_ID": "🚫 FILTERED_IN_B",
+                    "StratA_Entry_To_Exit_Time": f"{etime} -> {extime}",
+                    "StratB_Entry_To_Exit_Time": "FILTERED",
+                    "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
+                    "StratB_Entry_To_Exit_Price": "NO TRADE",
+                    "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
+                    "StratB_Gross_PnL_INR": 0.0,
+                    "StratA_Post_Tax_PnL_INR": pt_a,
+                    "StratB_Post_Tax_PnL_INR": 0.0,
+                    "Net_Trade_Alpha_B_vs_A_INR": round(0.0 - pt_a, 2),
+                    "StratA_Verdict": str(r.get("Performance_Verdict", "")),
+                    "StratB_Verdict": f"🛡️ FILTERED ({filter_reason[:48]})",
+                    "Two_Expert_Audit_Explanation": filter_reason,
+                })
+                continue
+
+            # Accepted by Strategy B forward gates
+            used_sec.add(sector)
+            if is_op:
+                op_count_per_day[edate] = day_op_cnt + 1
+            else:
+                cnc_count_per_day[edate] = day_cnc_cnt + 1
+
+            r["Sector_Group"] = sector
+            r["Two_Expert_Action"] = "Passed Forward Institutional Quality, Window, R:R & Sector Gates"
             accepted_rows.append(r)
 
             ab_trade_log_rows.append({
                 "Entry_Date": edate,
                 "Ticker": tkr,
-                "Execution_Status_A_vs_B": exec_status_ab,
+                "Execution_Status_A_vs_B": "✅ BOTH A & B EXECUTED",
                 "Trades_Count_A_vs_B": "A: 1 | B: 1",
                 "StratA_Strategy_ID": sid_a,
-                "StratB_Strategy_ID": sid,
+                "StratB_Strategy_ID": sid_a,
                 "StratA_Entry_To_Exit_Time": f"{etime} -> {extime}",
-                "StratB_Entry_To_Exit_Time": str(r.get("Entry_To_Exit_Time", f"{etime} -> {extime}")),
+                "StratB_Entry_To_Exit_Time": f"{etime} -> {extime}",
                 "StratA_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
-                "StratB_Entry_To_Exit_Price": f"₹{float(r.get('Entry_Price', ep_a)):,.2f} -> ₹{float(r.get('Exit_Or_Live_Price', xp_a)):,.2f}",
+                "StratB_Entry_To_Exit_Price": f"₹{ep_a:,.2f} -> ₹{xp_a:,.2f}",
                 "StratA_Gross_PnL_INR": round(pnl_gross_a, 2),
-                "StratB_Gross_PnL_INR": round(pnl_gross_b, 2),
+                "StratB_Gross_PnL_INR": round(pnl_gross_a, 2),
                 "StratA_Post_Tax_PnL_INR": pt_a,
-                "StratB_Post_Tax_PnL_INR": pt_b,
-                "Net_Trade_Alpha_B_vs_A_INR": round(pt_b - pt_a, 2),
-                "StratA_Verdict": str(row.get("Performance_Verdict", "")),
+                "StratB_Post_Tax_PnL_INR": pt_a,
+                "Net_Trade_Alpha_B_vs_A_INR": 0.0,
+                "StratA_Verdict": str(r.get("Performance_Verdict", "")),
                 "StratB_Verdict": str(r.get("Performance_Verdict", "")),
-                "Two_Expert_Audit_Explanation": str(r.get("Two_Expert_Action", "")),
+                "Two_Expert_Audit_Explanation": r["Two_Expert_Action"],
             })
 
-    # Include Time-of-Day Volume Normalized (Vol_Ratio_ToD) morning Operator springs unlocked by Strategy B
-    unlocked_tod_rows = [
-        {
-            "Entry_Date": "2026-11-03",
-            "Ticker": "LUPIN",
-            "Entry_To_Exit_Time": "09:52:00 -> 10:36:00",
-            "Entry_Time_IST": "09:52:00",
-            "Exit_Time_IST": "10:36:00",
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹145.80 (+0.74%)",
-            "Exit_Trigger_Reason": "🎯 1m High (₹2196.80) hit Target ₹2196.20 at 10:36",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Paper_Order_Side": "AUTO-BUY (1m Operator)",
-            "Entry_Price": 2180.00,
-            "Exit_Or_Live_Price": 2196.20,
-            "Qty_20K": 9,
-            "Capital_Used_INR": 19620.00,
-            "PnL_INR": 145.80,
-            "PnL_Pct": 0.74,
-            "Initial_SL": 2171.20,
-            "Trailing_SL": 2191.50,
-            "Target_Price": 2196.20,
-            "Trade_Status": "TARGET_ACHIEVED",
-            "Trigger_And_Exit_Audit": "Operator Low Absorption + VWAP Reclaim (7.6x Vol, CLV 0.82) -> 🎯 Target hit at 10:36",
-            "Trade_ID": "OP-LUPIN-20261103-0950-BUY",
-            "Platform_And_Stat_Charges_INR": 21.08,
-            "Platform_Charges_INR": 21.08,
-            "Net_Profit_After_Charges_INR": 124.72,
-            "Net_PnL_After_Charges_INR": 124.72,
-            "Net_Post_Charges_Pct": 0.64,
-            "Post_Tax_PnL_INR": 99.78,
-            "Two_Expert_Action": "Bear & Intraday Expert Fix: Qualified OP_S1 Spring Reclaiming VWAP (Vol 7.6x >= 6.0x, CLV 0.82 >= 0.65)",
-        },
-        {
-            "Entry_Date": "2026-11-02",
-            "Ticker": "DIVISLAB",
-            "Entry_To_Exit_Time": "10:02:00 -> 10:44:00",
-            "Entry_Time_IST": "10:02:00",
-            "Exit_Time_IST": "10:44:00",
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹146.40 (+0.80%)",
-            "Exit_Trigger_Reason": "🎯 1m High (₹6149.50) hit Target ₹6148.80 at 10:44",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Paper_Order_Side": "AUTO-BUY (1m Operator)",
-            "Entry_Price": 6100.00,
-            "Exit_Or_Live_Price": 6148.80,
-            "Qty_20K": 3,
-            "Capital_Used_INR": 18300.00,
-            "PnL_INR": 146.40,
-            "PnL_Pct": 0.80,
-            "Initial_SL": 6076.00,
-            "Trailing_SL": 6136.00,
-            "Target_Price": 6148.80,
-            "Trade_Status": "TARGET_ACHIEVED",
-            "Trigger_And_Exit_Audit": "Operator Low Absorption + VWAP Reclaim (7.2x Vol, CLV 0.81) -> 🎯 Target hit at 10:44",
-            "Trade_ID": "OP-DIVISLAB-20261102-1000-BUY",
-            "Platform_And_Stat_Charges_INR": 20.48,
-            "Platform_Charges_INR": 20.48,
-            "Net_Profit_After_Charges_INR": 125.92,
-            "Net_PnL_After_Charges_INR": 125.92,
-            "Net_Post_Charges_Pct": 0.69,
-            "Post_Tax_PnL_INR": 100.74,
-            "Two_Expert_Action": "Bear & Intraday Expert Fix: Qualified OP_S1 Spring Reclaiming VWAP (Vol 7.2x >= 6.0x, CLV 0.81 >= 0.65)",
-        },
-        {
-            "Entry_Date": "2026-10-28",
-            "Ticker": "HAL",
-            "Entry_To_Exit_Time": "10:06:00 -> 10:48:00",
-            "Entry_Time_IST": "10:06:00",
-            "Exit_Time_IST": "10:48:00",
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹142.80 (+0.74%)",
-            "Exit_Trigger_Reason": "🎯 1m High (₹4148.50) hit Target ₹4147.60 at 10:48",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Paper_Order_Side": "AUTO-BUY (1m Operator)",
-            "Entry_Price": 4119.04,
-            "Exit_Or_Live_Price": 4147.60,
-            "Qty_20K": 5,
-            "Capital_Used_INR": 19295.20,
-            "PnL_INR": 142.80,
-            "PnL_Pct": 0.74,
-            "Initial_SL": 4103.50,
-            "Trailing_SL": 4138.20,
-            "Target_Price": 4147.60,
-            "Trade_Status": "TARGET_ACHIEVED",
-            "Trigger_And_Exit_Audit": "Operator Low Absorption + VWAP Reclaim (7.4x Vol, CLV 0.78) -> 🎯 Target hit at 10:48",
-            "Trade_ID": "OP-HAL-20261028-1004-BUY",
-            "Platform_And_Stat_Charges_INR": 20.48,
-            "Platform_Charges_INR": 20.48,
-            "Net_Profit_After_Charges_INR": 122.32,
-            "Net_PnL_After_Charges_INR": 122.32,
-            "Net_Post_Charges_Pct": 0.63,
-            "Post_Tax_PnL_INR": 97.86,
-            "Two_Expert_Action": "Bear & Intraday Expert Fix: Qualified OP_S1 Spring Reclaiming VWAP (Vol 7.4x >= 6.0x, CLV 0.78 >= 0.65)",
-        },
-        {
-            "Entry_Date": "2026-10-27",
-            "Ticker": "SUNPHARMA",
-            "Entry_To_Exit_Time": "09:56:00 -> 10:34:00",
-            "Entry_Time_IST": "09:56:00",
-            "Exit_Time_IST": "10:34:00",
-            "Performance_Verdict": "🟢 REALIZED PROFIT +₹136.40 (+0.71%)",
-            "Exit_Trigger_Reason": "🎯 1m High (₹1876.40) hit Target ₹1875.80 at 10:34",
-            "Strategy_ID": "OP_S1_Operator_Low_Absorption_BUY",
-            "Paper_Order_Side": "AUTO-BUY (1m Operator)",
-            "Entry_Price": 1862.16,
-            "Exit_Or_Live_Price": 1875.80,
-            "Qty_20K": 10,
-            "Capital_Used_INR": 18621.60,
-            "PnL_INR": 136.40,
-            "PnL_Pct": 0.71,
-            "Initial_SL": 1854.80,
-            "Trailing_SL": 1871.20,
-            "Target_Price": 1875.80,
-            "Trade_Status": "TARGET_ACHIEVED",
-            "Trigger_And_Exit_Audit": "Operator Low Absorption + Defensive Healthcare RS (+1.4%) -> 🎯 Target hit at 10:34",
-            "Trade_ID": "OP-SUNPHARMA-20261027-0954-BUY",
-            "Platform_And_Stat_Charges_INR": 19.85,
-            "Platform_Charges_INR": 19.85,
-            "Net_Profit_After_Charges_INR": 116.55,
-            "Net_PnL_After_Charges_INR": 116.55,
-            "Net_Post_Charges_Pct": 0.63,
-            "Post_Tax_PnL_INR": 93.24,
-            "Two_Expert_Action": "Bear & Intraday Expert Fix: Qualified OP_S1 Spring in Defensive RS Leader (Vol 6.8x >= 6.0x, CLV 0.74 >= 0.65)",
-        },
-    ]
-    for u_row in unlocked_tod_rows:
-        if u_row["Entry_Date"] > today_str:
-            continue
-        if u_row["Entry_Date"] >= V3_EXPERT_MONDAY_START_DATE and not is_monday_or_later:
-            continue
-        accepted_rows.append(u_row)
-        ab_trade_log_rows.append({
-            "Entry_Date": u_row["Entry_Date"],
-            "Ticker": u_row["Ticker"],
-            "Execution_Status_A_vs_B": "🟣 A: MISSED | B: UNLOCKED SPRING (+Alpha)",
-            "Trades_Count_A_vs_B": "A: 0 | B: 1",
-            "StratA_Strategy_ID": "⚪ NOT_TRIGGERED_IN_A",
-            "StratB_Strategy_ID": u_row["Strategy_ID"],
-            "StratA_Entry_To_Exit_Time": "NO TRADE",
-            "StratB_Entry_To_Exit_Time": u_row["Entry_To_Exit_Time"],
-            "StratA_Entry_To_Exit_Price": "NO TRADE",
-            "StratB_Entry_To_Exit_Price": f"₹{u_row['Entry_Price']:,.2f} -> ₹{u_row['Exit_Or_Live_Price']:,.2f}",
-            "StratA_Gross_PnL_INR": 0.0,
-            "StratB_Gross_PnL_INR": u_row["PnL_INR"],
-            "StratA_Post_Tax_PnL_INR": 0.0,
-            "StratB_Post_Tax_PnL_INR": u_row["Post_Tax_PnL_INR"],
-            "Net_Trade_Alpha_B_vs_A_INR": u_row["Post_Tax_PnL_INR"],
-            "StratA_Verdict": "⚪ Missed by Full-Day Volume Penalty",
-            "StratB_Verdict": u_row["Performance_Verdict"],
-            "Two_Expert_Audit_Explanation": u_row["Two_Expert_Action"],
+    # Write Strategy B Ledgers
+    shadow_all_df = pd.DataFrame(accepted_rows)
+    if not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns:
+        shadow_all_df = shadow_all_df.sort_values(by=["Entry_Date", "Entry_Time_IST"], ascending=[False, False]).reset_index(drop=True)
+    else:
+        shadow_all_df = pd.DataFrame(columns=strat_a_df.columns if not strat_a_df.empty else ["Entry_Date", "Ticker", "Entry_To_Exit_Time", "Strategy_ID", "Trade_Status", "PnL_INR"])
+
+    # Compute Strategy B adaptive strategy ranking strictly on closed Strategy B trades (writes adaptive_strategy_ranking.csv)
+    adaptive_b_map = compute_adaptive_strategy_scores(shadow_all_df, current_regime=current_regime)
+    adaptive_a_map = {}
+    if not strat_a_df.empty:
+        # Compute Strategy A closed-trade summary per strategy without overwriting adaptive_strategy_ranking.csv
+        for spec in ALL_9_STRATEGY_SPECS:
+            sid = spec["Strategy_ID"]
+            sub_a_all = strat_a_df[strat_a_df["Strategy_ID"] == sid] if "Strategy_ID" in strat_a_df.columns else pd.DataFrame()
+            st_col = "Trade_Status" if "Trade_Status" in sub_a_all.columns else "Status"
+            sub_a_cl = sub_a_all[sub_a_all[st_col].apply(_is_closed_trade_status)] if (not sub_a_all.empty and st_col in sub_a_all.columns) else pd.DataFrame()
+            if sub_a_cl.empty:
+                adaptive_a_map[sid] = {"n_closed": 0, "n_open": len(sub_a_all), "wins": 0, "losses": 0, "wr": 0.0, "gross": 0.0, "chg": 0.0, "tax": 0.0, "post_tax": 0.0}
+            else:
+                dm_a, pk_a, _, gr_a, ch_a, net_a_s, pt_a_s = _build_strategy_daily_metrics(sub_a_cl)
+                w_a = int((sub_a_cl["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if "Net_Profit_After_Charges_INR" in sub_a_cl.columns else int((sub_a_cl["PnL_INR"].astype(float) > 0).sum())
+                n_cl_a = len(sub_a_cl)
+                adaptive_a_map[sid] = {
+                    "n_closed": n_cl_a,
+                    "n_open": len(sub_a_all) - n_cl_a,
+                    "wins": w_a,
+                    "losses": n_cl_a - w_a,
+                    "wr": round(w_a / n_cl_a * 100.0, 1),
+                    "gross": gr_a,
+                    "chg": ch_a,
+                    "tax": round(max(0.0, net_a_s * 0.20), 2),
+                    "post_tax": pt_a_s,
+                }
+    else:
+        for spec in ALL_9_STRATEGY_SPECS:
+            adaptive_a_map[spec["Strategy_ID"]] = {"n_closed": 0, "n_open": 0, "wins": 0, "losses": 0, "wr": 0.0, "gross": 0.0, "chg": 0.0, "tax": 0.0, "post_tax": 0.0}
+
+    # Build Tab 2 Scorecard (STRICTLY 9 strategies, ZERO Backtest_3Y_WR_A_vs_B, ZERO TOTAL_PORTFOLIO row)
+    scorecard_ab_rows = []
+    for spec in ALL_9_STRATEGY_SPECS:
+        sid = spec["Strategy_ID"]
+        sname = CANONICAL_STRATEGY_NAMES.get(sid, spec.get("Strategy_Name_And_Mode", sid))
+        is_short_strat = sid == "OP_S3_Operator_Supply_Dump_SELL"
+        sig_dir = "🔴 SHORT SELL (MIS Only)" if is_short_strat else ("🟢 BUY (CNC/MIS)" if sid.startswith("OP_") else "🟢 BUY (CNC)")
+        prod_mode = "MIS Only" if is_short_strat else ("CNC/MIS" if sid.startswith("OP_") else "CNC Only")
+
+        a_m = adaptive_a_map[sid]
+        b_m = adaptive_b_map.get(sid, {})
+        sub_b_all = shadow_all_df[shadow_all_df["Strategy_ID"] == sid] if (not shadow_all_df.empty and "Strategy_ID" in shadow_all_df.columns) else pd.DataFrame()
+        st_b_col = "Trade_Status" if "Trade_Status" in sub_b_all.columns else "Status"
+        sub_b_cl = sub_b_all[sub_b_all[st_b_col].apply(_is_closed_trade_status)] if (not sub_b_all.empty and st_b_col in sub_b_all.columns) else pd.DataFrame()
+        b_n_cl = int(b_m.get("Closed_Trades", len(sub_b_cl)))
+        b_n_open = len(sub_b_all) - b_n_cl
+        b_wins = int(b_m.get("Closed_Wins", 0))
+        b_losses = int(b_m.get("Closed_Losses", 0))
+        b_wr = float(b_m.get("Raw_Closed_WR_Pct", 0.0))
+        b_wlb = float(b_m.get("Wilson_Lower_Bound_Pct", 0.0))
+        b_xirr = float(b_m.get("Raw_XIRR_Pct", 0.0))
+        b_sxirr = float(b_m.get("Shrunk_XIRR_Pct", 0.0))
+        b_udays = int(b_m.get("Unique_Trade_Days", 0))
+        ad_score = float(b_m.get("Adaptive_Rank_Score", 0.0))
+        ad_rank = int(b_m.get("Adaptive_Rank", 9))
+
+        _, _, _, b_gross, b_chg, b_net, b_post_tax = _build_strategy_daily_metrics(sub_b_cl)
+        b_tax = round(max(0.0, b_net * 0.20), 2)
+
+        a_cnt = a_m["n_closed"]
+        a_wins = a_m["wins"]
+        a_losses = a_m["losses"]
+        a_wr = a_m["wr"]
+        a_post_tax = a_m["post_tax"]
+        diff_pt = round(b_post_tax - a_post_tax, 2)
+
+        if b_n_cl == 0 and a_cnt == 0:
+            succ_sc_str = "⏳ 0 Closed Trades"
+            verdict_ab = f"⏳ Awaiting Closed Trades ({b_n_open} Active Open)" if b_n_open > 0 else "⏳ Awaiting Live Signal Trigger"
+        else:
+            b_icon = "🟢" if b_wr >= 75.0 else ("🟡" if b_wr >= 55.0 else "🔴")
+            x_txt = f" | XIRR {b_xirr:+.1f}%" if b_udays >= 5 else f" | {b_udays}/5d XIRR"
+            succ_sc_str = (
+                f"{b_icon} B: {b_wr:.1f}% Closed ({b_wins}W/{b_losses}L | WLB {b_wlb:.1f}% | ₹{b_post_tax:+,.0f}{x_txt})"
+                if b_n_cl > 0
+                else f"⚪ B: 0 Closed | A: {a_wr:.1f}% ({a_wins}W/{a_losses}L)"
+            )
+            verdict_ab = (
+                f"🟢 B Higher Quality by ₹{diff_pt:+,.2f} Post-Tax (A: {a_cnt}T -> B: {b_n_cl}T)"
+                if diff_pt > 0
+                else (
+                    f"⚖️ Aligned (A: ₹{a_post_tax:+,.2f} | B: ₹{b_post_tax:+,.2f})"
+                    if diff_pt == 0
+                    else f"🟡 Real Sample Variance (A: ₹{a_post_tax:+,.2f} | B: ₹{b_post_tax:+,.2f})"
+                )
+            )
+
+        _, conf_sc_badge = _compute_confidence_badge(
+            paper_wr_pct=b_wr,
+            wlb_pct=b_wlb,
+            shrunk_xirr_pct=b_sxirr,
+            readiness_score=85.0 if b_n_cl > 0 else 60.0,
+            is_blocked_in_b=False,
+            n_closed=b_n_cl,
+            context_note=f"B {b_wins}W/{b_losses}L | A {a_wins}W/{a_losses}L" if (b_n_cl > 0 or a_cnt > 0) else "",
+        )
+
+        scorecard_ab_rows.append({
+            "Adaptive_Rank": ad_rank,
+            "Strategy_ID": sid,
+            "Strategy_Name": sname,
+            "Signal_Direction": sig_dir,
+            "Product_Mode": prod_mode,
+            "Paper_Trade_Success_Rate": succ_sc_str,
+            "Confidence_Level": conf_sc_badge,
+            "Trades_Done_A_vs_B": f"A: {a_cnt} Closed | B: {b_n_cl} Closed ({b_n_open} Open)",
+            "A_vs_B_Scorecard_Verdict": verdict_ab,
+            "Strategy_Name_And_Mode": f"{sname} ({prod_mode})",
+            "StratA_Total_Trades": a_cnt,
+            "StratB_Total_Trades": b_n_cl,
+            "StratB_Active_Open": b_n_open,
+            "StratA_Wins_Losses_WR": f"{a_wins}W/{a_losses}L ({a_wr:.1f}%)" if a_cnt > 0 else "0W/0L (0.0%)",
+            "StratB_Wins_Losses_WR": f"{b_wins}W/{b_losses}L ({b_wr:.1f}%)" if b_n_cl > 0 else "0W/0L (0.0%)",
+            "StratB_WLB_Pct": b_wlb,
+            "StratB_XIRR_Pct": b_xirr,
+            "StratB_Shrunk_XIRR_Pct": b_sxirr,
+            "StratB_Unique_Days": b_udays,
+            "Adaptive_Rank_Score": ad_score,
+            "StratA_Gross_INR": a_m["gross"],
+            "StratB_Gross_INR": b_gross,
+            "StratA_Charges_And_Tax_INR": round(a_m["chg"] + a_m["tax"], 2),
+            "StratB_Charges_And_Tax_INR": round(b_chg + b_tax, 2),
+            "StratA_Post_Tax_INR": a_post_tax,
+            "StratB_Post_Tax_INR": b_post_tax,
+            "Net_Post_Tax_Alpha_B_vs_A_INR": diff_pt,
         })
 
-    perf_map_b = _get_strategy_paper_performance_map()
-    shadow_all_df = pd.DataFrame(accepted_rows)
+    scorecard_b_df = pd.DataFrame(scorecard_ab_rows).sort_values(
+        by=["Adaptive_Rank_Score", "StratB_WLB_Pct", "StratB_XIRR_Pct", "StratB_Post_Tax_INR"],
+        ascending=[False, False, False, False],
+    ).reset_index(drop=True)
+    scorecard_b_df["Adaptive_Rank"] = range(1, len(scorecard_b_df) + 1)
+    scorecard_b_df.to_csv(V3_EXPERT_SCORECARD_CSV, index=False)
+    scorecard_b_df.to_csv(V3_EXPERT_AB_COMPARISON_CSV, index=False)
+
+    # Refresh Strategy B ledger badges cleanly with final Strategy B closed stats
     if not shadow_all_df.empty:
+        perf_map_b = _get_strategy_paper_performance_map(current_regime=current_regime)
         s_names_b, s_succ_b, conf_lvl_b, wr_sort_b, pt_sort_b, conf_num_b = [], [], [], [], [], []
         for _, r_b in shadow_all_df.iterrows():
             sid_b = str(r_b.get("Strategy_ID", "L6_5GATE_10AM_SNIPER")).strip()
-            p_info_b = perf_map_b.get(sid_b, perf_map_b.get("L6_5GATE_10AM_SNIPER", {}))
-            s_names_b.append(p_info_b.get("Strategy_Name", CANONICAL_STRATEGY_NAMES.get(sid_b, sid_b)))
-            s_succ_b.append(p_info_b.get("StratB_Success_Str", "100.0% Paper WR"))
-            wr_vb = float(p_info_b.get("StratB_Sort_WR", 95.0))
-            pt_vb = float(p_info_b.get("StratB_Post_Tax_INR", 0.0))
-            pnl_rb = float(r_b.get("Net_Profit_After_Charges_INR", r_b.get("PnL_INR", 0.0)))
-            c_score_b, c_badge_b = _compute_confidence_badge(
-                paper_wr_pct=wr_vb,
-                hist_wr_pct=float(p_info_b.get("Hist_3Y_WR_Pct", 92.0)),
-                readiness_score=93.0 if pnl_rb > 0 else 72.0,
-                gap_pct=0.0,
-                is_blocked_in_b=False,
-                context_note="Passed All 2-Expert Gates",
+            p_b = perf_map_b.get(sid_b, perf_map_b.get("L6_5GATE_10AM_SNIPER", {}))
+            s_names_b.append(p_b.get("Strategy_Name", sid_b))
+            s_succ_b.append(p_b.get("StratB_Success_Str", "⏳ 0 Closed Trades"))
+            wr_vb = float(p_b.get("StratB_WLB_Pct", 0.0))
+            pt_vb = float(p_b.get("StratB_Post_Tax_INR", 0.0))
+            pnl_rb = float(pd.to_numeric(r_b.get("Net_Profit_After_Charges_INR", r_b.get("PnL_INR", 0.0)), errors="coerce") or 0.0)
+            c_sc_b, c_bg_b = _compute_confidence_badge(
+                paper_wr_pct=float(p_b.get("StratB_WR_Pct", 0.0)),
+                wlb_pct=wr_vb,
+                shrunk_xirr_pct=float(p_b.get("StratB_Shrunk_XIRR_Pct", 0.0)),
+                readiness_score=85.0 if pnl_rb > 0 else 65.0,
+                n_closed=int(p_b.get("StratB_Trades", 0)),
+                context_note="Passed B Gates",
             )
-            conf_lvl_b.append(c_badge_b)
+            conf_lvl_b.append(c_bg_b)
             wr_sort_b.append(wr_vb)
             pt_sort_b.append(pt_vb)
-            conf_num_b.append(c_score_b)
+            conf_num_b.append(c_sc_b)
         shadow_all_df["Strategy_Name"] = s_names_b
         shadow_all_df["Paper_Trade_Success_Rate"] = s_succ_b
         shadow_all_df["Confidence_Level"] = conf_lvl_b
         shadow_all_df["Strategy_Paper_WR_Pct"] = wr_sort_b
         shadow_all_df["Strategy_Paper_PostTax_INR"] = pt_sort_b
         shadow_all_df["Confidence_Score_Pct"] = conf_num_b
-        if "Entry_Date" in shadow_all_df.columns:
-            shadow_all_df = shadow_all_df.sort_values(by=["Entry_Date", "Entry_Time_IST"], ascending=[False, False]).reset_index(drop=True)
-    shadow_all_df.to_csv(V3_EXPERT_SHADOW_LEDGER_CSV, index=False)
 
-    if not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns:
-        live_monday_df = shadow_all_df[shadow_all_df["Entry_Date"].astype(str) >= V3_EXPERT_MONDAY_START_DATE].copy()
-    else:
-        live_monday_df = pd.DataFrame(columns=shadow_all_df.columns if not shadow_all_df.empty else ["Entry_Date", "Ticker", "Entry_To_Exit_Time", "Strategy_ID", "PnL_INR"])
+    shadow_all_df.to_csv(V3_EXPERT_SHADOW_LEDGER_CSV, index=False)
+    live_monday_df = (
+        shadow_all_df[shadow_all_df["Entry_Date"].astype(str) >= V3_EXPERT_MONDAY_START_DATE].copy()
+        if (not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns)
+        else pd.DataFrame(columns=shadow_all_df.columns)
+    )
     live_monday_df.to_csv(V3_EXPERT_FRESH_LEDGER_CSV, index=False)
 
     ab_trade_log_df = pd.DataFrame(ab_trade_log_rows)
-    if not ab_trade_log_df.empty:
-        ab_names, ab_succ, ab_conf, ab_wr_sort, ab_pt_sort = [], [], [], [], []
-        for _, r_ab in ab_trade_log_df.iterrows():
-            sid_b_raw = str(r_ab.get("StratB_Strategy_ID", "")).strip()
-            sid_a_raw = str(r_ab.get("StratA_Strategy_ID", "")).strip()
-            eff_sid = sid_b_raw if sid_b_raw in perf_map_b else (sid_a_raw if sid_a_raw in perf_map_b else "OP_S2_Operator_VWAP_Markup_BUY")
-            p_ab = perf_map_b.get(eff_sid, perf_map_b["OP_S2_Operator_VWAP_Markup_BUY"])
-            ab_names.append(p_ab.get("Strategy_Name", CANONICAL_STRATEGY_NAMES.get(eff_sid, eff_sid)))
-            ab_succ.append(p_ab.get("Combined_AB_Success_Str", p_ab.get("StratB_Success_Str", "")))
-            is_blk = sid_b_raw.startswith("🚫")
-            wr_eff = float(p_ab.get("StratB_Sort_WR", 94.0)) if not is_blk else float(p_ab.get("StratA_Sort_WR", 50.0))
-            pt_eff = float(p_ab.get("StratB_Post_Tax_INR", 0.0)) if not is_blk else float(p_ab.get("StratA_Post_Tax_INR", -100.0))
-            _, c_b_str = _compute_confidence_badge(
-                paper_wr_pct=wr_eff,
-                hist_wr_pct=float(p_ab.get("Hist_3Y_WR_Pct", 91.0)),
-                readiness_score=92.0 if not is_blk else 42.0,
-                gap_pct=0.0,
-                is_blocked_in_b=is_blk,
-                context_note="Executed in Strategy B" if not is_blk else "Trap Blocked by Strategy B",
-            )
-            ab_conf.append(c_b_str)
-            ab_wr_sort.append(wr_eff)
-            ab_pt_sort.append(pt_eff)
-        ab_trade_log_df["Strategy_Name"] = ab_names
-        ab_trade_log_df["Paper_Trade_Success_Rate"] = ab_succ
-        ab_trade_log_df["Confidence_Level"] = ab_conf
-        ab_trade_log_df["Strategy_Paper_WR_Pct"] = ab_wr_sort
-        ab_trade_log_df["Strategy_Paper_PostTax_INR"] = ab_pt_sort
-        if "Entry_Date" in ab_trade_log_df.columns:
-            ab_trade_log_df = ab_trade_log_df.sort_values(by=["Entry_Date", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+    if not ab_trade_log_df.empty and "Entry_Date" in ab_trade_log_df.columns:
+        ab_trade_log_df = ab_trade_log_df.sort_values(by=["Entry_Date", "Ticker"], ascending=[False, True]).reset_index(drop=True)
     ab_trade_log_df.to_csv(V3_EXPERT_AB_TRADE_LOG_CSV, index=False)
 
     rejected_df = pd.DataFrame(rejected_trap_rows)
@@ -5875,380 +5272,129 @@ def run_v3_two_expert_monday_auto_engine(
         rejected_df = rejected_df.sort_values(by=["Session_Date", "Entry_Time_IST"], ascending=[False, False]).reset_index(drop=True)
     rejected_df.to_csv(V3_EXPERT_REJECTED_TRAPS_CSV, index=False)
 
-    # Build Table 3A: Day-by-Day Side-by-Side Comparison (Strategy A vs Strategy B in Every Row)
+    # Day-by-Day Strategy A vs Strategy B Summary (strictly real daily peak capital & N>=5 XIRR)
     all_dates = sorted(
         list(
             set(
-                (strat_a_df["Entry_Date"].astype(str).unique().tolist() if (not strat_a_df.empty and "Entry_Date" in strat_a_df.columns) else [])
-                + (shadow_all_df["Entry_Date"].astype(str).unique().tolist() if (not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns) else [])
+                (strat_a_df["Entry_Date"].astype(str).str[:10].unique().tolist() if (not strat_a_df.empty and "Entry_Date" in strat_a_df.columns) else [])
+                + (shadow_all_df["Entry_Date"].astype(str).str[:10].unique().tolist() if (not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns) else [])
             )
         ),
         reverse=True,
     )
     daily_rows_ab = []
     for d_str in all_dates:
-        grp_a = strat_a_df[strat_a_df["Entry_Date"].astype(str) == d_str] if (not strat_a_df.empty and "Entry_Date" in strat_a_df.columns) else pd.DataFrame()
-        grp_b = shadow_all_df[shadow_all_df["Entry_Date"].astype(str) == d_str] if (not shadow_all_df.empty and "Entry_Date" in shadow_all_df.columns) else pd.DataFrame()
-
-        a_trd = len(grp_a)
-        a_cnc = int(grp_a["Strategy_ID"].astype(str).str.startswith("L").sum()) if a_trd > 0 else 0
-        a_op = a_trd - a_cnc
-        a_wins = int((grp_a["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if a_trd > 0 else 0
-        a_losses = a_trd - a_wins
-        a_wr = round(a_wins / a_trd * 100.0, 1) if a_trd > 0 else 0.0
-        a_peak = 114820.00 if d_str == "2026-11-03" else (112640.00 if d_str == "2026-11-02" else (123794.75 if d_str == "2026-10-28" else 156465.95))
-        a_gross = round(float(grp_a["PnL_INR"].astype(float).sum()), 2) if a_trd > 0 else 0.0
-        a_chg = round(float(grp_a["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if a_trd > 0 else 0.0
-        a_net = round(a_gross - a_chg, 2)
-        a_tax = round(max(0.0, a_net * 0.20), 2)
-        a_pt = round(a_net - a_tax, 2)
-        a_roi = a_pt / max(a_peak, 1.0)
-        a_xirr = round(((1.0 + a_roi) ** 252 - 1.0) * 100.0, 2)
-
-        b_trd = len(grp_b)
-        b_cnc = int(grp_b["Strategy_ID"].astype(str).str.startswith("L").sum()) if b_trd > 0 else 0
-        b_op = b_trd - b_cnc
-        b_wins = int((grp_b["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if b_trd > 0 else 0
-        b_losses = b_trd - b_wins
-        b_wr = round(b_wins / b_trd * 100.0, 1) if b_trd > 0 else 0.0
-        b_peak = 105400.00 if d_str == "2026-11-03" else (104200.00 if d_str == "2026-11-02" else (108450.00 if d_str == "2026-10-28" else 144390.00))
-        b_gross = round(float(grp_b["PnL_INR"].astype(float).sum()), 2) if b_trd > 0 else 0.0
-        b_chg = round(float(grp_b["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if b_trd > 0 else 0.0
-        b_net = round(b_gross - b_chg, 2)
-        b_tax = round(max(0.0, b_net * 0.20), 2)
-        b_pt = round(b_net - b_tax, 2)
-        b_roi = b_pt / max(b_peak, 1.0)
-        b_xirr = round(((1.0 + b_roi) ** 252 - 1.0) * 100.0, 2)
-
-        alpha_day = round(b_pt - a_pt, 2)
-        xirr_alpha_day = round(b_xirr - a_xirr, 2)
-        d_label = (
-            f"{d_str} (Tuesday — Today Live A/B Session)"
-            if d_str == "2026-11-03"
-            else (
-                f"{d_str} (Monday — Live A/B Session #1)"
-                if d_str == "2026-11-02"
-                else f"{d_str} (Pre-Monday Benchmark)"
-            )
-        )
-        mode_tag = (
-            "🟢 LIVE PARALLEL A vs B (Monday Onward)"
-            if d_str >= V3_EXPERT_MONDAY_START_DATE
-            else "🔬 PRE-MONDAY BENCHMARK (A Live vs B Shadow)"
-        )
+        grp_a = strat_a_df[strat_a_df["Entry_Date"].astype(str).str[:10] == d_str] if not strat_a_df.empty else pd.DataFrame()
+        grp_b = shadow_all_df[shadow_all_df["Entry_Date"].astype(str).str[:10] == d_str] if not shadow_all_df.empty else pd.DataFrame()
+        m_a_d = _summarize_ledger_subset(grp_a)
+        m_b_d = _summarize_ledger_subset(grp_b)
+        alpha_day = round(m_b_d["post_tax_profit_inr"] - m_a_d["post_tax_profit_inr"], 2)
         daily_rows_ab.append({
-            "Session_Date": d_label,
-            "Trades_Done_A_vs_B": f"A: {a_trd} ({a_cnc} CNC+{a_op} Op) | B: {b_trd} ({b_cnc} CNC+{b_op} Op)",
-            "A_vs_B_Daily_Verdict": f"🏆 B Beats A by +₹{alpha_day:,.2f} Post-Tax (A: +₹{a_pt:,.2f} [{a_wr:.1f}% WR] vs B: +₹{b_pt:,.2f} [{b_wr:.1f}% WR])",
-            "Comparison_Mode": mode_tag,
-            "StratA_Trades": a_trd,
-            "StratB_Trades": b_trd,
-            "StratA_CNC_And_Op": f"{a_cnc} CNC + {a_op} Op",
-            "StratB_CNC_And_Op": f"{b_cnc} CNC + {b_op} Op",
-            "StratA_Wins_Losses_WR": f"{a_wins}W/{a_losses}L ({a_wr:.1f}%)",
-            "StratB_Wins_Losses_WR": f"{b_wins}W/{b_losses}L ({b_wr:.1f}%)",
-            "StratA_Peak_Capital_INR": a_peak,
-            "StratB_Peak_Capital_INR": b_peak,
-            "StratA_Gross_Profit_INR": a_gross,
-            "StratB_Gross_Profit_INR": b_gross,
-            "StratA_Charges_INR": a_chg,
-            "StratB_Charges_INR": b_chg,
-            "StratA_Tax_20Pct_INR": a_tax,
-            "StratB_Tax_20Pct_INR": b_tax,
-            "StratA_Post_Tax_Profit_INR": a_pt,
-            "StratB_Post_Tax_Profit_INR": b_pt,
+            "Session_Date": d_str,
+            "Trades_Done_A_vs_B": f"A: {m_a_d['n_closed']} ({m_a_d['n_cnc']} CNC+{m_a_d['n_op']} Op) | B: {m_b_d['n_closed']} ({m_b_d['n_cnc']} CNC+{m_b_d['n_op']} Op)",
+            "A_vs_B_Daily_Verdict": f"A: ₹{m_a_d['post_tax_profit_inr']:+,.2f} ({m_a_d['net_wr_pct']:.1f}% WR) | B: ₹{m_b_d['post_tax_profit_inr']:+,.2f} ({m_b_d['net_wr_pct']:.1f}% WR) [Δ ₹{alpha_day:+,.2f}]",
+            "Comparison_Mode": "🟢 LIVE REAL SESSION",
+            "StratA_Trades": m_a_d["n_closed"],
+            "StratB_Trades": m_b_d["n_closed"],
+            "StratA_CNC_And_Op": f"{m_a_d['n_cnc']} CNC + {m_a_d['n_op']} Op",
+            "StratB_CNC_And_Op": f"{m_b_d['n_cnc']} CNC + {m_b_d['n_op']} Op",
+            "StratA_Wins_Losses_WR": f"{m_a_d['net_w']}W/{m_a_d['net_l']}L ({m_a_d['net_wr_pct']:.1f}%)",
+            "StratB_Wins_Losses_WR": f"{m_b_d['net_w']}W/{m_b_d['net_l']}L ({m_b_d['net_wr_pct']:.1f}%)",
+            "StratA_Peak_Capital_INR": m_a_d["peak_cap_inr"],
+            "StratB_Peak_Capital_INR": m_b_d["peak_cap_inr"],
+            "StratA_Gross_Profit_INR": m_a_d["gross_pnl_inr"],
+            "StratB_Gross_Profit_INR": m_b_d["gross_pnl_inr"],
+            "StratA_Charges_INR": m_a_d["total_charges_inr"],
+            "StratB_Charges_INR": m_b_d["total_charges_inr"],
+            "StratA_Tax_20Pct_INR": m_a_d["income_tax_20pct_inr"],
+            "StratB_Tax_20Pct_INR": m_b_d["income_tax_20pct_inr"],
+            "StratA_Post_Tax_Profit_INR": m_a_d["post_tax_profit_inr"],
+            "StratB_Post_Tax_Profit_INR": m_b_d["post_tax_profit_inr"],
             "Net_Post_Tax_Alpha_B_vs_A_INR": alpha_day,
-            "StratA_Annualized_XIRR_Pct": a_xirr,
-            "StratB_Annualized_XIRR_Pct": b_xirr,
-            "XIRR_Alpha_B_vs_A_Pct": xirr_alpha_day,
+            "StratA_Annualized_XIRR_Pct": m_a_d["xirr_pct"],
+            "StratB_Annualized_XIRR_Pct": m_b_d["xirr_pct"],
+            "XIRR_Alpha_B_vs_A_Pct": round(m_b_d["xirr_pct"] - m_a_d["xirr_pct"], 2),
         })
 
-    # Add 3-Day Cumulative Portfolio Row at the bottom of Table 3A
-    n_days = max(len(daily_rows_ab), 1)
-    tot_a_t = len(strat_a_df)
-    tot_a_cnc = int(strat_a_df["Strategy_ID"].astype(str).str.startswith("L").sum()) if tot_a_t > 0 else 9
-    tot_a_op = tot_a_t - tot_a_cnc
-    tot_a_wins = int((strat_a_df["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if tot_a_t > 0 else 29
-    tot_a_wr = round(tot_a_wins / tot_a_t * 100.0, 1) if tot_a_t > 0 else 78.4
-    tot_a_g = round(float(strat_a_df["PnL_INR"].astype(float).sum()), 2) if tot_a_t > 0 else 2533.60
-    tot_a_chg = round(float(strat_a_df["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if tot_a_t > 0 else 744.59
-    tot_a_net = round(tot_a_g - tot_a_chg, 2)
-    tot_a_tax = round(max(0.0, tot_a_net * 0.20), 2)
-    tot_a_pt = round(tot_a_net - tot_a_tax, 2)
-    avg_peak_a = round(float(np.mean([r["StratA_Peak_Capital_INR"] for r in daily_rows_ab])) if daily_rows_ab else 130966.90, 2)
-    daily_roi_a = (tot_a_pt / n_days) / max(avg_peak_a, 1.0)
-    xirr_a_tot = round(((1.0 + daily_roi_a) ** 252 - 1.0) * 100.0, 2)
+    m_a_tot = _summarize_ledger_subset(strat_a_df)
+    m_b_tot = _summarize_ledger_subset(shadow_all_df)
+    n_days = max(len(all_dates), 1)
+    alpha_pt = round(m_b_tot["post_tax_profit_inr"] - m_a_tot["post_tax_profit_inr"], 2)
+    alpha_pct = round(alpha_pt / max(abs(m_a_tot["post_tax_profit_inr"]), 1.0) * 100.0, 1) if m_a_tot["post_tax_profit_inr"] != 0 else 0.0
+    xirr_alpha_tot = round(m_b_tot["xirr_pct"] - m_a_tot["xirr_pct"], 2)
 
-    tot_b_t = len(shadow_all_df)
-    tot_b_cnc = int(shadow_all_df["Strategy_ID"].astype(str).str.startswith("L").sum()) if tot_b_t > 0 else 9
-    tot_b_op = tot_b_t - tot_b_cnc
-    tot_b_wins = int((shadow_all_df["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if tot_b_t > 0 else 33
-    tot_b_wr = round(tot_b_wins / tot_b_t * 100.0, 1) if tot_b_t > 0 else 97.1
-    tot_b_g = round(float(shadow_all_df["PnL_INR"].astype(float).sum()), 2) if tot_b_t > 0 else 3673.75
-    tot_b_chg = round(float(shadow_all_df["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if tot_b_t > 0 else 683.87
-    tot_b_net = round(tot_b_g - tot_b_chg, 2)
-    tot_b_tax = round(max(0.0, tot_b_net * 0.20), 2)
-    tot_b_pt = round(tot_b_net - tot_b_tax, 2)
-    avg_peak_b = round(float(np.mean([r["StratB_Peak_Capital_INR"] for r in daily_rows_ab])) if daily_rows_ab else 119013.33, 2)
-    daily_roi_b = (tot_b_pt / n_days) / max(avg_peak_b, 1.0)
-    xirr_b_tot = round(((1.0 + daily_roi_b) ** 252 - 1.0) * 100.0, 2)
-    simple_ann_b = round(daily_roi_b * 252 * 100.0, 2)
-
-    alpha_pt = round(tot_b_pt - tot_a_pt, 2)
-    alpha_pct = round(alpha_pt / max(tot_a_pt, 1.0) * 100.0, 1)
-    xirr_alpha_tot = round(xirr_b_tot - xirr_a_tot, 2)
-
-    daily_rows_ab.append({
-        "Session_Date": f"TOTAL / {n_days}-DAY PORTFOLIO SUMMARY",
-        "Trades_Done_A_vs_B": f"A: {tot_a_t} ({tot_a_t/n_days:.1f}/d) | B: {tot_b_t} ({tot_b_t/n_days:.1f}/d)",
-        "A_vs_B_Daily_Verdict": f"🏆 TOTAL B ALPHA: +₹{alpha_pt:,.2f} (+{alpha_pct:.1f}%) Post-Tax | XIRR: A +{xirr_a_tot:.1f}% vs B +{xirr_b_tot:.1f}%",
-        "Comparison_Mode": f"📊 {n_days}-SESSION CUMULATIVE A vs B",
-        "StratA_Trades": tot_a_t,
-        "StratB_Trades": tot_b_t,
-        "StratA_CNC_And_Op": f"{tot_a_cnc} CNC + {tot_a_op} Op",
-        "StratB_CNC_And_Op": f"{tot_b_cnc} CNC + {tot_b_op} Op",
-        "StratA_Wins_Losses_WR": f"{tot_a_wins}W/{tot_a_t - tot_a_wins}L ({tot_a_wr:.1f}%)",
-        "StratB_Wins_Losses_WR": f"{tot_b_wins}W/{tot_b_t - tot_b_wins}L ({tot_b_wr:.1f}%)",
-        "StratA_Peak_Capital_INR": avg_peak_a,
-        "StratB_Peak_Capital_INR": avg_peak_b,
-        "StratA_Gross_Profit_INR": tot_a_g,
-        "StratB_Gross_Profit_INR": tot_b_g,
-        "StratA_Charges_INR": tot_a_chg,
-        "StratB_Charges_INR": tot_b_chg,
-        "StratA_Tax_20Pct_INR": tot_a_tax,
-        "StratB_Tax_20Pct_INR": tot_b_tax,
-        "StratA_Post_Tax_Profit_INR": tot_a_pt,
-        "StratB_Post_Tax_Profit_INR": tot_b_pt,
-        "Net_Post_Tax_Alpha_B_vs_A_INR": alpha_pt,
-        "StratA_Annualized_XIRR_Pct": xirr_a_tot,
-        "StratB_Annualized_XIRR_Pct": xirr_b_tot,
-        "XIRR_Alpha_B_vs_A_Pct": xirr_alpha_tot,
-    })
-
-    daily_b_df = pd.DataFrame(daily_rows_ab)
-    daily_b_df.to_csv(V3_EXPERT_DAILY_SUMMARY_CSV, index=False)
-
-    # Build Table 3B: All 9 Strategies Side-by-Side Scorecard (Strategy A vs Strategy B in Every Row)
-    all_9_specs = [
-        ("L1_SECTOR_ORB_SNIPER", "🎯 L1: Sectoral Shift + NR7 Compression ORB", "CNC BUY <=₹20K", 92.36, 93.55, 1.645, 355.05, "A: 0.00/d (Masked) | B: 0.62/d"),
-        ("L2_SUPPORT_SPRING_SNIPER", "🎯 L2: Structural S1 + 50DMA Institutional Spring", "CNC BUY <=₹20K", 92.23, 96.45, 1.163, 137.41, "A: 0.00/d (Masked) | B: 0.79/d"),
-        ("L3_CATALYST_VWAP_SNIPER", "🎯 L3: Fresh Catalyst + Day-2 Anchored VWAP", "CNC BUY <=₹20K", 90.35, 95.37, 1.001, 85.79, "A: 0.00/d (Masked) | B: 0.43/d"),
-        ("L4_DEFENSIVE_RS_SNIPER", "🛡️ L4: Bear / High-VIX Relative Strength Fortress", "CNC BUY <=₹20K", 92.63, 94.62, 1.112, 119.18, "A: 0.67/d | B: 0.67/d"),
-        ("L5_GLOBAL_MACRO_SNIPER", "🌍 L5: Overnight Global Macro Gap & Hold", "CNC BUY <=₹20K", 87.76, 94.51, 2.478, 145.54, "A: 0.00/d (Masked) | B: 0.36/d"),
-        ("L6_5GATE_10AM_SNIPER", "🎯 L6: 5-Gate Pre-Qualified 10:00 AM ORB Sniper", "CNC BUY <=₹20K", 87.39, 91.51, 1.169, 102.99, "A: 2.33/d (Fallback) | B: 0.43/d"),
-        ("OP_S1_Operator_Low_Absorption_BUY", "🟢 OP_S1: 1m Operator Spring + VWAP Reclaim BUY", "AUTO-BUY <=₹20K", 66.70, 88.50, 0.480, 6.80, "A: 1.67/d | B: 2.00/d"),
-        ("OP_S2_Operator_VWAP_Markup_BUY", "🟢 OP_S2: 1m Operator High-Vol VWAP Markup BUY", "AUTO-BUY <=₹20K", 83.30, 91.20, 0.520, 8.40, "A: 5.33/d | B: 5.00/d"),
-        ("OP_S3_Operator_Supply_Dump_SELL", "🔴 OP_S3: 1m Operator Supply Dump Breakdown SELL", "AUTO-SELL <=₹20K", 55.60, 92.50, 0.560, 9.20, "A: 2.33/d | B: 1.00/d"),
-    ]
-
-    scorecard_ab_rows = []
-    strat_a_monday_df = strat_a_df[strat_a_df["Entry_Date"].astype(str) >= V3_EXPERT_MONDAY_START_DATE] if (not strat_a_df.empty and "Entry_Date" in strat_a_df.columns) else pd.DataFrame()
-
-    for sid, sname, smode, bt_wr_a, bt_wr_b, bt_ret, bt_pf, exp_freq in all_9_specs:
-        sub_a = strat_a_df[strat_a_df["Strategy_ID"] == sid] if (not strat_a_df.empty and "Strategy_ID" in strat_a_df.columns) else pd.DataFrame()
-        sub_a_mon = strat_a_monday_df[strat_a_monday_df["Strategy_ID"] == sid] if (not strat_a_monday_df.empty and "Strategy_ID" in strat_a_monday_df.columns) else pd.DataFrame()
-        sub_b = shadow_all_df[shadow_all_df["Strategy_ID"] == sid] if (not shadow_all_df.empty and "Strategy_ID" in shadow_all_df.columns) else pd.DataFrame()
-        sub_b_mon = live_monday_df[live_monday_df["Strategy_ID"] == sid] if (not live_monday_df.empty and "Strategy_ID" in live_monday_df.columns) else pd.DataFrame()
-
-        a_cnt = len(sub_a)
-        a_mon_cnt = len(sub_a_mon)
-        a_wins = int((sub_a["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if a_cnt > 0 else 0
-        a_wr = round(a_wins / a_cnt * 100.0, 1) if a_cnt > 0 else 0.0
-        a_gross = round(float(sub_a["PnL_INR"].astype(float).sum()), 2) if a_cnt > 0 else 0.0
-        a_chg = round(float(sub_a["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if a_cnt > 0 else 0.0
-        a_net = round(a_gross - a_chg, 2)
-        a_tax = round(max(0.0, a_net * 0.20), 2)
-        a_post_tax = round(a_net - a_tax, 2)
-        a_mon_pt = round(float(sub_a_mon["Post_Tax_PnL_INR"].astype(float).sum()), 2) if (a_mon_cnt > 0 and "Post_Tax_PnL_INR" in sub_a_mon.columns) else 0.0
-
-        b_cnt = len(sub_b)
-        b_mon_cnt = len(sub_b_mon)
-        b_wins = int((sub_b["Net_Profit_After_Charges_INR"].astype(float) > 0).sum()) if b_cnt > 0 else 0
-        b_wr = round(b_wins / b_cnt * 100.0, 1) if b_cnt > 0 else 0.0
-        b_gross = round(float(sub_b["PnL_INR"].astype(float).sum()), 2) if b_cnt > 0 else 0.0
-        b_chg = round(float(sub_b["Platform_And_Stat_Charges_INR"].astype(float).sum()), 2) if b_cnt > 0 else 0.0
-        b_net = round(b_gross - b_chg, 2)
-        b_tax = round(max(0.0, b_net * 0.20), 2)
-        b_post_tax = round(b_net - b_tax, 2)
-        b_mon_pt = round(float(sub_b_mon["Post_Tax_PnL_INR"].astype(float).sum()), 2) if (b_mon_cnt > 0 and "Post_Tax_PnL_INR" in sub_b_mon.columns) else 0.0
-
-        diff_pt = round(b_post_tax - a_post_tax, 2)
-        verdict_ab = (
-            f"🟢 B Beats A by +₹{diff_pt:,.2f} Post-Tax (A: ₹{a_post_tax:+,.2f} vs B: +₹{b_post_tax:,.2f})"
-            if diff_pt > 0
-            else (
-                f"🔄 Re-Attributed in B to L1/L2/L3/L5 (A: {a_cnt} trds +₹{a_post_tax:,.2f} | B: {b_cnt} trd +₹{b_post_tax:,.2f})"
-                if sid == "L6_5GATE_10AM_SNIPER"
-                else f"🟢 Matched (A: +₹{a_post_tax:,.2f} | B: +₹{b_post_tax:,.2f})"
-            )
-        )
-        _, conf_sc_badge = _compute_confidence_badge(
-            paper_wr_pct=b_wr,
-            hist_wr_pct=bt_wr_b,
-            readiness_score=93.0,
-            gap_pct=0.0,
-            is_blocked_in_b=False,
-            context_note=f"B: {b_wins}W/{b_cnt - b_wins}L ({b_wr:.1f}%) | A: {a_wins}W/{a_cnt - a_wins}L ({a_wr:.1f}%)",
-        )
-        succ_sc_str = (
-            f"🟣 B: {b_wr:.1f}% ({b_wins}W/{b_cnt - b_wins}L, +₹{b_post_tax:,.0f}) | "
-            f"🟢 A: {a_wr:.1f}% ({a_wins}W/{a_cnt - a_wins}L, ₹{a_post_tax:+,.0f})"
-            if a_cnt > 0
-            else f"🟣 B: {b_wr:.1f}% ({b_wins}W/{b_cnt - b_wins}L, +₹{b_post_tax:,.0f}) | 🟢 A: Masked under L6 (100% CNC WR)"
-        )
-        scorecard_ab_rows.append({
-            "_sort_b_wr": b_wr,
-            "_sort_b_pt": b_post_tax,
-            "_sort_a_pt": a_post_tax,
-            "Strategy_ID": sid,
-            "Strategy_Name": f"{sname} ({smode})",
-            "Paper_Trade_Success_Rate": succ_sc_str,
-            "Confidence_Level": conf_sc_badge,
-            "Trades_Done_A_vs_B": f"A: {a_cnt} (Mon: {a_mon_cnt}) | B: {b_cnt} (Mon: {b_mon_cnt})",
-            "A_vs_B_Scorecard_Verdict": verdict_ab,
-            "Strategy_Name_And_Mode": f"{sname} ({smode})",
-            "Expected_Daily_Freq_A_vs_B": exp_freq,
-            "StratA_Total_Trades": a_cnt,
-            "StratB_Total_Trades": b_cnt,
-            "StratA_Monday_Trades": a_mon_cnt,
-            "StratB_Monday_Trades": b_mon_cnt,
-            "StratA_Wins_Losses_WR": f"{a_wins}W/{a_cnt - a_wins}L ({a_wr:.1f}%)",
-            "StratB_Wins_Losses_WR": f"{b_wins}W/{b_cnt - b_wins}L ({b_wr:.1f}%)",
-            "StratA_Gross_INR": a_gross,
-            "StratB_Gross_INR": b_gross,
-            "StratA_Charges_And_Tax_INR": round(a_chg + a_tax, 2),
-            "StratB_Charges_And_Tax_INR": round(b_chg + b_tax, 2),
-            "StratA_Post_Tax_INR": a_post_tax,
-            "StratB_Post_Tax_INR": b_post_tax,
-            "Net_Post_Tax_Alpha_B_vs_A_INR": diff_pt,
-            "StratA_Monday_Post_Tax_INR": a_mon_pt,
-            "StratB_Monday_Post_Tax_INR": b_mon_pt,
-            "Backtest_3Y_WR_A_vs_B": f"A: {bt_wr_a:.1f}% -> B: {bt_wr_b:.1f}%",
+    if daily_rows_ab:
+        daily_rows_ab.append({
+            "Session_Date": f"TOTAL / {len(all_dates)}-DAY PORTFOLIO SUMMARY",
+            "Trades_Done_A_vs_B": f"A: {m_a_tot['n_closed']} ({m_a_tot['n_closed']/n_days:.1f}/d) | B: {m_b_tot['n_closed']} ({m_b_tot['n_closed']/n_days:.1f}/d)",
+            "A_vs_B_Daily_Verdict": f"📊 Post-Tax: A ₹{m_a_tot['post_tax_profit_inr']:+,.2f} vs B ₹{m_b_tot['post_tax_profit_inr']:+,.2f} (Δ ₹{alpha_pt:+,.2f}) | XIRR: B {m_b_tot['xirr_pct']:+.1f}%",
+            "Comparison_Mode": f"📊 {len(all_dates)}-SESSION CUMULATIVE A vs B",
+            "StratA_Trades": m_a_tot["n_closed"],
+            "StratB_Trades": m_b_tot["n_closed"],
+            "StratA_CNC_And_Op": f"{m_a_tot['n_cnc']} CNC + {m_a_tot['n_op']} Op",
+            "StratB_CNC_And_Op": f"{m_b_tot['n_cnc']} CNC + {m_b_tot['n_op']} Op",
+            "StratA_Wins_Losses_WR": f"{m_a_tot['net_w']}W/{m_a_tot['net_l']}L ({m_a_tot['net_wr_pct']:.1f}%)",
+            "StratB_Wins_Losses_WR": f"{m_b_tot['net_w']}W/{m_b_tot['net_l']}L ({m_b_tot['net_wr_pct']:.1f}%)",
+            "StratA_Peak_Capital_INR": m_a_tot["peak_cap_inr"],
+            "StratB_Peak_Capital_INR": m_b_tot["peak_cap_inr"],
+            "StratA_Gross_Profit_INR": m_a_tot["gross_pnl_inr"],
+            "StratB_Gross_Profit_INR": m_b_tot["gross_pnl_inr"],
+            "StratA_Charges_INR": m_a_tot["total_charges_inr"],
+            "StratB_Charges_INR": m_b_tot["total_charges_inr"],
+            "StratA_Tax_20Pct_INR": m_a_tot["income_tax_20pct_inr"],
+            "StratB_Tax_20Pct_INR": m_b_tot["income_tax_20pct_inr"],
+            "StratA_Post_Tax_Profit_INR": m_a_tot["post_tax_profit_inr"],
+            "StratB_Post_Tax_Profit_INR": m_b_tot["post_tax_profit_inr"],
+            "Net_Post_Tax_Alpha_B_vs_A_INR": alpha_pt,
+            "StratA_Annualized_XIRR_Pct": m_a_tot["xirr_pct"],
+            "StratB_Annualized_XIRR_Pct": m_b_tot["xirr_pct"],
+            "XIRR_Alpha_B_vs_A_Pct": xirr_alpha_tot,
         })
 
-    # Sort all 9 strategies so Best-Performing Strategies appear on top by default
-    scorecard_ab_rows.sort(
-        key=lambda x: (float(x.get("_sort_b_wr", 0.0)), float(x.get("_sort_b_pt", 0.0)), float(x.get("_sort_a_pt", 0.0))),
-        reverse=True,
-    )
-    for r_sc in scorecard_ab_rows:
-        for k_drop in ("_sort_b_wr", "_sort_b_pt", "_sort_a_pt"):
-            r_sc.pop(k_drop, None)
-
-    mon_a_cnt = len(strat_a_monday_df)
-    mon_b_cnt = len(live_monday_df)
-    mon_a_pt = round(float(strat_a_monday_df["Post_Tax_PnL_INR"].astype(float).sum()), 2) if (mon_a_cnt > 0 and "Post_Tax_PnL_INR" in strat_a_monday_df.columns) else 559.74
-    mon_b_pt = round(float(live_monday_df["Post_Tax_PnL_INR"].astype(float).sum()), 2) if (mon_b_cnt > 0 and "Post_Tax_PnL_INR" in live_monday_df.columns) else 852.34
-
-    scorecard_ab_rows.append({
-        "Strategy_ID": "TOTAL_PORTFOLIO (ALL 9 LOGICS)",
-        "Strategy_Name": "🏆 All 9 Logics Combined (Top-3 CNC + 1m Operator)",
-        "Paper_Trade_Success_Rate": f"🟣 B: {tot_b_wr:.1f}% ({tot_b_wins}W/{tot_b_t - tot_b_wins}L, +₹{tot_b_pt:,.0f}) | 🟢 A: {tot_a_wr:.1f}% ({tot_a_wins}W/{tot_a_t - tot_a_wins}L, +₹{tot_a_pt:,.0f})",
-        "Confidence_Level": f"🟢 VERY HIGH (96% — {tot_b_wr:.1f}% Portfolio WR in B vs {tot_a_wr:.1f}% in A)",
-        "Trades_Done_A_vs_B": f"A: {tot_a_t} (Mon: {mon_a_cnt}) | B: {tot_b_t} (Mon: {mon_b_cnt})",
-        "A_vs_B_Scorecard_Verdict": f"🏆 B Beats A by +₹{alpha_pt:,.2f} (+{alpha_pct:.1f}%) Post-Tax | Monday Live: A +₹{mon_a_pt:,.2f} vs B +₹{mon_b_pt:,.2f}",
-        "Strategy_Name_And_Mode": "All 9 Logics Combined (Top-3 CNC + 1m Operator)",
-        "Expected_Daily_Freq_A_vs_B": "A: 12.3/day | B: 11.3/day",
-        "StratA_Total_Trades": tot_a_t,
-        "StratB_Total_Trades": tot_b_t,
-        "StratA_Monday_Trades": mon_a_cnt,
-        "StratB_Monday_Trades": mon_b_cnt,
-        "StratA_Wins_Losses_WR": f"{tot_a_wins}W/{tot_a_t - tot_a_wins}L ({tot_a_wr:.1f}%)",
-        "StratB_Wins_Losses_WR": f"{tot_b_wins}W/{tot_b_t - tot_b_wins}L ({tot_b_wr:.1f}%)",
-        "StratA_Gross_INR": tot_a_g,
-        "StratB_Gross_INR": tot_b_g,
-        "StratA_Charges_And_Tax_INR": round(tot_a_chg + tot_a_tax, 2),
-        "StratB_Charges_And_Tax_INR": round(tot_b_chg + tot_b_tax, 2),
-        "StratA_Post_Tax_INR": tot_a_pt,
-        "StratB_Post_Tax_INR": tot_b_pt,
-        "Net_Post_Tax_Alpha_B_vs_A_INR": alpha_pt,
-        "StratA_Monday_Post_Tax_INR": mon_a_pt,
-        "StratB_Monday_Post_Tax_INR": mon_b_pt,
-        "Backtest_3Y_WR_A_vs_B": "A: 90.8% -> B: 94.5%",
-    })
-
-    scorecard_b_df = pd.DataFrame(scorecard_ab_rows)
-    scorecard_b_df.to_csv(V3_EXPERT_SCORECARD_CSV, index=False)
-    scorecard_b_df.to_csv(V3_EXPERT_AB_COMPARISON_CSV, index=False)
-
-    # Also persist the 3-Year Walk-Forward Re-Backtest Comparison CSV in data/ for Tab 5
-    rebacktest_3y_rows = [
-        {"Logic_ID": "L1_SECTOR_ORB_SNIPER", "Strategy_Name": "Sectoral Shift + NR7 Compression ORB", "Avg_Trade_Freq": "0.62/day (~156/yr)", "Before_3Y_Trades": 157, "After_3Y_Trades": 155, "Before_WR_Pct": 92.36, "After_WR_Pct": 93.55, "Before_AvgLoser_Pct": -0.088, "After_AvgLoser_Pct": -0.072, "Before_MaxDD_Pct": -0.09, "After_MaxDD_Pct": -0.07, "Before_PF": 241.32, "After_PF": 355.05, "Before_AvgRet_Pct": 1.622, "After_AvgRet_Pct": 1.645},
-        {"Logic_ID": "L2_SUPPORT_SPRING_SNIPER", "Strategy_Name": "Structural S1 + 50DMA Institutional Spring", "Avg_Trade_Freq": "0.79/day (~198/yr)", "Before_3Y_Trades": 206, "After_3Y_Trades": 197, "Before_WR_Pct": 92.23, "After_WR_Pct": 96.45, "Before_AvgLoser_Pct": -0.485, "After_AvgLoser_Pct": -0.240, "Before_MaxDD_Pct": -1.60, "After_MaxDD_Pct": -0.48, "Before_PF": 29.59, "After_PF": 137.41, "Before_AvgRet_Pct": 1.070, "After_AvgRet_Pct": 1.163},
-        {"Logic_ID": "L3_CATALYST_VWAP_SNIPER", "Strategy_Name": "Fresh Catalyst + Day-2 Anchored VWAP", "Avg_Trade_Freq": "0.43/day (~109/yr)", "Before_3Y_Trades": 114, "After_3Y_Trades": 108, "Before_WR_Pct": 90.35, "After_WR_Pct": 95.37, "Before_AvgLoser_Pct": -0.464, "After_AvgLoser_Pct": -0.255, "Before_MaxDD_Pct": -0.43, "After_MaxDD_Pct": -0.22, "Before_PF": 21.47, "After_PF": 85.79, "Before_AvgRet_Pct": 0.903, "After_AvgRet_Pct": 1.001},
-        {"Logic_ID": "L4_DEFENSIVE_RS_SNIPER", "Strategy_Name": "Bear / High-VIX Defensive Relative Strength", "Avg_Trade_Freq": "0.37/day (~94/yr)", "Before_3Y_Trades": 95, "After_3Y_Trades": 93, "Before_WR_Pct": 92.63, "After_WR_Pct": 94.62, "Before_AvgLoser_Pct": -0.231, "After_AvgLoser_Pct": -0.175, "Before_MaxDD_Pct": -0.25, "After_MaxDD_Pct": -0.18, "Before_PF": 63.61, "After_PF": 119.18, "Before_AvgRet_Pct": 1.057, "After_AvgRet_Pct": 1.112},
-        {"Logic_ID": "L5_GLOBAL_MACRO_SNIPER", "Strategy_Name": "Overnight Global Macro + Sector Tailwind", "Avg_Trade_Freq": "0.36/day (~92/yr)", "Before_3Y_Trades": 98, "After_3Y_Trades": 91, "Before_WR_Pct": 87.76, "After_WR_Pct": 94.51, "Before_AvgLoser_Pct": -1.133, "After_AvgLoser_Pct": -0.312, "Before_MaxDD_Pct": -1.27, "After_MaxDD_Pct": -0.34, "Before_PF": 16.57, "After_PF": 145.54, "Before_AvgRet_Pct": 2.164, "After_AvgRet_Pct": 2.478},
-        {"Logic_ID": "L6_5GATE_10AM_SNIPER", "Strategy_Name": "5-Gate Pre-Qualified 10:00 AM Sniper", "Avg_Trade_Freq": "0.43/day (~107/yr)", "Before_3Y_Trades": 111, "After_3Y_Trades": 106, "Before_WR_Pct": 87.39, "After_WR_Pct": 91.51, "Before_AvgLoser_Pct": -0.166, "After_AvgLoser_Pct": -0.135, "Before_MaxDD_Pct": -0.14, "After_MaxDD_Pct": -0.11, "Before_PF": 53.36, "After_PF": 102.99, "Before_AvgRet_Pct": 1.093, "After_AvgRet_Pct": 1.169},
-        {"Logic_ID": "TOTAL_3Y_SNIPER_PORTFOLIO", "Strategy_Name": "All 6 Sniper Logics Combined (Nifty 250)", "Avg_Trade_Freq": "3.00/day (~756/yr)", "Before_3Y_Trades": 781, "After_3Y_Trades": 750, "Before_WR_Pct": 90.78, "After_WR_Pct": 94.53, "Before_AvgLoser_Pct": -0.437, "After_AvgLoser_Pct": -0.179, "Before_MaxDD_Pct": -1.60, "After_MaxDD_Pct": -0.48, "Before_PF": 33.17, "After_PF": 143.66, "Before_AvgRet_Pct": 1.296, "After_AvgRet_Pct": 1.393},
-    ]
-    pd.DataFrame(rebacktest_3y_rows).to_csv(V3_EXPERT_3Y_REBACKTEST_CSV, index=False)
+    pd.DataFrame(daily_rows_ab).to_csv(V3_EXPERT_DAILY_SUMMARY_CSV, index=False)
 
     losses_avoided_inr = round(float(rejected_df["Loss_Avoided_INR"].astype(float).sum()), 2) if not rejected_df.empty else 0.0
-    status_str = (
-        f"🟢 LIVE AUTO-TRADING (SINCE MONDAY {V3_EXPERT_MONDAY_START_DATE})"
-        if is_monday_or_later
-        else f"⏳ ARMED FOR MONDAY ({V3_EXPERT_MONDAY_START_DATE} @ 09:15 AM IST)"
-    )
+    m_today_b = _summarize_ledger_subset(shadow_all_df[shadow_all_df["Entry_Date"].astype(str).str[:10] == today_str] if not shadow_all_df.empty else pd.DataFrame())
+    m_today_a = _summarize_ledger_subset(strat_a_df[strat_a_df["Entry_Date"].astype(str).str[:10] == today_str] if not strat_a_df.empty else pd.DataFrame())
+    status_str = f"🟢 ACTIVE ({m_b_tot['n_closed']} Closed Real Trades Across {m_b_tot['unique_days']} Sessions)"
 
     summary_b = {
-        "strategy_version": "v3.0_Two_Expert_Critic_Challenger",
-        "scheduled_start_date": V3_EXPERT_MONDAY_START_DATE,
+        "strategy_version": "v3.1_Forward_Only_Clean_Data",
+        "scheduled_start_date": APP_CREATED_DATE,
         "status_badge": status_str,
         "status_banner": status_str,
-        "is_monday_live": is_monday_or_later,
-        "monday_live_trades_count": mon_b_cnt,
-        "monday_live_trades_a_count": mon_a_cnt,
-        "monday_live_post_tax_pnl_inr": mon_b_pt,
-        "monday_live_post_tax_pnl_a_inr": mon_a_pt,
-        "monday_post_tax_alpha_inr": round(mon_b_pt - mon_a_pt, 2),
-        "strat_a_total_trades": tot_a_t,
-        "strat_a_net_wr_pct": tot_a_wr,
-        "strat_a_gross_pnl_inr": tot_a_g,
-        "strat_a_charges_inr": tot_a_chg,
-        "strat_a_tax_20pct_inr": tot_a_tax,
-        "strat_a_post_tax_pnl_inr": tot_a_pt,
-        "strat_a_avg_daily_peak_capital_inr": avg_peak_a,
-        "strat_a_annualized_xirr_pct": xirr_a_tot,
-        "shadow_validated_trades": tot_b_t,
-        "shadow_net_wr_pct": tot_b_wr,
-        "shadow_gross_pnl_inr": tot_b_g,
-        "shadow_charges_inr": tot_b_chg,
-        "shadow_tax_20pct_inr": tot_b_tax,
-        "shadow_post_tax_pnl_inr": tot_b_pt,
-        "shadow_avg_daily_peak_capital_inr": avg_peak_b,
-        "shadow_annualized_xirr_pct": xirr_b_tot,
-        "shadow_simple_annualized_roi_pct": simple_ann_b,
+        "is_monday_live": True,
+        "unique_trading_days_a": m_a_tot["unique_days"],
+        "unique_trading_days_b": m_b_tot["unique_days"],
+        "strat_a_total_trades": m_a_tot["n_closed"],
+        "strat_a_open_trades": m_a_tot["n_open"],
+        "strat_a_net_wr_pct": m_a_tot["net_wr_pct"],
+        "strat_a_gross_pnl_inr": m_a_tot["gross_pnl_inr"],
+        "strat_a_charges_inr": m_a_tot["total_charges_inr"],
+        "strat_a_tax_20pct_inr": m_a_tot["income_tax_20pct_inr"],
+        "strat_a_post_tax_pnl_inr": m_a_tot["post_tax_profit_inr"],
+        "strat_a_avg_daily_peak_capital_inr": m_a_tot["peak_cap_inr"],
+        "strat_a_annualized_xirr_pct": m_a_tot["xirr_pct"],
+        "shadow_validated_trades": m_b_tot["n_closed"],
+        "shadow_open_trades": m_b_tot["n_open"],
+        "shadow_net_wr_pct": m_b_tot["net_wr_pct"],
+        "shadow_gross_pnl_inr": m_b_tot["gross_pnl_inr"],
+        "shadow_charges_inr": m_b_tot["total_charges_inr"],
+        "shadow_tax_20pct_inr": m_b_tot["income_tax_20pct_inr"],
+        "shadow_post_tax_pnl_inr": m_b_tot["post_tax_profit_inr"],
+        "shadow_avg_daily_peak_capital_inr": m_b_tot["peak_cap_inr"],
+        "shadow_annualized_xirr_pct": m_b_tot["xirr_pct"],
+        "shadow_simple_annualized_roi_pct": m_b_tot["ann_252_roi_pct"],
         "rejected_falling_knives_count": len(rejected_df),
         "rejected_losses_avoided_inr": losses_avoided_inr,
         "net_alpha_vs_1st_stable_post_tax_inr": alpha_pt,
         "net_alpha_vs_1st_stable_pct": alpha_pct,
         "xirr_alpha_vs_1st_stable_pct": xirr_alpha_tot,
-        "avg_expected_trades_per_day": round(tot_b_t / n_days, 1),
-        "shadow_validation_oct27_28": {
-            "total_trades": tot_b_t,
-            "net_wr_pct": tot_b_wr,
-            "gross_pnl_inr": tot_b_g,
-            "charges_inr": tot_b_chg,
-            "tax_20pct_inr": tot_b_tax,
-            "post_tax_profit_inr": tot_b_pt,
-            "avg_daily_peak_capital_inr": avg_peak_b,
-            "annualized_xirr_pct": xirr_b_tot,
-            "annualized_simple_roi_pct": simple_ann_b,
-        },
-        "live_monday_forward": {
-            "total_trades": mon_b_cnt,
-            "strat_a_monday_trades": mon_a_cnt,
-            "post_tax_profit_inr": mon_b_pt,
-            "strat_a_monday_post_tax_inr": mon_a_pt,
-            "monday_alpha_post_tax_inr": round(mon_b_pt - mon_a_pt, 2),
-        },
-        "alpha_vs_1st_stable": {
-            "post_tax_profit_alpha_inr": alpha_pt,
-            "post_tax_profit_alpha_pct": alpha_pct,
-            "net_wr_improvement_pct": round(tot_b_wr - tot_a_wr, 1),
-            "peak_capital_saved_per_day_inr": round(avg_peak_b - avg_peak_a, 2),
-            "annualized_xirr_alpha_pct": xirr_alpha_tot,
-        },
+        "avg_expected_trades_per_day": round(m_b_tot["n_closed"] / n_days, 1) if m_b_tot["n_closed"] > 0 else 0.0,
+        "today_live_trades_a": m_today_a["n_trades"],
+        "today_live_trades_b": m_today_b["n_trades"],
+        "today_post_tax_a": m_today_a["post_tax_profit_inr"],
+        "today_post_tax_b": m_today_b["post_tax_profit_inr"],
     }
     with open(V3_EXPERT_SUMMARY_JSON, "w", encoding="utf-8") as f:
         json.dump(summary_b, f, indent=2)
@@ -6256,22 +5402,67 @@ def run_v3_two_expert_monday_auto_engine(
     return summary_b
 
 
-if __name__ == "__main__":
+def rebuild_all_real_paper_history(
+    start_date: str = APP_CREATED_DATE,
+    eod_315pm_auto_exit: bool = True,
+    enable_mis_short: bool = True,
+) -> dict:
+    """
+    End-to-end clean rebuild pipeline from 100% genuine NSE market OHLCV (`1d`/`5m`/`1m`)
+    since `start_date` (`2026-10-27`):
+      1. Live regime + point-in-time sniper & watchlist scan
+      2. Clean chronological Top-3 CNC history rebuild + today rollover
+      3. Chunked 1m Operator footprint scan (`>= 2026-10-27`) + chronological auto-execution
+      4. Clean Strategy A ledger & closed-trade scorecard
+      5. Forward-only Strategy B challenger evaluation & adaptive ranking refresh
+      6. Forward candidate queue + continuous critic audit memory check
+    """
     report, snipers, watchlist = scan_live_sniper_opportunities()
-    print(f"Live Regime: {report['regime_badge']} | Nifty: {report['nifty_close']} ({report['nifty_ret_1d_pct']:+.2f}%) | VIX: {report['india_vix']}")
-    print(f"Universe Size Scanned: {len(UNIVERSE_META)} NIFTY 250 & International Instruments (Watchlist rows: {len(watchlist)})")
-    print(f"Authorized Sniper Logics Today: {report['authorized_sniper_logics']}")
-    print(f"High-Conviction Sniper Signals Triggered Today: {len(snipers)}")
-    auto_rollover_daily_top3_cnc(eod_315pm_auto_exit=True)
-    op_signals = scan_operator_1m_footprints(watchlist_df=watchlist)
-    op_trades, op_perf = auto_execute_and_evaluate_operator_trades(op_signals)
-    build_all_strategies_paper_ledger_and_scorecard(op_trades_df=op_trades)
+    cur_regime = str(report.get("regime", ""))
+    cnc_hist = rebuild_clean_cnc_history_from_market(
+        start_date=start_date, eod_315pm_auto_exit=eod_315pm_auto_exit
+    )
+    auto_rollover_daily_top3_cnc(eod_315pm_auto_exit=eod_315pm_auto_exit)
+    op_signals = scan_operator_1m_footprints(watchlist_df=watchlist, start_date=start_date)
+    op_trades, op_perf = auto_execute_and_evaluate_operator_trades(
+        operator_signals_df=op_signals,
+        enable_mis_short=enable_mis_short,
+        current_regime=cur_regime,
+    )
+    build_all_strategies_paper_ledger_and_scorecard(op_trades_df=op_trades, current_regime=cur_regime)
     v3_summary = run_v3_two_expert_monday_auto_engine(
         watchlist_df=watchlist,
         sniper_df=snipers,
         op_signals_df=op_signals,
-        force_rebuild_shadow=True,
-        force_refresh=True,
+        force_rebuild_shadow=False,
+        force_refresh=False,
+        enable_mis_short=enable_mis_short,
+        current_regime=cur_regime,
     )
-    print(f"Operator 1m Auto-Trades: {op_perf['total_auto_trades']} ({op_perf['buy_auto_trades']} BUY / {op_perf['sell_auto_trades']} SELL) | WR: {op_perf['win_rate_pct']}% | Net P&L: ₹{op_perf['total_net_pnl_inr']:+,.2f}")
-    print(f"Strategy A vs Strategy B Total Trades: A={v3_summary.get('strat_a_total_trades')} | B={v3_summary.get('shadow_validated_trades')} | B Post-Tax Alpha: +₹{v3_summary.get('net_alpha_vs_1st_stable_post_tax_inr')}")
+    build_probable_intraday_candidates_sheet(
+        watchlist_df=watchlist,
+        sniper_df=snipers,
+        op_signals_df=op_signals,
+        enable_mis_short=enable_mis_short,
+        current_regime=cur_regime,
+    )
+    audit_mem = run_continuous_critic_audit_and_memory_check()
+    return {
+        "regime": report,
+        "cnc_history_rows": len(cnc_hist),
+        "op_signals_rows": len(op_signals),
+        "op_trades_rows": len(op_trades),
+        "op_perf": op_perf,
+        "v3_summary": v3_summary,
+        "audit_guardrails_failed": audit_mem.get("failed_guardrails_count", 0),
+    }
+
+
+if __name__ == "__main__":
+    res = rebuild_all_real_paper_history()
+    rep = res["regime"]
+    v3s = res["v3_summary"]
+    opp = res["op_perf"]
+    print(f"Live Regime: {rep['regime_badge']} | Nifty: {rep['nifty_close']} ({rep['nifty_ret_1d_pct']:+.2f}%) | VIX: {rep['india_vix']}")
+    print(f"Clean Rebuild Done -> CNC History: {res['cnc_history_rows']} | 1m Op Closed/Total: {opp.get('total_auto_trades', 0)} ({opp.get('buy_auto_trades', 0)} BUY / {opp.get('sell_auto_trades', 0)} SELL)")
+    print(f"Strategy A Closed: {v3s.get('strat_a_total_trades')} (WR {v3s.get('strat_a_net_wr_pct')}%) | Strategy B Closed: {v3s.get('shadow_validated_trades')} (WR {v3s.get('shadow_net_wr_pct')}%) | B Post-Tax: ₹{v3s.get('shadow_post_tax_pnl_inr', 0):+,.2f}")

@@ -25,6 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from intraday_expert_engine import (
     DATA_DIR,
+    APP_CREATED_DATE,
     SNIPER_TRADES_CSV,
     SNIPER_TELEMETRY_CSV,
     OPERATOR_SIGNALS_CSV,
@@ -36,8 +37,13 @@ from intraday_expert_engine import (
     scan_live_sniper_opportunities,
     evaluate_chronological_exits,
     stage_top3_daily_cnc_entries,
+    auto_rollover_daily_top3_cnc,
     scan_operator_1m_footprints,
     auto_execute_and_evaluate_operator_trades,
+    build_all_strategies_paper_ledger_and_scorecard,
+    run_v3_two_expert_monday_auto_engine,
+    build_probable_intraday_candidates_sheet,
+    run_continuous_critic_audit_and_memory_check,
 )
 
 
@@ -80,14 +86,13 @@ def run_daemon(mode: str = "FULL_CYCLE"):
         print(f"[Authorized Logics] {', '.join(report['authorized_sniper_logics'])}")
 
         if mode in ("FULL_CYCLE", "MORNING_SNIPER_SCAN"):
-            # Stage Top 3 CNC entries (<= ₹20,000 per ticker, max 3 entries/day) if ledger is empty or has legacy >3 rows
+            auto_rollover_daily_top3_cnc(eod_315pm_auto_exit=True)
             curr_df = pd.read_csv(SNIPER_TELEMETRY_CSV) if os.path.exists(SNIPER_TELEMETRY_CSV) else pd.DataFrame()
             needs_top3_seed = (
                 curr_df.empty
-                or len(curr_df) != MAX_DAILY_ENTRIES
                 or "Daily_Slot" not in curr_df.columns
-                or ("Capital_Used_INR" not in curr_df.columns)
-                or (curr_df["Capital_Used_INR"].max() > MAX_BUDGET_PER_TICKER_INR)
+                or "Capital_Used_INR" not in curr_df.columns
+                or (pd.to_numeric(curr_df["Capital_Used_INR"], errors="coerce").fillna(0.0).max() > MAX_BUDGET_PER_TICKER_INR)
             )
             if needs_top3_seed:
                 seeded = stage_top3_daily_cnc_entries(
@@ -110,6 +115,10 @@ def run_daemon(mode: str = "FULL_CYCLE"):
                     )
 
     # Step 2: Chronological 5m Candle Replay & Auto-Exit Check (Purchase_Time + 5m -> 3:15 PM IST)
+    snipers_for_downstream = snipers_df if "snipers_df" in locals() else None
+    wl_for_op = watchlist_df if "watchlist_df" in locals() else None
+    cur_regime = str(report.get("regime", "")) if "report" in locals() else None
+
     if mode in ("FULL_CYCLE", "CHRONOLOGICAL_GTT_CHECK", "EOD_310PM_SWING_GATE"):
         updated_ledger = evaluate_chronological_exits(
             trades_csv_path=SNIPER_TELEMETRY_CSV,
@@ -122,15 +131,35 @@ def run_daemon(mode: str = "FULL_CYCLE"):
             tot_pnl = updated_ledger["PnL_INR"].sum()
             print(f"[Portfolio Summary] Total Capital Deployed: ₹{tot_cap:,.2f} (<= ₹60,000 cap) | Net P&L: ₹{tot_pnl:+,.2f}")
 
-    # Step 3: 1-Minute Operator / Big-Player Footprint Detector & Separate Auto-Trade (BUY & SELL) Tracker
-    wl_for_op = watchlist_df if "watchlist_df" in locals() else None
-    op_signals = scan_operator_1m_footprints(watchlist_df=wl_for_op)
+    # Step 3: 1-Minute Operator / Big-Player Footprint Detector & Chronological Auto-Trade Tracker
+    op_signals = scan_operator_1m_footprints(watchlist_df=wl_for_op, start_date=APP_CREATED_DATE)
     op_trades, op_perf = auto_execute_and_evaluate_operator_trades(op_signals)
     print(
-        f"[Operator 1m Auto-Trade Engine (Separate Tracker)] Universe: {op_perf['universe_size_tickers']} tickers | "
-        f"Auto-Trades: {op_perf['total_auto_trades']} ({op_perf['buy_auto_trades']} BUY / {op_perf['sell_auto_trades']} SELL) | "
-        f"Win Rate: {op_perf['win_rate_pct']}% | Net P&L: ₹{op_perf['total_net_pnl_inr']:+,.2f} "
-        f"(Buy P&L: ₹{op_perf['buy_net_pnl_inr']:+,.2f} | Sell P&L: ₹{op_perf['sell_net_pnl_inr']:+,.2f})"
+        f"[Operator 1m Auto-Trade Engine] Universe: {op_perf.get('universe_size_tickers', 0)} tickers | "
+        f"Auto-Trades: {op_perf.get('total_auto_trades', 0)} ({op_perf.get('buy_auto_trades', 0)} BUY / {op_perf.get('sell_auto_trades', 0)} SELL) | "
+        f"Closed WR: {op_perf.get('win_rate_pct', 0.0)}% | Net P&L: ₹{op_perf.get('total_net_pnl_inr', 0.0):+,.2f}"
+    )
+
+    # Step 4: Unified Strategy A & Strategy B Scorecards, Adaptive Ranking & Critic Audit Parity
+    build_all_strategies_paper_ledger_and_scorecard(op_trades_df=op_trades, current_regime=cur_regime)
+    v3_summary = run_v3_two_expert_monday_auto_engine(
+        watchlist_df=wl_for_op,
+        sniper_df=snipers_for_downstream,
+        op_signals_df=op_signals,
+        current_regime=cur_regime,
+    )
+    build_probable_intraday_candidates_sheet(
+        watchlist_df=wl_for_op,
+        sniper_df=snipers_for_downstream,
+        op_signals_df=op_signals,
+        current_regime=cur_regime,
+    )
+    audit_mem = run_continuous_critic_audit_and_memory_check()
+    print(
+        f"[Strategy A/B & Critic Parity] A Closed: {v3_summary.get('strat_a_total_trades')} ({v3_summary.get('strat_a_net_wr_pct')}%) | "
+        f"B Closed: {v3_summary.get('shadow_validated_trades')} ({v3_summary.get('shadow_net_wr_pct')}%) | "
+        f"B Post-Tax: ₹{v3_summary.get('shadow_post_tax_pnl_inr', 0):+,.2f} | "
+        f"Failed Guardrails: {audit_mem.get('failed_guardrails_count', 0)}"
     )
 
 
